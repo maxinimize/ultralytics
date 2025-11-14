@@ -124,6 +124,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.yolo_env/
 
 # Spyder project settings
 .spyderproject
@@ -152,6 +153,7 @@ dmypy.json
 runs/
 wandb/
 .DS_Store
+logs/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
