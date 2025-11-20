@@ -77,6 +77,6 @@ yolo detect train \
   imgsz=640 \
   epochs=5 \
   batch=${GLOBAL_BATCH} \
-  device=0,1 \                # 2GPUs
+  device=0,1 \
   workers=${NUM_WORKERS} \
   cache=ram

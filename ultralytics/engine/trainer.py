@@ -564,12 +564,22 @@ class BaseTrainer:
         else:
             torch.cuda.empty_cache()
 
+    # def read_results_csv(self):
+    #     """Read results.csv into a dictionary using polars."""
+    #     import polars as pl  # scope for faster 'import ultralytics'
+
+    #     try:
+    #         return pl.read_csv(self.csv, infer_schema_length=None).to_dict(as_series=False)
+    #     except Exception:
+    #         return {}
+    
     def read_results_csv(self):
         """Read results.csv into a dictionary using polars."""
-        import polars as pl  # scope for faster 'import ultralytics'
+        import pandas as pd
 
         try:
-            return pl.read_csv(self.csv, infer_schema_length=None).to_dict(as_series=False)
+            df = pd.read_csv(self.csv)
+            return df.to_dict(orient="list")
         except Exception:
             return {}
 
