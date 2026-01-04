@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=yolov8_train
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-48:00
+#SBATCH --time=0-06:00
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:h100:2
 # #SBATCH --partition=gpubase_bygpu_b1
 #SBATCH --output=logs/%x-%j.out
