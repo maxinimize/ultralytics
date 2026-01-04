@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e # exit on error
 
+#####################################################################
+# replace pyproject.toml with pyproject_shardnet.toml if on SHARCNET 
+#####################################################################
+
 # Load necessary modules on SHARCNET
 module load StdEnv/2023
 module load gcc/12.3
