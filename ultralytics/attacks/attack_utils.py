@@ -1,11 +1,6 @@
 import torch
-import yaml
-from pathlib import Path
-from models.yolo import Model
-from ultralytics.utils.patches import torch_load
-from utils.general import LOGGER, check_suffix, intersect_dicts
-from utils.downloads import attempt_download
-from utils.torch_utils import de_parallel
+from ultralytics.utils import LOGGER, DEFAULT_CFG_DICT, IterableSimpleNamespace
+from ultralytics.nn.tasks import DetectionModel
 from copy import deepcopy
 
 def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
@@ -17,40 +12,48 @@ def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
         device (torch.device): Device.
         nc (int): Number of classes.
         training (bool): Whether in training mode.
+        imgsz (int): Input image size.
 
     Returns:
         attack_model: Configured attack model.
     """
-    if attack_weights and attack_weights != "":
-        check_suffix(attack_weights, ".pt")
-        attack_weights_path = attempt_download(attack_weights) # download if not found locally
-
-        ckpt = torch_load(attack_weights_path, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-
-        hyp = ckpt.get("hyp", {})
-        cfg = None
-        
-        attack_model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
-        exclude = ["anchor"] if (cfg or hyp.get("anchors")) else []
-        csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, attack_model.state_dict(), exclude=exclude)  # intersect
-        attack_model.load_state_dict(csd, strict=False)  # load    
-        LOGGER.info(f"Transferred {len(csd)}/{len(attack_model.state_dict())} items for attack model")
-
-        # load default hyperparameters
-        ROOT = Path(__file__).parents[1]  # YOLOv5 root directory
-        hyp_path = ROOT / "data/hyps/hyp.scratch-low.yaml"
-        
-        with open(hyp_path, errors="ignore") as f:
-            hyp = yaml.safe_load(f)  # load hyps dict
-        
-        # Model attributes
-        nl = de_parallel(attack_model).model[-1].nl  # number of detection layers (to scale hyps)
-        hyp["box"] *= 3 / nl  # scale to layers
-        hyp["cls"] *= nc / 80 * 3 / nl  # scale to classes and layers
-        hyp["obj"] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
-        attack_model.nc = nc  # attach number of classes to model
-        attack_model.hyp = hyp  # attach hyperparameters to model
-    else:
+    if not attack_weights:
         raise ValueError("attack_weights must be provided for setup_attack_model()")
+    
+    # load checkpoint
+    ckpt = torch.load(attack_weights, map_location='cpu', weights_only=False)
+    
+    # model configuration
+    cfg = ckpt.get('model').yaml if hasattr(ckpt.get('model', {}), 'yaml') else None
+    
+    # create model
+    if cfg:
+        attack_model = DetectionModel(cfg, ch=3, nc=nc).to(device)
+    else:
+        # reconstruct model from checkpoint
+        attack_model = ckpt['model'].to(device)
+        if hasattr(attack_model, 'nc'):
+            attack_model.nc = nc
+    
+    # load weights
+    if 'model' in ckpt:
+        state_dict = ckpt['model'].state_dict() if hasattr(ckpt['model'], 'state_dict') else ckpt['model']
+        attack_model.load_state_dict(state_dict, strict=False)
+        LOGGER.info(f"Loaded attack model from {attack_weights}")
+    
+    # set hyperparameters
+    attack_model.args = deepcopy(DEFAULT_CFG_DICT)
+    attack_model.args['imgsz'] = imgsz
+    if 'hyp' in ckpt:
+        for k, v in ckpt['hyp'].items():
+            if k in attack_model.args:
+                attack_model.args[k] = v
+    
+    # convert to IterableSimpleNamespace for compatibility with loss functions
+    attack_model.args = IterableSimpleNamespace(**attack_model.args)
+    
+    # set model to eval mode if not training
+    if not training:
+        attack_model.eval()
+    
     return attack_model

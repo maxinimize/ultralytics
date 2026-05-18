@@ -385,7 +385,7 @@ class YoloV5ForART(nn.Module):
             
             return {"loss": dummy}
 
-class ARTPGD(Attacker):
+class ARTMIM(Attacker):
     attack_mode = "detector"
     requires_targets = True
     target_format = "detector_targets"
@@ -394,9 +394,10 @@ class ARTPGD(Attacker):
       epsilon -> PGD.eps
       lr      -> PGD.eps_step
       epoch   -> PGD.max_iter
+      decay   -> PGD.decay (Momentum)
     """
     def __init__(self, model, config=None, target=None,
-                 epsilon=0.05, lr=0.005, epoch=20, img_size=640):
+                 epsilon=0.05, lr=0.005, epoch=20, decay=1.0, img_size=640):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
 
@@ -423,7 +424,7 @@ class ARTPGD(Attacker):
         if hasattr(self.estimator, "set_dropout"):
             self.estimator.set_dropout(False)
  
-        # PGD
+        # PGD with Momentum (MIM)
         self.attack = ProjectedGradientDescent(
             estimator=self.estimator,
             norm=np.inf,
@@ -432,6 +433,7 @@ class ARTPGD(Attacker):
             max_iter=epoch,
             targeted=False,
             num_random_init=0,
+            decay=decay,
             verbose=False,
         )
 
