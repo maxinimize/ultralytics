@@ -13,6 +13,8 @@ def main():
     parser.add_argument('--device', default='0,1')
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--workers', type=int, default=None)
+    parser.add_argument('--project', default='runs/train_adv', help='Project directory')
+    parser.add_argument('--name', default='exp', help='Experiment name')
     args = parser.parse_args()
 
     overrides = dict(
@@ -24,6 +26,8 @@ def main():
         imgsz=args.imgsz,
         workers=args.workers,
         attack_name=args.attack_name,
+        project=args.project,
+        name=args.name,
     )
     trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
     trainer.train()

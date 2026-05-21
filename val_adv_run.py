@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--attack_name", default="cw", help="Attack name used by the shared factory, e.g. cw, bim, deepfool, jsma, uap, autoattack, pgd, mim")
     parser.add_argument("--use_whitebox", action="store_true", help="Use the evaluated model itself as the attack model")
     parser.add_argument("--attack_override", action="store_true", help="Force rebuilding the attacker in this validation script even if trainer._setup_train() already created one")
+    parser.add_argument('--project', default='runs/val_adv', help='Project directory')
+    parser.add_argument('--name', default='exp', help='Experiment name')
     args = parser.parse_args()
 
     overrides = dict(
@@ -24,6 +26,8 @@ def main():
         batch=args.batch,
         device=args.device,
         attack_name=args.attack_name,
+        project=args.project,
+        name=args.name,
     )
 
     trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
@@ -56,6 +60,7 @@ def main():
     validator = trainer.get_validator()
     validator.model = trainer.model
     validator.attacker = trainer.attacker
+    validator.attack_name = args.attack_name
 
     stats = validator(model=validator.model)
     print("Validation results:", stats)

@@ -30,11 +30,15 @@ python val_adv_run.py \
   --weights=runs/detect/train31/weights/best.pt \
   --data=coco_val.yaml \
   --attack_weights=yolo12l.pt \
-  --attack_name=pgd
+  --attack_name=pgd \
+  --project=runs \
+  --name=val_pgd
 
 # python val_adv_run.py \
 #   --weights=yolo12l.pt \
 #   --data=coco_val.yaml \
 #   --attack_weights=yolo12l.pt \
-#   --attack_name=bim
-#   --batch=16
+#   --attack_name=bim \
+#   --batch=16 \
+#   --project=runs \
+#   --name=val_bim

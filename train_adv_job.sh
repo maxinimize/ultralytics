@@ -72,7 +72,7 @@ echo "====================="
 mkdir -p logs
 
 # Train
-python /home/czhan295/ultralytics/train_adv_run.py \
+python train_adv_run.py \
   --model=yolo12l.pt \
   --attack_weights=yolo12l.pt \
   --data=coco_train.yaml \
@@ -81,5 +81,7 @@ python /home/czhan295/ultralytics/train_adv_run.py \
   --batch=${GLOBAL_BATCH} \
   --device=0 \
   --workers=${NUM_WORKERS} \
-  --attack_name=deepfool
+  --attack_name=dp \
+  --project=runs \
+  --name=train_dp
   
