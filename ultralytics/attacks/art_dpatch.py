@@ -68,7 +68,7 @@ class ARTDPatch(Attacker):
         lr: float = 5.0,
         epoch: int = 20,
         img_size: int = 640,
-        patch_shape: Tuple[int, int, int] = (40, 40, 3),
+        patch_shape: Tuple[int, int, int] = (3, 40, 40),
         batch_size: int = 16,
         random_location: bool = False,
         target_label: Optional[int | Sequence[int] | np.ndarray] = None,

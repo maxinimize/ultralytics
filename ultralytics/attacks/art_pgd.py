@@ -19,7 +19,6 @@ from art.attacks.evasion import ProjectedGradientDescent
 
 
 class BatchContainer:
-    """模拟 YOLOv8 训练时的 batch 对象,支持属性和字典访问"""
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -110,7 +109,7 @@ class BatchContainer:
 #         preds = self.model(images, augment=False)
 
 #         if targets is None:
-#             # 推理模式
+#             # inference mode
 #             dets = non_max_suppression(preds, conf_thres=0.001, iou_thres=0.6, max_det=300)
 #             out = []
 #             for det in dets:
@@ -127,7 +126,7 @@ class BatchContainer:
 #                     out.append({"boxes": boxes, "labels": labels, "scores": scores})
 #             return out
 
-#         # ✅ 训练模式: ART 格式 -> YOLO 格式
+#         # training mode: ART format -> YOLO format
 #         n, _, H, W = images.shape
 #         yolo_tgts = []
         
@@ -149,9 +148,9 @@ class BatchContainer:
 #             if c.dim() == 0:
 #                 c = c.unsqueeze(0)
             
-#             # ✅ 关键修复: 验证 boxes 的列数
+#             # check boxes columns
 #             if b.size(-1) != 4:
-#                 LOGGER.warning(f"⚠️ Invalid boxes shape: {b.shape}, expected (N, 4)")
+#                 LOGGER.warning(f"Invalid boxes shape: {b.shape}, expected (N, 4)")
 #                 continue
             
 #             xy = (b[:, 0:2] + b[:, 2:4]) * 0.5
@@ -160,9 +159,9 @@ class BatchContainer:
 #             xy[:, 0] /= W; xy[:, 1] /= H
 #             wh[:, 0] /= W; wh[:, 1] /= H
             
-#             # ✅ 验证归一化后的值
+#             # check normalized values
 #             if torch.any(torch.isnan(xy)) or torch.any(torch.isnan(wh)):
-#                 LOGGER.warning(f"⚠️ NaN detected in normalized targets, skipping")
+#                 LOGGER.warning(f"NaN detected in normalized targets, skipping")
 #                 continue
             
 #             img_idx = torch.full((b.size(0), 1), i, device=images.device, dtype=torch.float32)
@@ -170,25 +169,25 @@ class BatchContainer:
             
 #             yolo_tgts.append(torch.cat([img_idx, cls, xy, wh], dim=1))
 
-#         # ✅ 处理空 targets 的情况
+#         # handle empty targets
 #         if len(yolo_tgts) == 0:
-#             # ✅ 关键: 返回一个小的虚拟损失,避免调用 _loss_fn
-#             LOGGER.debug(f"⚠️ No valid targets in batch, returning dummy loss")
+#             # critical: return a small dummy loss to avoid calling _loss_fn
+#             LOGGER.debug(f"No valid targets in batch, returning dummy loss")
 #             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
         
 #         yolo_targets = torch.cat(yolo_tgts, dim=0)
         
-#         # ✅ 再次检查 yolo_targets 的形状
+#         # check yolo_targets shape
 #         if yolo_targets.size(0) == 0 or yolo_targets.size(1) != 6:
-#             LOGGER.warning(f"⚠️ Invalid yolo_targets shape: {yolo_targets.shape}")
+#             LOGGER.warning(f"Invalid yolo_targets shape: {yolo_targets.shape}")
 #             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
         
-#         # ✅ 计算损失(只有当有有效 targets 时)
+#         # compute loss (only when there are valid targets)
 #         try:
 #             total_loss, _ = self._loss_fn(preds, yolo_targets)
 #             return {"loss": total_loss}
 #         except Exception as e:
-#             LOGGER.warning(f"⚠️ Loss computation failed: {e}, returning dummy loss")
+#             LOGGER.warning(f"Loss computation failed: {e}, returning dummy loss")
 #             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
 
 class YoloV5ForART(nn.Module):
@@ -200,11 +199,11 @@ class YoloV5ForART(nn.Module):
         self.model = yolo_model
         self.img_size = img_size
         
-        # 获取 YOLOv8 的损失函数
+        # get YOLOv8 loss function
         unwrapped = unwrap_model(self.model)
         self._loss_fn = unwrapped.loss
         
-        # 确保模型在 eval 模式但允许梯度
+        # ensure model is in eval mode but allow gradients
         self.model.eval()
         # for p in self.model.parameters():
         #     p.requires_grad = True
@@ -219,7 +218,7 @@ class YoloV5ForART(nn.Module):
         """
         from ultralytics.utils import LOGGER
         
-        # ========== 推理模式 ==========
+        # inference mode
         if targets is None:
             with torch.no_grad():
                 preds = self.model(images, augment=False)
@@ -239,7 +238,7 @@ class YoloV5ForART(nn.Module):
                     out.append({"boxes": boxes, "labels": labels, "scores": scores})
             return out
 
-        # ========== 训练模式: 转换 targets ==========
+        # training mode: convert targets
         n, _, H, W = images.shape
         yolo_tgts = []
         
@@ -287,9 +286,9 @@ class YoloV5ForART(nn.Module):
         if yolo_targets.size(0) == 0 or yolo_targets.size(1) != 6:
             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
         
-        # ========== 方案3: 使用 YOLOv8 原生 loss ==========
+        # use YOLOv8 loss
         try:
-            # 步骤1: 保存模型原始状态
+            # save original model state
             original_training = self.model.training
             
             # Note: We do NOT freeze model parameters here. 
@@ -298,7 +297,7 @@ class YoloV5ForART(nn.Module):
             
             # Force enable grad for the entire block to ensure operations are recorded
             with torch.enable_grad():
-                # 步骤3: 确保输入图像需要梯度
+                # ensure input images requires gradients
                 if not images.requires_grad:
                     images.requires_grad_(True)
                 
@@ -307,7 +306,7 @@ class YoloV5ForART(nn.Module):
                      LOGGER.warning("⚠️ torch.is_grad_enabled() IS FALSE inside wrapper! Forcing it.")
                      torch.set_grad_enabled(True)
 
-                # # DEBUG: Deep diagnostics
+                # # DEBUG
                 # LOGGER.info(f"DEBUG DIAGNOSTICS:")
                 # LOGGER.info(f"  Model training mode: {self.model.training}")
                 # try:
@@ -320,26 +319,26 @@ class YoloV5ForART(nn.Module):
                 # LOGGER.info(f"  Input images: shape={images.shape}, req_grad={images.requires_grad}, is_leaf={images.is_leaf}")
                 # LOGGER.info(f"  Grad enabled: {torch.is_grad_enabled()}")
                 
-                # 步骤4: 设置为 train 模式以获取 feature maps (用于 loss 计算)
-                #但强制 BN 层为 eval 模式 (使用预训练统计量)
+                # set train mode to get feature maps (for loss computation)
+                # but force BN layers to eval mode (use pretrained statistics)
                 self.model.train()
                 for m in self.model.modules():
                     if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
                         m.eval()
                 
-                # LOGGER.info(f"  Model training mode after set: {self.model.training}")
+                # LOGGER.info(f"Model training mode after set: {self.model.training}")
 
-                # 步骤5: 前向传播
+                # forward propagation
                 preds = self.model(images, augment=False)
                 
-                # LOGGER.info(f"  Preds type: {type(preds)}")
+                # LOGGER.info(f"Preds type: {type(preds)}")
                 if isinstance(preds, (list, tuple)):
-                     LOGGER.info(f"  Preds len: {len(preds)}")
+                     LOGGER.info(f"Preds len: {len(preds)}")
                      if len(preds) > 0 and isinstance(preds[0], torch.Tensor):
-                         LOGGER.info(f"  Preds[0] req_grad: {preds[0].requires_grad}")
-                         LOGGER.info(f"  Preds[0] grad_fn: {preds[0].grad_fn}")
+                         LOGGER.info(f"Preds[0] req_grad: {preds[0].requires_grad}")
+                         LOGGER.info(f"Preds[0] grad_fn: {preds[0].grad_fn}")
 
-                # ✅ 步骤6: 构造 batch
+                # construct batch
                 batch = BatchContainer(
                     img=images,
                     batch_idx=yolo_targets[:, 0].long(),
@@ -347,7 +346,7 @@ class YoloV5ForART(nn.Module):
                     bboxes=yolo_targets[:, 2:6],
                 )
                 
-                # ✅ 步骤7: 调用损失函数
+                # call loss function
                 loss, loss_items = self._loss_fn(batch, preds)
                 
                 # Ensure loss is scalar for backward()
@@ -355,7 +354,7 @@ class YoloV5ForART(nn.Module):
 
                 # Verify graph integrity
                 if not final_loss.requires_grad:
-                    LOGGER.warning(f"⚠️ Critical: Loss does not require grad! Input req_grad={images.requires_grad}")
+                    LOGGER.warning(f"Critical: Loss does not require grad! Input req_grad={images.requires_grad}")
                     # Debug preds
                     if isinstance(preds, (list, tuple)) and len(preds) > 0:
                         LOGGER.warning(f"DEBUG: preds[0] req_grad={preds[0].requires_grad}")
@@ -370,8 +369,7 @@ class YoloV5ForART(nn.Module):
             return {"loss": final_loss}
             
         except Exception as e:
-            # 异常处理
-            LOGGER.warning(f"⚠️ Loss computation failed: {e}")
+            LOGGER.warning(f"Loss computation failed: {e}")
             
             self.model.train(original_training)
             
@@ -490,7 +488,7 @@ class ARTPGD(Attacker):
         """
         out: List[Dict[str, np.ndarray]] = []
         
-        # ✅ 增加输入验证
+        # input validation
         if targets is None or targets.numel() == 0:
             for _ in range(batch_size):
                 out.append({
@@ -501,7 +499,7 @@ class ARTPGD(Attacker):
         
         t = targets.detach().cpu()
         
-        # ✅ 确保 targets 是 2D 张量
+        # ensure targets is 2D tensor
         if t.dim() == 1:
             t = t.unsqueeze(0)
         elif t.dim() > 2:
@@ -509,14 +507,14 @@ class ARTPGD(Attacker):
             if t.dim() == 1:
                 t = t.unsqueeze(0)
         
-        # ✅ 验证列数
+        # check number of columns
         if t.size(1) < 6:
             raise ValueError(f"targets must have 6 columns, got {t.size(1)}")
         
         for i in range(batch_size):
             ti = t[t[:, 0] == i]
             
-            # ✅ 改用 size(0) 检查行数
+            # use size(0) to check number of rows
             if ti.size(0) == 0:
                 out.append({
                     "boxes": np.zeros((0, 4), dtype=np.float32),
@@ -524,11 +522,11 @@ class ARTPGD(Attacker):
                 })
                 continue
             
-            # ✅ 确保 ti 是 2D
+            # ensure ti is 2D
             if ti.dim() == 1:
                 ti = ti.unsqueeze(0)
             
-            # xywh (归一化) -> xyxy (像素)
+            # xywh (normalized) -> xyxy (pixel)
             xywh = ti[:, 2:6].clone()
             xywh[:, 0] *= W; xywh[:, 1] *= H
             xywh[:, 2] *= W; xywh[:, 3] *= H
@@ -539,7 +537,7 @@ class ARTPGD(Attacker):
             xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
             xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
             
-            # ✅ 裁剪到图像边界
+            # clip to image boundary
             xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clamp(0, W)
             xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clamp(0, H)
             

@@ -107,9 +107,9 @@ class ARTFGSM(Attacker):
         """
         out: List[Dict[str, np.ndarray]] = []
         
-        # ✅ 增加输入验证
+        # input validation
         if targets is None or targets.numel() == 0:
-            # 返回空标签
+            # return empty labels
             for _ in range(batch_size):
                 out.append({
                     "boxes": np.zeros((0, 4), dtype=np.float32),
@@ -119,7 +119,7 @@ class ARTFGSM(Attacker):
         
         t = targets.detach().cpu()
         
-        # ✅ 确保 targets 是 2D 张量
+        # ensure targets are 2D tensor
         if t.dim() == 1:
             t = t.unsqueeze(0)  # (6,) -> (1, 6)
         elif t.dim() > 2:
@@ -127,26 +127,26 @@ class ARTFGSM(Attacker):
             if t.dim() == 1:
                 t = t.unsqueeze(0)
         
-        # ✅ 验证 targets 至少有 6 列
+        # check columns
         if t.size(1) < 6:
             raise ValueError(f"targets must have 6 columns, got {t.size(1)}")
         
         for i in range(batch_size):
-            ti = t[t[:, 0] == i]  # 提取属于图像 i 的目标
+            ti = t[t[:, 0] == i]  # extract targets of image i
             
-            # ✅ 改进空检查: 检查行数而不是 numel
-            if ti.size(0) == 0:  # 没有目标
+            # check rows
+            if ti.size(0) == 0:  # no targets
                 out.append({
                     "boxes": np.zeros((0, 4), dtype=np.float32),
                     "labels": np.zeros((0,), dtype=np.int64)
                 })
                 continue
             
-            # ✅ 确保 ti 是 2D
+            # ensure ti is 2D
             if ti.dim() == 1:
                 ti = ti.unsqueeze(0)
             
-            # 转换 xywh (归一化) -> xyxy (绝对坐标)
+            # convert xywh (normalized) to xyxy (absolute coordinates)
             xywh = ti[:, 2:6].clone()
             xywh[:, 0] *= W  # x_center
             xywh[:, 1] *= H  # y_center
@@ -160,7 +160,7 @@ class ARTFGSM(Attacker):
             xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2  # x2
             xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2  # y2
             
-            # ✅ 裁剪到图像边界
+            # clip to image boundary
             xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clamp(0, W)
             xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clamp(0, H)
             

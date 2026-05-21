@@ -164,11 +164,11 @@ class DetectionTrainer(BaseTrainer):
 
         attack_weights = getattr(self.args, "attack_weights", None)
         attack_name = getattr(self.args, "attack_name", "cw")
-        LOGGER.info(f"🔍 Debug: attack_weights from args = {attack_weights}, type = {type(attack_weights)}")
+        LOGGER.info(f"Debug: attack_weights from args = {attack_weights}, type = {type(attack_weights)}")
 
         if attack_weights:
             try:
-                LOGGER.info(f"🚀 Attempting to load attack model from: {attack_weights}")
+                LOGGER.info(f"Attempting to load attack model from: {attack_weights}")
                 imgsz = getattr(self.args, "imgsz", 640)
                 self.attack_model = setup_attack_model(
                     attack_weights,
@@ -177,22 +177,22 @@ class DetectionTrainer(BaseTrainer):
                     training=False,
                     imgsz=imgsz,
                 )
-                LOGGER.info(f"✅ Attack model loaded successfully from {attack_weights}")
+                LOGGER.info(f"Attack model loaded successfully from {attack_weights}")
 
                 self.attack_model.eval()
                 for p in self.attack_model.parameters():
                     p.requires_grad = True
 
                 self.attacker = build_attacker(attack_name, model=self.attack_model, img_size=imgsz)
-                LOGGER.info(f"✅ attacker initialized: {attack_name}")
+                LOGGER.info(f"attacker initialized: {attack_name}")
             except Exception as e:
-                LOGGER.warning(f"❌ Failed to load attack model or attacker: {e}")
+                LOGGER.warning(f"Failed to load attack model or attacker: {e}")
                 import traceback
                 LOGGER.warning(traceback.format_exc())
                 self.attack_model = None
                 self.attacker = None
         else:
-            LOGGER.info("ℹ️ No attack weights provided, adversarial training disabled")
+            LOGGER.info("No attack weights provided, adversarial training disabled")
 
     def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
         """Return a YOLO detection model.
@@ -224,6 +224,7 @@ class DetectionTrainer(BaseTrainer):
             self.test_loader, save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks
         )
         validator.attacker = getattr(self, "attacker", None)
+        validator.attack_name = getattr(self.args, "attack_name", None)
         return validator
 
     def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
@@ -308,7 +309,7 @@ class DetectionTrainer(BaseTrainer):
 
             return None if imgs_adv is None else imgs_adv.to(batch["img"].dtype)
         except Exception as e:
-            LOGGER.warning(f"⚠️ Adversarial generation failed: {e}. Skipping attack for this batch.")
+            LOGGER.warning(f"Adversarial generation failed: {e}. Skipping attack for this batch.")
             return None
 
     def _do_train(self):
