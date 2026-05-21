@@ -789,8 +789,7 @@ def save_dataset_cache_file(prefix: str, path: Path, x: dict, version: str):
     """Save an Ultralytics dataset *.cache dictionary x to path."""
     x["version"] = version  # add cache version
     if is_dir_writeable(path.parent):
-        if path.exists():
-            path.unlink()  # remove *.cache file if exists
+        path.unlink(missing_ok=True)  # remove *.cache file if exists
         with open(str(path), "wb") as file:  # context manager here fixes windows async np.save bug
             np.save(file, x)
         LOGGER.info(f"{prefix}New cache created: {path}")

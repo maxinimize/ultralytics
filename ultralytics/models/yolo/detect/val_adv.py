@@ -16,7 +16,7 @@ from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, colorstr, emojis, nms, ops
+from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, colorstr, nms, ops
 from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
@@ -114,7 +114,7 @@ class DetectionValidator(BaseValidator):
             elif self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data, split=self.args.split)
             else:
-                raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
+                raise FileNotFoundError(f"Dataset '{self.args.data}' for task={self.args.task} not found")
 
             if self.device.type in {"cpu", "mps"}:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
@@ -147,7 +147,7 @@ class DetectionValidator(BaseValidator):
 
             # Inference
             with dt[1]:
-                # ✅ Explicitly use no_grad here, but allow gradients in preprocess before this
+                # Explicitly use no_grad here, but allow gradients in preprocess before this
                 with torch.no_grad():
                     preds = model(batch["img"], augment=augment)
 
@@ -213,15 +213,53 @@ class DetectionValidator(BaseValidator):
         attacker = getattr(self, "attacker", None)
         if attacker:
             try:
-                if hasattr(attacker, "proxy_model"):
-                    attacker.proxy_model.current_paths = batch.get("im_file", [])
-                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                    attacker.estimator.model.current_paths = batch.get("im_file", [])
+                attack_name = getattr(self, "attack_name", None)
+                im_files = batch.get("im_file", [])
+                
+                # Caching logic
+                all_cached = False
+                cache_paths = []
+                cached_imgs = []
+                
+                if attack_name and im_files:
+                    all_cached = True
+                    for f in im_files:
+                        path = Path(f)
+                        cache_path = path.parent / f"{path.stem}_{attack_name}.pt"
+                        cache_paths.append(cache_path)
+                        if cache_path.exists():
+                            try:
+                                cached_imgs.append(torch.load(cache_path, map_location=self.device))
+                            except Exception as e:
+                                LOGGER.warning(f"Failed to load cache {cache_path}: {e}")
+                                all_cached = False
+                                break
+                        else:
+                            all_cached = False
+                            break
 
-                with torch.amp.autocast(device_type="cuda", enabled=False):
-                    imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
-                if imgs_adv is not None:
-                    batch["img"] = imgs_adv.to(batch["img"].dtype).to(self.device)
+                if all_cached and len(cached_imgs) == len(im_files):
+                    batch["img"] = torch.stack(cached_imgs).to(batch["img"].dtype).to(self.device)
+                else:
+                    if hasattr(attacker, "proxy_model"):
+                        attacker.proxy_model.current_paths = im_files
+                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                        attacker.estimator.model.current_paths = im_files
+
+                    with torch.amp.autocast(device_type="cuda", enabled=False):
+                        imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
+                    if imgs_adv is not None:
+                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
+                        batch["img"] = imgs_adv_cast
+                        
+                        # Save the generated images to cache
+                        if attack_name and im_files:
+                            for i, cache_path in enumerate(cache_paths):
+                                if not cache_path.exists():
+                                    try:
+                                        torch.save(imgs_adv_cast[i].detach().cpu(), cache_path)
+                                    except Exception as e:
+                                        LOGGER.warning(f"Failed to save cache {cache_path}: {e}")
             except Exception as e:
                 LOGGER.warning(f"Adversarial generation failed: {e}. Skipping attack for this batch.")
 
