@@ -1,5 +1,5 @@
 import argparse
-from ultralytics.models.yolo.detect.train_adv import DetectionTrainer
+from ultralytics.models.yolo.detect.train_adv_dynamic import DetectionTrainer
 
 
 def main():
@@ -8,7 +8,6 @@ def main():
     parser.add_argument('--data', default='coco128.yaml')
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch', type=int, default=24)
-    parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
     parser.add_argument('--attack_name', default='cw', help='Attack name passed to the shared factory, e.g. fgsm, pgd, mim, cw, bim, deepfool, jsma, uap, autoattack')
     parser.add_argument('--use_pregenerated_adv', action='store_true', help='Load pre-generated adversarial images from disk')
     parser.add_argument('--device', default='0,1')
@@ -17,7 +16,11 @@ def main():
     parser.add_argument('--project', default='runs/train_adv', help='Project directory')
     parser.add_argument('--name', default='exp', help='Experiment name')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='Resume training from last checkpoint')
-    parser.add_argument('--no_train_aug', action='store_true', help='Disable YOLO training augmentations for adversarial training.')
+    
+    # Dynamic pool arguments
+    parser.add_argument('--attack_mix_ratio', type=float, default=0.5, help='Fraction of attacked images in each batch')
+    parser.add_argument('--num_aug', type=int, default=5, help='Number of clean/attacked augmented images generated per original image')
+    parser.add_argument('--pool_update_period', type=int, default=5, help='Epoch update frequency for regenerating dynamic pools')
     args = parser.parse_args()
 
     overrides = dict(
@@ -33,42 +36,12 @@ def main():
         project=args.project,
         name=args.name,
         resume=args.resume,
+        attack_mix_ratio=args.attack_mix_ratio,
+        num_aug=args.num_aug,
+        pool_update_period=args.pool_update_period,
     )
 
-    if args.no_train_aug:
-        overrides.update({
-        # image mixing augmentations
-        "mosaic": 0.0,
-        "mixup": 0.0,
-        "cutmix": 0.0,
-        "copy_paste": 0.0,
-
-        # geometric augmentations
-        "degrees": 0.0,
-        "translate": 0.0,
-        "scale": 0.0,
-        "shear": 0.0,
-        "perspective": 0.0,
-
-        # flipping / channel changes
-        "flipud": 0.0,
-        "fliplr": 0.0,
-        "bgr": 0.0,
-
-        # color augmentations
-        "hsv_h": 0.0,
-        "hsv_s": 0.0,
-        "hsv_v": 0.0,
-
-        # training-time image size variation
-        "multi_scale": 0.0,
-
-        # classification-specific, but safe to disable explicitly
-        "auto_augment": None,
-        "erasing": 0.0,
-    })
-
-    trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
+    trainer = DetectionTrainer(overrides=overrides)
     trainer.train()
 
 

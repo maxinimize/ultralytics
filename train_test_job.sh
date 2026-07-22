@@ -1,14 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=yolov8_train
+#SBATCH --job-name=yolov12_train_test
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-23:59        
+#SBATCH --time=0-11:59        
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:h100:1
-# #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:2
-# #SBATCH --partition=gpubase_bygpu_b1
 #SBATCH --output=logs/%x-%j.out
-# #SBATCH --qos=devel
 
 set -euo pipefail
 
@@ -54,64 +51,49 @@ if [ "$THREADS_PER_PROC" -lt 1 ]; then THREADS_PER_PROC=1; fi
 export OMP_NUM_THREADS=$THREADS_PER_PROC
 export OMP_THREAD_LIMIT=$THREADS_PER_PROC
 
-NUM_WORKERS=$(( THREADS_PER_PROC - 1 ))
+# NUM_WORKERS=$(( THREADS_PER_PROC - 1 ))
+NUM_WORKERS=$(( THREADS_PER_PROC / 2 ))  # 4 / 2 = 2
 if [ "$NUM_WORKERS" -lt 1 ]; then NUM_WORKERS=1; fi
 
 # Global batch size
 GLOBAL_BATCH=16
 
-# === Debugging info ===
-echo "===== debug env ====="
-echo "Host: $(hostname)"
-echo "GPUs on node: ${SLURM_GPUS_ON_NODE:-<unset>}"
-echo "NPROC_PER_NODE: $NPROC_PER_NODE"
-echo "OMP_NUM_THREADS (per-proc): $OMP_NUM_THREADS"
-echo "DataLoader workers (per-proc): $NUM_WORKERS"
-echo "====================="
-
 mkdir -p logs
 
-# Train
-# python train_adv_run.py \
-#   --model=runs/train_dp_5ep/weights/last.pt \
+# # Run training with ratio parameter
+# python train_test_run.py \
+#   --model=runs/train_m1_s2/weights/last.pt \
 #   --attack_weights=yolo12l.pt \
-#   --data=coco_train.yaml \
+#   --data=coco_train_temp.yaml \
 #   --imgsz=640 \
-#   --epochs=2 \
+#   --epochs=25 \
 #   --batch=${GLOBAL_BATCH} \
 #   --device=0 \
 #   --workers=${NUM_WORKERS} \
-#   --attack_name=dp \
+#   --attack_name="pgd bim mim" \
+#   --ratio="0.3 0.2 0.1" \
 #   --project=runs \
-#   --name=train_dp_5ep \
-#   --resume
+#   --name=train_m1_s3
 
-python train_adv_run.py \
+python train_test_run.py \
   --model=yolo12l.pt \
   --attack_weights=yolo12l.pt \
-  --data=coco_train.yaml \
+  --data=coco_train_temp.yaml \
   --imgsz=640 \
-  --epochs=40 \
+  --epochs=300 \
   --batch=${GLOBAL_BATCH} \
   --device=0 \
   --workers=${NUM_WORKERS} \
-  --attack_name=pgd \
+  --attack_name="pgd bim mim" \
+  --ratio="0.25 0.25 0.4" \
   --project=runs \
-  --name=train_pgd_withPretrainedAdvImg_noAugAll_compare \
-  --use_pregenerated_adv \
-  --no_train_aug
+  --name=train_pregen_pgd_bim_mim_252540_300eps
 
-# python train_adv_run.py \
-#   --model=yolo12l.pt \
-#   --attack_weights=yolo12l.pt \
-#   --data=coco_train.yaml \
-#   --imgsz=640 \
-#   --epochs=5 \
-#   --batch=${GLOBAL_BATCH} \
+
+# # Resume training with ratio parameter from the last checkpoint
+# python train_test_run.py \
+#   --resume=runs/train_pgd_bim_mim_252540/weights/last.pt \
 #   --device=0 \
-#   --workers=${NUM_WORKERS} \
-#   --attack_name=pgd \
-#   --project=runs \
-#   --name=train_pgd_random \
+#   --batch=${GLOBAL_BATCH} \
+#   --workers=${NUM_WORKERS}
 
-  

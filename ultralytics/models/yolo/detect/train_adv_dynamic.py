@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import math
 import random
 import time
@@ -16,7 +17,7 @@ from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, colorstr, TQDM
+from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, colorstr, TQDM, LOCAL_RANK
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model, unset_deterministic, autocast
@@ -31,18 +32,60 @@ from ultralytics.attacks.attack_utils import setup_attack_model
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 
 
-class YOLODatasetAdv(YOLODataset):
-    """Dataset class for loading clean images and their corresponding pre-generated adversarial images."""
+class RepeatDataset(torch.utils.data.Dataset):
+    """Dataset wrapper to repeat each item in a dataset repeats times."""
 
-    def __init__(self, cfg, img_path, batch, data, mode="train", rect=False, stride=32, **kwargs):
-        """Initialize YOLODatasetAdv with configuration and extract attack_name."""
+    def __init__(self, dataset, repeats):
+        self.dataset = dataset
+        self.repeats = repeats
+
+    def __len__(self):
+        return len(self.dataset) * self.repeats
+
+    def __getitem__(self, index):
+        orig_idx = index // self.repeats
+        aug_idx = index % self.repeats
+        sample = self.dataset[orig_idx]
+        return {
+            "img": sample["img"],
+            "cls": sample["cls"],
+            "bboxes": sample["bboxes"],
+            "orig_idx": orig_idx,
+            "aug_idx": aug_idx
+        }
+
+
+def collate_fn_list(batch):
+    """Custom collate function to return batch samples as a list of dicts."""
+    return batch
+
+
+def worker_init_fn(worker_id):
+    """Initialize worker seed to ensure randomness across workers."""
+    import random
+    import numpy as np
+    import time
+    seed = (worker_id + 1) * int(time.time() * 1000) % (2**32 - 1)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+class YOLODynamicPoolDataset(YOLODataset):
+    """Dataset class for loading clean and pre-generated attacked augmented images from disk with a custom mix ratio."""
+
+    def __init__(self, cfg, clean_dir, attacked_dir, batch, data, mode="train", rect=False, stride=32, **kwargs):
+        """Initialize YOLODynamicPoolDataset."""
         self.cfg = cfg
-        self.attack_name = getattr(cfg, "attack_name", "pgd")
+        self.clean_dir = Path(clean_dir)
+        self.attacked_dir = Path(attacked_dir)
+        self.attack_mix_ratio = getattr(cfg, "attack_mix_ratio", 0.5)
+
         super().__init__(
-            img_path=img_path,
+            img_path=str(self.clean_dir / "images"),
             imgsz=cfg.imgsz,
             batch_size=batch,
-            augment=mode == "train",
+            augment=False,  # Disable on-the-fly random transformations
             hyp=cfg,
             rect=cfg.rect or rect,
             cache=cfg.cache or None,
@@ -57,29 +100,24 @@ class YOLODatasetAdv(YOLODataset):
             **kwargs
         )
 
-    def get_img_files(self, img_path: str | list[str]) -> list[str]:
-        """Filter the image list to only keep images that have pre-generated adversarial counterparts."""
-        im_files = super().get_img_files(img_path)
-        valid_files = []
-        for f in im_files:
-            p = Path(f)
-            adv_path = p.parent / f"{p.stem}_{self.attack_name}{p.suffix}"
-            if adv_path.exists():
-                valid_files.append(f)
-        
-        # Log training sample counts
-        LOGGER.info(f"YOLODatasetAdv: Kept {len(valid_files)}/{len(im_files)} images that have pre-generated adversarial counterparts (suffix: _{self.attack_name}).")
-        return valid_files
-
-    def load_adv_image(self, i: int, rect_mode: bool = True) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
-        """Load the pre-generated adversarial image from disk."""
+    def load_image(self, i: int, rect_mode: bool = True) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+        """Load the pre-generated clean or attacked image from disk depending on attack_mix_ratio."""
         orig_path = self.im_files[i]
         p = Path(orig_path)
-        adv_path = p.parent / f"{p.stem}_{self.attack_name}{p.suffix}"
         
-        im = cv2.imread(str(adv_path), flags=self.cv2_flag)
+        # Decide whether to load the attacked image or clean image based on attack_mix_ratio
+        use_attacked = random.random() < self.attack_mix_ratio
+        
+        if use_attacked:
+            img_path = self.attacked_dir / "images" / p.name
+            if not img_path.exists():
+                img_path = self.clean_dir / "images" / p.name
+        else:
+            img_path = self.clean_dir / "images" / p.name
+
+        im = cv2.imread(str(img_path), flags=self.cv2_flag)
         if im is None:
-            raise FileNotFoundError(f"Adversarial Image Not Found: {adv_path}")
+            raise FileNotFoundError(f"Image Not Found: {img_path}")
             
         h0, w0 = im.shape[:2]  # orig hw
         if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
@@ -93,155 +131,60 @@ class YOLODatasetAdv(YOLODataset):
             im = im[..., None]
         return im, (h0, w0), im.shape[:2]
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        """Return transformed clean and adversarial label information for given index."""
-        # 1. Load clean image and label
-        label_clean = self.get_image_and_label(index)
-        
-        # 2. Temporarily set load_image to load_adv_image to get adversarial label structure
-        original_load_image = self.load_image
-        try:
-            self.load_image = lambda idx, rect_mode=True: self.load_adv_image(idx, rect_mode=rect_mode)
-            label_adv = self.get_image_and_label(index)
-        finally:
-            self.load_image = original_load_image
-            
-        # 3. Apply the exact same transformations to both clean and adversarial images by saving/restoring RNG state
-        import random as py_random
-        
-        random_state = py_random.getstate()
-        np_state = np.random.get_state()
-        torch_state = torch.get_rng_state()
-        
-        # Apply transforms to clean
-        transformed_clean = self.transforms(label_clean)
-        
-        # Restore random state
-        py_random.setstate(random_state)
-        np.random.set_state(np_state)
-        torch.set_rng_state(torch_state)
-        
-        # Apply transforms to adversarial image (temporarily override load_image to handle mosaic/mixup components)
-        try:
-            self.load_image = lambda idx, rect_mode=True: self.load_adv_image(idx, rect_mode=rect_mode)
-            transformed_adv = self.transforms(label_adv)
-        finally:
-            self.load_image = original_load_image
-            
-        # 4. Save the transformed adversarial image inside the clean label dict
-        transformed_clean["img_adv"] = transformed_adv["img"]
-        return transformed_clean
-
-    @staticmethod
-    def collate_fn(batch: list[dict]) -> dict:
-        """Collate both clean and adversarial data samples into batches."""
-        new_batch = {}
-        batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
-        keys = batch[0].keys()
-        values = list(zip(*[list(b.values()) for b in batch]))
-        for i, k in enumerate(keys):
-            value = values[i]
-            if k in {"img", "img_adv", "text_feats", "sem_masks"}:
-                value = torch.stack(value, 0)
-            elif k == "visuals":
-                value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
-                value = torch.cat(value, 0)
-            new_batch[k] = value
-        new_batch["batch_idx"] = list(new_batch["batch_idx"])
-        for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
-        return new_batch
-
 
 class DetectionTrainer(BaseTrainer):
-    """A class extending the BaseTrainer class for training based on a detection model.
+    """A class extending the BaseTrainer class for dynamic pool-based adversarial training."""
 
-    This trainer specializes in object detection tasks, handling the specific requirements for training YOLO models for
-    object detection including dataset building, data loading, preprocessing, and model configuration.
-
-    Attributes:
-        model (DetectionModel): The YOLO detection model being trained.
-        data (dict): Dictionary containing dataset information including class names and number of classes.
-        loss_names (tuple): Names of the loss components used in training (box_loss, cls_loss, dfl_loss).
-
-    Methods:
-        build_dataset: Build YOLO dataset for training or validation.
-        get_dataloader: Construct and return dataloader for the specified mode.
-        preprocess_batch: Preprocess a batch of images by scaling and converting to float.
-        set_model_attributes: Set model attributes based on dataset information.
-        get_model: Return a YOLO detection model.
-        get_validator: Return a validator for model evaluation.
-        label_loss_items: Return a loss dictionary with labeled training loss items.
-        progress_string: Return a formatted string of training progress.
-        plot_training_samples: Plot training samples with their annotations.
-        plot_training_labels: Create a labeled training plot of the YOLO model.
-        auto_batch: Calculate optimal batch size based on model memory requirements.
-
-    Examples:
-        >>> from ultralytics.models.yolo.detect import DetectionTrainer
-        >>> args = dict(model="yolo11n.pt", data="coco8.yaml", epochs=3)
-        >>> trainer = DetectionTrainer(overrides=args)
-        >>> trainer.train()
-    """
-
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None, attack_weights = ""):
-        """Initialize a DetectionTrainer object for training YOLO object detection model training.
-
-        Args:
-            cfg (dict, optional): Default configuration dictionary containing training parameters.
-            overrides (dict, optional): Dictionary of parameter overrides for the default configuration.
-            _callbacks (list, optional): List of callback functions to be executed during training.
-            attack_weights (str, optional): Path to the attack model weights.
-        """
-
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+        """Initialize a DetectionTrainer object."""
         if overrides is None:
             overrides = {}
-        self._attack_weights_arg = attack_weights or overrides.pop("attack_weights", "")
         self._attack_name_arg = overrides.pop("attack_name", "cw")
         self._use_pregenerated_adv_arg = overrides.pop("use_pregenerated_adv", False)
+        
+        # Get dynamic pool overrides
+        self._attack_mix_ratio_arg = overrides.pop("attack_mix_ratio", 0.5)
+        self._num_aug_arg = overrides.pop("num_aug", 5)
+        self._pool_update_period_arg = overrides.pop("pool_update_period", 5)
 
         super().__init__(cfg, overrides, _callbacks)
 
-        if not hasattr(self.args, "attack_weights"):
-            self.args.attack_weights = self._attack_weights_arg
         if not hasattr(self.args, "attack_name"):
             self.args.attack_name = self._attack_name_arg
         if not hasattr(self.args, "use_pregenerated_adv"):
             self.args.use_pregenerated_adv = self._use_pregenerated_adv_arg
+        if not hasattr(self.args, "attack_mix_ratio"):
+            self.args.attack_mix_ratio = self._attack_mix_ratio_arg
+        if not hasattr(self.args, "num_aug"):
+            self.args.num_aug = self._num_aug_arg
+        if not hasattr(self.args, "pool_update_period"):
+            self.args.pool_update_period = self._pool_update_period_arg
         
-        self.attack_model = None
         self.attacker = None
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
-        """Build YOLO Dataset for training or validation.
-
-        Args:
-            img_path (str): Path to the folder containing images.
-            mode (str): 'train' mode or 'val' mode, users are able to customize different augmentations for each mode.
-            batch (int, optional): Size of batches, this is for 'rect' mode.
-
-        Returns:
-            (Dataset): YOLO dataset object configured for the specified mode.
-        """
+        """Build YOLO Dataset for training or validation."""
         gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
-        if mode == "train" and getattr(self.args, "use_pregenerated_adv", False):
-            return YOLODatasetAdv(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        if mode == "train":
+            # For training, load from the dynamic pool in /scratch
+            scratch_base = os.environ.get("SCRATCH", "/scratch/czhan295")
+            temp_dir = Path(scratch_base) / "train_adv_temp" / self.save_dir.name
+            clean_dir = temp_dir / "clean"
+            attacked_dir = temp_dir / "attacked"
+            return YOLODynamicPoolDataset(
+                self.args,
+                clean_dir=clean_dir,
+                attacked_dir=attacked_dir,
+                batch=batch,
+                data=self.data,
+                mode=mode,
+                rect=mode == "val",
+                stride=gs,
+            )
         return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
-        """Construct and return dataloader for the specified mode.
-
-        Args:
-            dataset_path (str): Path to the dataset.
-            batch_size (int): Number of images per batch.
-            rank (int): Process rank for distributed training.
-            mode (str): 'train' for training dataloader, 'val' for validation dataloader.
-
-        Returns:
-            (DataLoader): PyTorch dataloader object.
-        """
+        """Construct and return dataloader for the specified mode."""
         assert mode in {"train", "val"}, f"Mode must be 'train' or 'val', not {mode}."
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
             dataset = self.build_dataset(dataset_path, mode, batch_size)
@@ -259,14 +202,7 @@ class DetectionTrainer(BaseTrainer):
         )
 
     def preprocess_batch(self, batch: dict) -> dict:
-        """Preprocess a batch of images by scaling and converting to float.
-
-        Args:
-            batch (dict): Dictionary containing batch data with 'img' tensor.
-
-        Returns:
-            (dict): Preprocessed batch with normalized images.
-        """
+        """Preprocess a batch of images by scaling and converting to float."""
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
@@ -301,65 +237,45 @@ class DetectionTrainer(BaseTrainer):
         self.model.names = self.data["names"]
         self.model.args = self.args
 
-        attack_weights = getattr(self.args, "attack_weights", None)
         attack_name = getattr(self.args, "attack_name", "cw")
-        LOGGER.info(f"Debug: attack_weights from args = {attack_weights}, type = {type(attack_weights)}")
-
-        if attack_weights:
-            try:
-                LOGGER.info(f"Attempting to load attack model from: {attack_weights}")
-                imgsz = getattr(self.args, "imgsz", 640)
-                self.attack_model = setup_attack_model(
-                    attack_weights,
-                    device=self.device,
-                    nc=self.data["nc"],
-                    training=False,
-                    imgsz=imgsz,
-                )
-                LOGGER.info(f"Attack model loaded successfully from {attack_weights}")
-
-                self.attack_model.eval()
-                for p in self.attack_model.parameters():
-                    p.requires_grad = True
-
-                self.attacker = build_attacker(attack_name, model=self.attack_model, img_size=imgsz)
-                LOGGER.info(f"attacker initialized: {attack_name}")
-            except Exception as e:
-                LOGGER.warning(f"Failed to load attack model or attacker: {e}")
-                import traceback
-                LOGGER.warning(traceback.format_exc())
-                self.attack_model = None
-                self.attacker = None
-        else:
-            LOGGER.info("No attack weights provided, adversarial training disabled")
+        try:
+            imgsz = getattr(self.args, "imgsz", 640)
+            self.attacker = build_attacker(attack_name, model=unwrap_model(self.model), img_size=imgsz)
+            LOGGER.info(f"Attacker initialized using training model weights: {attack_name}")
+        except Exception as e:
+            LOGGER.warning(f"Failed to initialize attacker: {e}")
+            import traceback
+            LOGGER.warning(traceback.format_exc())
+            self.attacker = None
 
     def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
-        """Return a YOLO detection model.
-
-        Args:
-            cfg (str, optional): Path to model configuration file.
-            weights (str, optional): Path to model weights.
-            verbose (bool): Whether to display model information.
-
-        Returns:
-            (DetectionModel): YOLO detection model.
-        """
+        """Return a YOLO detection model."""
         model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
         if weights:
             model.load(weights)
         return model
+
+    def setup_model(self):
+        """Override to cache ckpt for resume support when called early."""
+        if hasattr(self, "_cached_ckpt"):
+            ckpt = self._cached_ckpt
+            delattr(self, "_cached_ckpt")
+            return ckpt
+        if isinstance(self.model, torch.nn.Module):
+            return getattr(self, "_resumed_ckpt", None)
+            
+        ckpt = super().setup_model()
+        self._resumed_ckpt = ckpt
+        return ckpt
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
 
         validator_args = copy(self.args)
-        if hasattr(validator_args, 'attack_weights'):
-            delattr(validator_args, 'attack_weights')
-        if hasattr(validator_args, 'attack_name'):
-            delattr(validator_args, 'attack_name')
-        if hasattr(validator_args, 'use_pregenerated_adv'):
-            delattr(validator_args, 'use_pregenerated_adv')
+        for key in ['attack_weights', 'attack_name', 'use_pregenerated_adv', 'attack_mix_ratio', 'num_aug', 'pool_update_period']:
+            if hasattr(validator_args, key):
+                delattr(validator_args, key)
 
         validator = DetectionValidatorAdv(
             self.test_loader, save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks
@@ -369,15 +285,7 @@ class DetectionTrainer(BaseTrainer):
         return validator
 
     def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
-        """Return a loss dict with labeled training loss items tensor.
-
-        Args:
-            loss_items (list[float], optional): List of loss values.
-            prefix (str): Prefix for keys in the returned dictionary.
-
-        Returns:
-            (dict | list): Dictionary of labeled loss items if loss_items is provided, otherwise list of keys.
-        """
+        """Return a loss dict with labeled training loss items tensor."""
         keys = [f"{prefix}/{x}" for x in self.loss_names]
         if loss_items is not None:
             loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
@@ -386,7 +294,7 @@ class DetectionTrainer(BaseTrainer):
             return keys
 
     def progress_string(self):
-        """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
+        """Return a formatted string of training progress."""
         return ("\n" + "%11s" * (4 + len(self.loss_names))) % (
             "Epoch",
             "GPU_mem",
@@ -396,12 +304,7 @@ class DetectionTrainer(BaseTrainer):
         )
 
     def plot_training_samples(self, batch: dict[str, Any], ni: int) -> None:
-        """Plot training samples with their annotations.
-
-        Args:
-            batch (dict[str, Any]): Dictionary containing batch data.
-            ni (int): Number of iterations.
-        """
+        """Plot training samples with their annotations."""
         plot_images(
             labels=batch,
             paths=batch["im_file"],
@@ -416,27 +319,15 @@ class DetectionTrainer(BaseTrainer):
         plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
 
     def auto_batch(self):
-        """Get optimal batch size by calculating memory occupation of model.
-
-        Returns:
-            (int): Optimal batch size.
-        """
+        """Get optimal batch size by calculating memory occupation of model."""
         with override_configs(self.args, overrides={"cache": False}) as self.args:
             train_dataset = self.build_dataset(self.data["train"], mode="train", batch=16)
         max_num_obj = max(len(label["cls"]) for label in train_dataset.labels) * 4  # 4 for mosaic augmentation
         del train_dataset  # free memory
         return super().auto_batch(max_num_obj)
 
-    def generate_adversarial(self, batch: dict) -> torch.Tensor | None:
-        """
-        Generate adversarial images for a batch.
-
-        The attack bridge automatically chooses detector targets or single-label
-        classifier targets based on attacker.attack_mode / estimator type.
-        """
-        if getattr(self.args, "use_pregenerated_adv", False):
-            return batch.get("img_adv")
-
+    def _generate_adversarial_batch(self, batch: dict) -> torch.Tensor | None:
+        """Helper to generate adversarial images for a single batch."""
         if self.attacker is None:
             return None
 
@@ -445,8 +336,9 @@ class DetectionTrainer(BaseTrainer):
                 self.attacker.proxy_model.current_paths = batch.get("im_file", [])
             if hasattr(self.attacker, "estimator") and hasattr(self.attacker.estimator, "model"):
                 self.attacker.estimator.model.current_paths = batch.get("im_file", [])
-            if self.attack_model is not None and hasattr(self.attack_model, "current_paths"):
-                self.attack_model.current_paths = batch.get("im_file", [])
+            model_to_attack = unwrap_model(self.model)
+            if hasattr(model_to_attack, "current_paths"):
+                model_to_attack.current_paths = batch.get("im_file", [])
 
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 imgs_adv = run_attack_on_batch(self.attacker, batch, label_policy="largest_box")
@@ -456,10 +348,213 @@ class DetectionTrainer(BaseTrainer):
             LOGGER.warning(f"Adversarial generation failed: {e}. Skipping attack for this batch.")
             return None
 
+    def generate_adversarial(self, batch: dict) -> torch.Tensor | None:
+        """Override to disable on-the-fly generation during the training step."""
+        return None
+
+    def generate_pools(self, gen_epoch=None):
+        """
+        Generate num_aug random augmented images per input image,
+        apply the attack using updated model weights, and save them.
+        """
+        import shutil
+        import json
+        from PIL import Image
+
+        if gen_epoch is None:
+            gen_epoch = getattr(self, "epoch", 0)
+
+        # Ensure we have our temp directories in /scratch
+        scratch_base = os.environ.get("SCRATCH", "/scratch/czhan295")
+        temp_dir = Path(scratch_base) / "train_adv_temp" / self.save_dir.name
+        clean_dir = temp_dir / "clean"
+        attacked_dir = temp_dir / "attacked"
+        info_file = temp_dir / "pool_info.json"
+
+        if RANK in {-1, 0}:
+            LOGGER.info(f"Dynamic Pool Generation: Starting pool generation under {temp_dir} for epoch {gen_epoch}...")
+            
+            # Remove info file to mark pool as incomplete during generation
+            if info_file.exists():
+                info_file.unlink()
+
+            # Recreate directories to be clean
+            if clean_dir.exists():
+                shutil.rmtree(clean_dir)
+            if attacked_dir.exists():
+                shutil.rmtree(attacked_dir)
+
+            (clean_dir / "images").mkdir(parents=True, exist_ok=True)
+            (clean_dir / "labels").mkdir(parents=True, exist_ok=True)
+            (attacked_dir / "images").mkdir(parents=True, exist_ok=True)
+            
+            # Put the model in eval mode for attack generation
+            self.model.eval()
+
+            # Create a generator dataset representing the original dataset with augmentations
+            gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
+            gen_dataset = build_yolo_dataset(
+                self.args,
+                self.data["train"],
+                self.args.batch,
+                self.data,
+                mode="train",
+                rect=False,
+                stride=gs,
+            )
+
+            N = len(gen_dataset)
+            num_aug = getattr(self.args, "num_aug", 5)
+            LOGGER.info(f"Dynamic Pool Generation: Original dataset has {N} images. Generating {num_aug * N} augmented images...")
+
+            # 1. Generate clean augmented images and labels in parallel using DataLoader
+            repeat_dataset = RepeatDataset(gen_dataset, num_aug)
+            clean_generator_loader = torch.utils.data.DataLoader(
+                repeat_dataset,
+                batch_size=self.args.batch if self.args.batch else 16,
+                num_workers=self.args.workers if self.args.workers is not None else 3,
+                collate_fn=collate_fn_list,
+                worker_init_fn=worker_init_fn,
+                shuffle=False,
+                pin_memory=False,
+            )
+
+            for batch in clean_generator_loader:
+                for sample in batch:
+                    try:
+                        img_tensor = sample["img"]  # (3, H, W)
+                        cls = sample["cls"]  # (num_objs, 1)
+                        bboxes = sample["bboxes"]  # (num_objs, 4)
+                        i = sample["orig_idx"]
+                        j = sample["aug_idx"]
+
+                        # Convert from CHW PyTorch tensor to HWC NumPy uint8
+                        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+                        img_pil = Image.fromarray(img_np)
+
+                        # Save clean augmented image
+                        img_name = f"img_{i}_aug_{j}.jpg"
+                        img_pil.save(clean_dir / "images" / img_name)
+
+                        # Save label (YOLO text format)
+                        lbl_name = f"img_{i}_aug_{j}.txt"
+                        with open(clean_dir / "labels" / lbl_name, "w") as f:
+                            for c_val, box in zip(cls, bboxes):
+                                f.write(f"{int(c_val)} {box[0]:.6f} {box[1]:.6f} {box[2]:.6f} {box[3]:.6f}\n")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to generate augmented image sample: {e}")
+
+            LOGGER.info("Dynamic Pool Generation: Clean augmented dataset generated. Running attacks...")
+
+            # 2. If attacker is active, generate attacked images
+            if self.attacker is not None:
+                # We build a YOLODataset over the generated clean augmented images
+                clean_aug_dataset = YOLODataset(
+                    img_path=str(clean_dir / "images"),
+                    imgsz=self.args.imgsz,
+                    batch_size=self.args.batch,
+                    augment=False,
+                    hyp=self.args,
+                    rect=False,
+                    stride=gs,
+                    single_cls=self.args.single_cls or False,
+                    classes=self.args.classes,
+                    data=self.data,
+                    task=self.args.task,
+                )
+
+                clean_aug_loader = build_dataloader(
+                    clean_aug_dataset,
+                    batch=self.args.batch,
+                    workers=self.args.workers,
+                    shuffle=False,
+                    rank=-1,  # Serial processing for pool generation is safer and simpler
+                )
+
+                # Process batches to generate attacks
+                for batch in clean_aug_loader:
+                    batch = self.preprocess_batch(batch)
+                    
+                    # Generate adversarial images for this batch
+                    imgs_adv = self._generate_adversarial_batch(batch)
+                    
+                    if imgs_adv is None:
+                        imgs_adv = batch["img"]
+                        
+                    im_files = batch["im_file"]
+                    for idx_in_batch in range(len(im_files)):
+                        img_name = Path(im_files[idx_in_batch]).name
+                        attacked_path = attacked_dir / "images" / img_name
+                        
+                        img_adv = imgs_adv[idx_in_batch]  # (3, H, W)
+                        img_adv_np = (img_adv.permute(1, 2, 0).detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                        
+                        Image.fromarray(img_adv_np).save(attacked_path)
+
+            # Write pool_info.json to mark completion
+            pool_info = {
+                "epoch": gen_epoch,
+                "num_aug": num_aug,
+                "completed": True
+            }
+            with open(info_file, "w") as f:
+                json.dump(pool_info, f, indent=4)
+            LOGGER.info("Dynamic Pool Generation: Successfully generated clean and attacked image pools.")
+
+        if self.world_size > 1:
+            dist.barrier()
+
+    def check_pool_valid(self, target_epoch: int) -> bool:
+        """Check if the pre-generated pool matches the target epoch, expected num_aug, and was fully generated."""
+        import json
+        scratch_base = os.environ.get("SCRATCH", "/scratch/czhan295")
+        pool_dir = Path(scratch_base) / "train_adv_temp" / self.save_dir.name
+        info_file = pool_dir / "pool_info.json"
+        clean_img_dir = pool_dir / "clean" / "images"
+
+        if not info_file.exists() or not clean_img_dir.exists():
+            return False
+
+        try:
+            with open(info_file, "r") as f:
+                info = json.load(f)
+            
+            completed = info.get("completed", False)
+            gen_epoch = info.get("epoch", -1)
+            num_aug = info.get("num_aug", -1)
+            
+            expected_num_aug = getattr(self.args, "num_aug", 5)
+
+            if completed and gen_epoch == target_epoch and num_aug == expected_num_aug:
+                if len(list(clean_img_dir.glob("*.jpg"))) > 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _do_train(self):
         """Train the model with the specified world size."""
         if self.world_size > 1:
             self._setup_ddp()
+
+        # Load/instantiate the model early so we can unwrap it and generate pools
+        if not isinstance(self.model, torch.nn.Module):
+            ckpt = self.setup_model()
+            self.model = self.model.to(self.device)
+            self.set_model_attributes()
+            # Cache the checkpoint for standard trainer initialization
+            self._cached_ckpt = ckpt
+
+        # Initial pool generation check
+        pool_update_period = getattr(self.args, "pool_update_period", 5)
+        expected_gen_epoch = (self.start_epoch // pool_update_period) * pool_update_period
+
+        if not self.check_pool_valid(expected_gen_epoch):
+            LOGGER.info(f"Dynamic Pool Check: No valid complete pool found for epoch {expected_gen_epoch}. Regenerating...")
+            self.generate_pools(gen_epoch=expected_gen_epoch)
+        else:
+            LOGGER.info(f"Dynamic Pool Check: Valid complete pool found for epoch {expected_gen_epoch}. Reusing existing pool.")
+
         self._setup_train()
 
         nb = len(self.train_loader)  # number of batches
@@ -487,11 +582,21 @@ class DetectionTrainer(BaseTrainer):
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
+            # Pool update check
+            pool_update_period = getattr(self.args, "pool_update_period", 5)
+            if epoch > self.start_epoch and epoch % pool_update_period == 0:
+                LOGGER.info(f"Dynamic Pool Update: Regenerating clean and attacked image pools at epoch {epoch}...")
+                self.generate_pools()
+                # Re-initialize training dataloader to read new pool files
+                batch_size = self.batch_size // max(self.world_size, 1)
+                self.train_loader = self.get_dataloader(
+                    self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+                )
+
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
-            # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
                 self._close_dataloader_mosaic()
                 self.train_loader.reset()
@@ -508,47 +613,23 @@ class DetectionTrainer(BaseTrainer):
                     xi = [0, nw]  # x interp
                     self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
                     for j, x in enumerate(self.optimizer.param_groups):
-                        # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                         x["lr"] = np.interp(
                             ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
-                # Forward
-                # Forward & Backward (Split for Clean and Adv)
+                # Forward (Single forward/backward pass using the mixed pool batch)
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    # Adversarial training: Generate BEFORE clean forward
-                    imgs_adv = self.generate_adversarial(batch)
-
-                    # 1. Clean Forward
                     if self.args.compile:
                         preds = self.model(batch["img"])
                         loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
                     else:
                         loss, self.loss_items = self.model(batch)
                 
-                # 1. Clean Backward
+                # Backward
                 self.scaler.scale(loss.sum()).backward()
-
-                # 2. Adversarial Forward & Backward
-                if imgs_adv is not None:
-                    with autocast(self.amp):
-                        batch_adv = batch.copy()
-                        batch_adv["img"] = imgs_adv
-                        if self.args.compile:
-                            preds_adv = self.model(batch_adv["img"])
-                            loss_adv, loss_items_adv = unwrap_model(self.model).loss(batch_adv, preds_adv)
-                        else:
-                            loss_adv, loss_items_adv = self.model(batch_adv)
-                    
-                    # 2. Adversarial Backward
-                    self.scaler.scale(loss_adv.sum()).backward()
-
-                    # Accumulate for logging
-                    self.loss_items = self.loss_items + loss_items_adv
-                    loss = loss + loss_adv
 
                 # Logging updates
                 self.loss = loss.sum()
@@ -649,4 +730,3 @@ class DetectionTrainer(BaseTrainer):
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
-

@@ -1,5 +1,5 @@
 import argparse
-from ultralytics.models.yolo.detect.train_adv import DetectionTrainer
+from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
 
 
 def main():
@@ -9,7 +9,9 @@ def main():
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch', type=int, default=24)
     parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
-    parser.add_argument('--attack_name', default='cw', help='Attack name passed to the shared factory, e.g. fgsm, pgd, mim, cw, bim, deepfool, jsma, uap, autoattack')
+    parser.add_argument('--attack_num', type=int, default=1, help='Number of attack types')
+    parser.add_argument('--attack_name', nargs='+', default=['pgd'], help='Attack name or list of attack names')
+    parser.add_argument('--attack_ratio', nargs='+', default=['0.5'], help='Attack ratio or list of attack ratios')
     parser.add_argument('--use_pregenerated_adv', action='store_true', help='Load pre-generated adversarial images from disk')
     parser.add_argument('--device', default='0,1')
     parser.add_argument('--imgsz', type=int, default=640)
@@ -29,6 +31,8 @@ def main():
         imgsz=args.imgsz,
         workers=args.workers,
         attack_name=args.attack_name,
+        attack_num=args.attack_num,
+        attack_ratio=args.attack_ratio,
         use_pregenerated_adv=args.use_pregenerated_adv,
         project=args.project,
         name=args.name,

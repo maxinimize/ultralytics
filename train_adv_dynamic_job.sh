@@ -86,32 +86,22 @@ mkdir -p logs
 #   --name=train_dp_5ep \
 #   --resume
 
-python train_adv_run.py \
-  --model=yolo12l.pt \
-  --attack_weights=yolo12l.pt \
-  --data=coco_train.yaml \
-  --imgsz=640 \
-  --epochs=40 \
-  --batch=${GLOBAL_BATCH} \
-  --device=0 \
-  --workers=${NUM_WORKERS} \
-  --attack_name=pgd \
-  --project=runs \
-  --name=train_pgd_withPretrainedAdvImg_noAugAll_compare \
-  --use_pregenerated_adv \
-  --no_train_aug
-
-# python train_adv_run.py \
+# python train_adv_dynamic_run.py \
 #   --model=yolo12l.pt \
-#   --attack_weights=yolo12l.pt \
 #   --data=coco_train.yaml \
 #   --imgsz=640 \
-#   --epochs=5 \
+#   --epochs=100 \
 #   --batch=${GLOBAL_BATCH} \
 #   --device=0 \
 #   --workers=${NUM_WORKERS} \
 #   --attack_name=pgd \
 #   --project=runs \
-#   --name=train_pgd_random \
+#   --name=train_pgd_dynamic_pool_100eps_2augs3cycs \
+#   --attack_mix_ratio=0.5 \
+#   --num_aug=2 \
+#   --pool_update_period=3 \
 
-  
+python train_adv_dynamic_run.py \
+  --resume runs/train_jsma_dynamic_pool_100eps/weights/last.pt \
+  --device=0 \
+  --workers=${NUM_WORKERS}

@@ -27,6 +27,7 @@ class ARTCW(Attacker):
         confidence=0.0,
         c=1e-4,
         img_size=640,
+        verbose=False,
     ):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
@@ -50,6 +51,8 @@ class ARTCW(Attacker):
             cw_kwargs["confidence"] = confidence
         if "c" in sig.parameters:
             cw_kwargs["c"] = c
+        if "verbose" in sig.parameters:
+            cw_kwargs["verbose"] = verbose
 
         self.attack = CarliniLInfMethod(**cw_kwargs)
 

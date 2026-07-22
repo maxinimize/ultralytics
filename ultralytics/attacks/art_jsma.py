@@ -24,6 +24,7 @@ class ARTJSMA(Attacker):
         epsilon=0.1,
         batch_size=1,
         img_size=640,
+        verbose=False,
     ):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
@@ -34,12 +35,18 @@ class ARTJSMA(Attacker):
         self.proxy_model, self.estimator = build_classifier_estimator(self.model, img_size=img_size)
         effective_theta = epsilon if epsilon is not None else theta
 
-        self.attack = SaliencyMapMethod(
-            classifier=self.estimator,
-            theta=effective_theta,
-            gamma=gamma,
-            batch_size=batch_size,
-        )
+        import inspect
+        jsma_kwargs = {
+            "classifier": self.estimator,
+            "theta": effective_theta,
+            "gamma": gamma,
+            "batch_size": batch_size,
+        }
+        sig = inspect.signature(SaliencyMapMethod.__init__)
+        if "verbose" in sig.parameters:
+            jsma_kwargs["verbose"] = verbose
+
+        self.attack = SaliencyMapMethod(**jsma_kwargs)
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         labels = normalize_classifier_targets(targets)

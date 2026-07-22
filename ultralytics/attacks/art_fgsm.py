@@ -56,7 +56,7 @@ class ARTFGSM(Attacker):
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         x: (N,C,H,W) in [0,1]
-        targets: (M,6) [img_idx, cls, x, y, w, h] (xywh 归一化)
+        targets: (M,6) [img_idx, cls, x, y, w, h] (normalized xywh)
         """
         n, _, h, w = x.shape
         y_art = self._to_art_labels(targets, h, w, n)

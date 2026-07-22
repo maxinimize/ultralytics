@@ -14,7 +14,7 @@ class ARTDeepFool(Attacker):
     requires_targets = True
     target_format = "single_label"
 
-    def __init__(self, model, config=None, target=None, epsilon=0.05, img_size=640):
+    def __init__(self, model, config=None, target=None, epsilon=0.05, img_size=640, verbose=False):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
         self.model.eval()
@@ -23,10 +23,18 @@ class ARTDeepFool(Attacker):
 
         self.proxy_model, self.estimator = build_classifier_estimator(self.model, img_size=img_size)
 
+        import inspect
+        df_kwargs = {}
+        sig = inspect.signature(DeepFool.__init__)
+        if "epsilon" in sig.parameters:
+            df_kwargs["epsilon"] = epsilon
+        if "verbose" in sig.parameters:
+            df_kwargs["verbose"] = verbose
+
         try:
-            self.attack = DeepFool(estimator=self.estimator, epsilon=epsilon)
+            self.attack = DeepFool(estimator=self.estimator, **df_kwargs)
         except TypeError:
-            self.attack = DeepFool(classifier=self.estimator, epsilon=epsilon)
+            self.attack = DeepFool(classifier=self.estimator, **df_kwargs)
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         labels = normalize_classifier_targets(targets)

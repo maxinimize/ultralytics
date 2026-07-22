@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=yolov8_val
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-23:59        
+#SBATCH --time=0-2:59        
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:h100:1
@@ -25,20 +25,33 @@ export PYTHONPATH=/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v4
 # activate virtual environment
 source .yolo_env/bin/activate
 
-#run validation
-python val_adv_run.py \
-  --weights=runs/detect/train31/weights/best.pt \
-  --data=coco_val.yaml \
-  --attack_weights=yolo12l.pt \
-  --attack_name=pgd \
-  --project=runs \
-  --name=val_pgd
+# run validation
+# python val_adv_run.py \
+#   --weights=runs/yolo12l.pt \
+#   --data=coco_val.yaml \
+#   --attack_weights=yolo12l.pt \
+#   --attack_name=dp \
+#   --project=runs \
+#   --name=val_dp_on_raw
 
 # python val_adv_run.py \
 #   --weights=yolo12l.pt \
 #   --data=coco_val.yaml \
-#   --attack_weights=yolo12l.pt \
-#   --attack_name=bim \
-#   --batch=16 \
 #   --project=runs \
-#   --name=val_bim
+#   --name=val_raw_on_raw
+
+
+# python val_adv_run.py \
+#   --weights=runs/train_online_pgd_bim_mim_5h_0.25/weights/best.pt \
+#   --data=coco_train_traffic.yaml \
+#   --attack_weights=yolo12l.pt \
+#   --attack_name=mim \
+#   --project=runs \
+#   --name=val_online_pgd_bim_mim_traffic_0.25_mim
+
+
+python val_adv_run.py \
+  --weights=runs/train_online_pgd_bim_mim_5h_0.25/weights/best.pt \
+  --data=coco_train_traffic.yaml \
+  --project=runs \
+  --name=val_online_pgd_bim_mim_traffic_0.25_raw

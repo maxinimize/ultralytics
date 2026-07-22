@@ -429,14 +429,14 @@ class ARTPGD(Attacker):
             eps_step=lr,
             max_iter=epoch,
             targeted=False,
-            num_random_init=0,
+            num_random_init=1,
             verbose=False,
         )
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         x: (N,C,H,W) in [0,1] float
-        targets: (M,6) [img_idx, cls, x, y, w, h] 归一化 xywh
+        targets: (M,6) [img_idx, cls, x, y, w, h] normalized xywh
         """
         n, _, h, w = x.shape
         y_art = self._to_art_labels(targets, h, w, n)

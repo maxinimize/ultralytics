@@ -14,7 +14,7 @@ class ARTAutoAttack(Attacker):
     requires_targets = True
     target_format = "single_label"
 
-    def __init__(self, model, config=None, target=None, epsilon=0.05, img_size=640):
+    def __init__(self, model, config=None, target=None, epsilon=0.05, img_size=640, verbose=False):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
         self.model.eval()
@@ -23,10 +23,18 @@ class ARTAutoAttack(Attacker):
 
         self.proxy_model, self.estimator = build_classifier_estimator(self.model, img_size=img_size)
 
+        import inspect
+        aa_kwargs = {}
+        sig = inspect.signature(AutoAttack.__init__)
+        if "eps" in sig.parameters:
+            aa_kwargs["eps"] = epsilon
+        if "verbose" in sig.parameters:
+            aa_kwargs["verbose"] = verbose
+
         try:
-            self.attack = AutoAttack(estimator=self.estimator, eps=epsilon)
+            self.attack = AutoAttack(estimator=self.estimator, **aa_kwargs)
         except TypeError:
-            self.attack = AutoAttack(classifier=self.estimator, eps=epsilon)
+            self.attack = AutoAttack(classifier=self.estimator, **aa_kwargs)
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         labels = normalize_classifier_targets(targets)

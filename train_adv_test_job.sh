@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=yolov8_train
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-23:59        
+#SBATCH --time=0-11:59        
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:h100:1
-# #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:2
+# #SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_2g.20gb:1
 # #SBATCH --partition=gpubase_bygpu_b1
 #SBATCH --output=logs/%x-%j.out
 # #SBATCH --qos=devel
@@ -72,7 +72,7 @@ echo "====================="
 mkdir -p logs
 
 # Train
-# python train_adv_run.py \
+# python train_adv_test_run.py \
 #   --model=runs/train_dp_5ep/weights/last.pt \
 #   --attack_weights=yolo12l.pt \
 #   --data=coco_train.yaml \
@@ -86,32 +86,36 @@ mkdir -p logs
 #   --name=train_dp_5ep \
 #   --resume
 
-python train_adv_run.py \
-  --model=yolo12l.pt \
-  --attack_weights=yolo12l.pt \
-  --data=coco_train.yaml \
-  --imgsz=640 \
-  --epochs=40 \
-  --batch=${GLOBAL_BATCH} \
-  --device=0 \
-  --workers=${NUM_WORKERS} \
-  --attack_name=pgd \
-  --project=runs \
-  --name=train_pgd_withPretrainedAdvImg_noAugAll_compare \
-  --use_pregenerated_adv \
-  --no_train_aug
-
-# python train_adv_run.py \
+# python train_adv_test_run.py \
 #   --model=yolo12l.pt \
 #   --attack_weights=yolo12l.pt \
 #   --data=coco_train.yaml \
 #   --imgsz=640 \
-#   --epochs=5 \
+#   --epochs=40 \
 #   --batch=${GLOBAL_BATCH} \
 #   --device=0 \
 #   --workers=${NUM_WORKERS} \
-#   --attack_name=pgd \
+#   --attack_num=2 \
+#   --attack_name pgd bim \
+#   --attack_ratio 0.25 0.25 \
 #   --project=runs \
-#   --name=train_pgd_random \
+#   --name=train_pgd_bim_withPretrainedAdvImg_noAugAll_compare \
+#   --use_pregenerated_adv \
+#   --no_train_aug
+
+python train_adv_test_run.py \
+  --model=yolo12l.pt \
+  --attack_weights=yolo12l.pt \
+  --data=coco_train_traffic.yaml \
+  --imgsz=640 \
+  --epochs=50 \
+  --batch=${GLOBAL_BATCH} \
+  --device=0 \
+  --workers=${NUM_WORKERS} \
+  --attack_num=3 \
+  --attack_name="pgd bim mim" \
+  --attack_ratio="0.25 0.25 0.25" \
+  --project=runs \
+  --name=train_online_pgd_bim_mim_traffic_0.25 \
 
   

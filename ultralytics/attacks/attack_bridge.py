@@ -335,22 +335,22 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
     """
     normalized = name.lower().strip()
 
-    if normalized in {"fgsm", "fgm"}:
+    if normalized in {"fgsm"}:
         from ultralytics.attacks.art_fgsm import ARTFGSM
         return ARTFGSM(model=model, **kwargs)
     if normalized in {"pgd"}:
         from ultralytics.attacks.art_pgd import ARTPGD
         return ARTPGD(model=model, **kwargs)
-    if normalized in {"dpatch", "dp", "art_dpatch"}:
+    if normalized in {"dpatch"}:
         from ultralytics.attacks.art_dpatch import ARTDPatch
         return ARTDPatch(model=model, **kwargs)
     if normalized in {"mim"}:
         from ultralytics.attacks.art_mim import ARTMIM
         return ARTMIM(model=model, **kwargs)
-    if normalized in {"cw", "c&w", "carlini", "carlini-wagner"}:
+    if normalized in {"cw"}:
         from ultralytics.attacks.art_cw import ARTCW
         return ARTCW(model=model, **kwargs)
-    if normalized in {"bim", "ifgsm", "i-fgsm"}:
+    if normalized in {"bim"}:
         from ultralytics.attacks.art_bim import ARTBIM
         return ARTBIM(model=model, **kwargs)
     if normalized in {"deepfool"}:
@@ -359,10 +359,10 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
     if normalized in {"jsma"}:
         from ultralytics.attacks.art_jsma import ARTJSMA
         return ARTJSMA(model=model, **kwargs)
-    if normalized in {"uap", "universal"}:
+    if normalized in {"uap"}:
         from ultralytics.attacks.art_uap import ARTUAP
         return ARTUAP(model=model, **kwargs)
-    if normalized in {"autoattack", "aa"}:
+    if normalized in {"autoattack"}:
         from ultralytics.attacks.art_autoattack import ARTAutoAttack
         return ARTAutoAttack(model=model, **kwargs)
 
