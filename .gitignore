@@ -154,6 +154,7 @@ runs/
 wandb/
 .DS_Store
 logs/
+runs_new/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
