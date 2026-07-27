@@ -107,15 +107,16 @@ python train_adv_test_run.py \
   --model=yolo12l.pt \
   --attack_weights=yolo12l.pt \
   --data=coco_train_traffic.yaml \
+  --classes 1 2 3 5 7 \
   --imgsz=640 \
   --epochs=50 \
   --batch=${GLOBAL_BATCH} \
   --device=0 \
   --workers=${NUM_WORKERS} \
-  --attack_num=3 \
-  --attack_name="pgd bim mim" \
-  --attack_ratio="0.25 0.25 0.25" \
-  --project=runs \
-  --name=train_online_pgd_bim_mim_traffic_0.25 \
+  --attack_num=2 \
+  --attack_name="pgd mim" \
+  --attack_ratio="0.25 0.25" \
+  --project=runs_new \
+  --name=train_online_pgd_mim_traffic_class_mod_0.25 \
 
   

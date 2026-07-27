@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--name', default='exp', help='Experiment name')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='Resume training from last checkpoint')
     parser.add_argument('--no_train_aug', action='store_true', help='Disable YOLO training augmentations for adversarial training.')
+    parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices, e.g. --classes 1 2 3 5 7')
     args = parser.parse_args()
 
     overrides = dict(
@@ -37,6 +38,7 @@ def main():
         project=args.project,
         name=args.name,
         resume=args.resume,
+        classes=args.classes,
     )
 
     if args.no_train_aug:

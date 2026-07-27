@@ -42,16 +42,18 @@ source .yolo_env/bin/activate
 
 
 # python val_adv_run.py \
-#   --weights=runs/train_online_pgd_bim_mim_5h_0.25/weights/best.pt \
+#   --weights=runs/train_online_pgd_mim_traffic_classMod_0.375/weights/best.pt \
 #   --data=coco_train_traffic.yaml \
+#   --classes 1 2 3 5 7 \
 #   --attack_weights=yolo12l.pt \
 #   --attack_name=mim \
 #   --project=runs \
-#   --name=val_online_pgd_bim_mim_traffic_0.25_mim
+#   --name=val_online_pgd_mim_traffic_classMod_0.375_mim
 
 
 python val_adv_run.py \
-  --weights=runs/train_online_pgd_bim_mim_5h_0.25/weights/best.pt \
+  --weights=runs/train_online_pgd_mim_traffic_classMod_0.375/weights/best.pt \
   --data=coco_train_traffic.yaml \
+  --classes 1 2 3 5 7 \
   --project=runs \
-  --name=val_online_pgd_bim_mim_traffic_0.25_raw
+  --name=val_online_pgd_mim_traffic_classMod_0.375_raw

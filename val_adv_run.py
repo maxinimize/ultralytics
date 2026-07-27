@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--attack_override", action="store_true", help="Force rebuilding the attacker in this validation script even if trainer._setup_train() already created one")
     parser.add_argument('--project', default='runs/val_adv', help='Project directory')
     parser.add_argument('--name', default='exp', help='Experiment name')
+    parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices, e.g. --classes 1 2 3 5 7')
     args = parser.parse_args()
 
     overrides = dict(
@@ -28,6 +29,7 @@ def main():
         attack_name=args.attack_name,
         project=args.project,
         name=args.name,
+        classes=args.classes,
     )
 
     trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
