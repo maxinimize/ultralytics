@@ -47,6 +47,7 @@ def main():
     parser.add_argument('--device', default='0', help='GPU device ID or cpu')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size for adversarial image generation')
     parser.add_argument('--split', default='train', choices=['train', 'val'], help='Dataset split to attack (train or val)')
+    parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices, e.g. --classes 1 2 3 5 7')
     args = parser.parse_args()
 
     # 1. Device setup
@@ -86,7 +87,7 @@ def main():
     cfg.cache = False
     cfg.single_cls = False
     cfg.task = 'detect'
-    cfg.classes = None
+    cfg.classes = args.classes
     cfg.fraction = 1.0
 
     dataset = build_yolo_dataset(

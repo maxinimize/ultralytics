@@ -29,7 +29,8 @@ source .yolo_env/bin/activate
 python generate_pregenerated_adv.py \
   --model yolo12l.pt \
   --data ultralytics/cfg/datasets/coco_train_traffic.yaml \
-  --attack_name mim \
+  --classes 1 2 3 5 7 \
+  --attack_name pgd \
   --imgsz 640 \
   --device 0 \
   --batch-size 16 \

@@ -205,16 +205,25 @@ class DetectionValidator(BaseValidator):
             
             ratio_sum = sum(ratios)
             weights = {}
-            if ratio_sum < 1.0:
-                weights["raw"] = 1.0 - ratio_sum
-                for att, r in zip(attack_names, ratios):
-                    weights[att] = weights.get(att, 0.0) + r
-            else:
-                weights["raw"] = 0.0
+
+            # don't use raw in validation as it can be biased
+            # if ratio_sum < 1.0:
+            #     weights["raw"] = 1.0 - ratio_sum
+            #     for att, r in zip(attack_names, ratios):
+            #         weights[att] = weights.get(att, 0.0) + r
+            # else:
+            #     weights["raw"] = 0.0
+            #     for att, r in zip(attack_names, ratios):
+            #         weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
+            
+            if ratio_sum > 0:
                 for att, r in zip(attack_names, ratios):
                     weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
-            
-            unique_runs = ["raw"]
+            else:
+                for att in attack_names:
+                    weights[att] = 1.0 / len(attack_names)
+
+            unique_runs = []
             for att in attack_names:
                 if att not in unique_runs and att != "raw":
                     unique_runs.append(att)

@@ -216,12 +216,13 @@ class DetectionValidator(BaseValidator):
                 attack_name = getattr(self, "attack_name", None)
                 im_files = batch.get("im_file", [])
                 
-                # Caching logic
+                # Caching logic (set use_cache to False to bypass reading and writing .pt cache files)
+                use_cache = False
                 all_cached = False
                 cache_paths = []
                 cached_imgs = []
                 
-                if attack_name and im_files:
+                if use_cache and attack_name and im_files:
                     all_cached = True
                     for f in im_files:
                         path = Path(f)
@@ -253,7 +254,7 @@ class DetectionValidator(BaseValidator):
                         batch["img"] = imgs_adv_cast
                         
                         # Save the generated images to cache
-                        if attack_name and im_files:
+                        if use_cache and attack_name and im_files:
                             for i, cache_path in enumerate(cache_paths):
                                 if not cache_path.exists():
                                     try:

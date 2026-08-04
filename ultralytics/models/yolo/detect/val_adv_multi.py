@@ -205,16 +205,25 @@ class DetectionValidator(BaseValidator):
 
             ratio_sum = sum(ratios)
             weights = {}
-            if ratio_sum < 1.0:
-                weights["raw"] = 1.0 - ratio_sum
-                for att, r in zip(attack_names, ratios):
-                    weights[att] = weights.get(att, 0.0) + r
-            else:
-                weights["raw"] = 0.0
+
+            # if ratio_sum < 1.0:
+            #     weights["raw"] = 1.0 - ratio_sum
+            #     for att, r in zip(attack_names, ratios):
+            #         weights[att] = weights.get(att, 0.0) + r
+            # else:
+            #     weights["raw"] = 0.0
+            #     for att, r in zip(attack_names, ratios):
+            #         weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
+
+            if ratio_sum > 0:
                 for att, r in zip(attack_names, ratios):
                     weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
+            else:
+                for att in attack_names:
+                    weights[att] = 1.0 / len(attack_names)
 
-            unique_runs = ["raw"]
+            # unique_runs = ["raw"]
+            unique_runs = []
             for att in attack_names:
                 if att not in unique_runs and att != "raw":
                     unique_runs.append(att)
@@ -400,12 +409,13 @@ class DetectionValidator(BaseValidator):
             try:
                 im_files = batch.get("im_file", [])
 
-                # Caching logic
+                # Caching logic (set use_cache to False to bypass reading and writing .pt cache files)
+                use_cache = False
                 all_cached = False
                 cache_paths = []
                 cached_imgs = []
 
-                if attack_name and im_files:
+                if use_cache and attack_name and im_files:
                     all_cached = True
                     for f in im_files:
                         path = Path(f)
@@ -437,7 +447,7 @@ class DetectionValidator(BaseValidator):
                         batch["img"] = imgs_adv_cast
 
                         # Save the generated images to cache
-                        if attack_name and im_files:
+                        if use_cache and attack_name and im_files:
                             for i, cache_path in enumerate(cache_paths):
                                 if not cache_path.exists():
                                     try:

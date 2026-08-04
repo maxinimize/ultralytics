@@ -27,7 +27,7 @@ import cv2
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
 
-from ultralytics.models.yolo.detect.val_adv_pregen_multi import DetectionValidator as DetectionValidatorAdv
+from ultralytics.models.yolo.detect.val_adv_multi import DetectionValidator as DetectionValidatorAdv
 from ultralytics.attacks.attack_utils import setup_attack_model
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 
