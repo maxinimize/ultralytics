@@ -1,0 +1,31 @@
+# HYDRA-specific experiment configuration.
+# Keep this separate from default.yaml until the integration is stable.
+
+hydra: true
+
+# Milestone 2 stage: "score" or "finetune".
+hydra_stage: score
+
+# Fraction of connections retained in each selected layer.
+# Example: keep_ratio=0.50 means 50% pruning.
+hydra_keep_ratio: 0.50
+
+# HYDRA baseline initialization.
+hydra_score_init: scaled
+
+# First implementation should use layer-wise top-k to match HYDRA behavior.
+hydra_global_pruning: false
+
+# Recommended for faithful score search: use live score parameters, not EMA.
+hydra_use_ema: false
+
+# Keep compile disabled until custom autograd, checkpoints, and DDP are verified.
+compile: false
+
+# Example Milestone-3 objective settings.
+# Adapt these names to the project's existing adversarial-training config.
+hydra_robust_objective: true
+hydra_clean_ratio: 0.50
+hydra_pgd_ratio: 0.50
+hydra_bim_ratio: 0.00
+hydra_mim_ratio: 0.00
