@@ -735,11 +735,12 @@ class BaseTrainer:
             self.accelerator.empty_cache()
 
     def read_results_csv(self):
-        """Read results.csv into a dictionary using polars."""
+        """Read results.csv into a dictionary using pandas."""
         import pandas as pd
 
         try:
-            return pl.read_csv(self.csv.read_bytes(), infer_schema_length=None).to_dict(as_series=False)
+            df = pd.read_csv(self.csv)
+            return df.to_dict(orient="list")
         except Exception:
             return {}
 

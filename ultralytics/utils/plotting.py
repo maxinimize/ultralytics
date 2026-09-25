@@ -723,14 +723,14 @@ def plot_labels(boxes, cls, names=(), save_dir=Path(""), on_plot=None):
         on_plot (Callable, optional): Function to call after plot is saved.
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
-    import polars
+    import pandas as pd
     from matplotlib.colors import LinearSegmentedColormap
 
     # Plot dataset labels
     LOGGER.info(f"Plotting labels to {save_dir / 'labels.jpg'}... ")
     nc = int(cls.max() + 1)  # number of classes
     boxes = boxes[:1000000]  # limit to 1M boxes
-    x = polars.DataFrame(boxes, schema=["x", "y", "width", "height"])
+    x = pd.DataFrame(boxes, columns=["x", "y", "width", "height"])
 
     # Matplotlib labels
     subplot_3_4_color = LinearSegmentedColormap.from_list("white_blue", ["white", "blue"])
@@ -1041,60 +1041,6 @@ def plot_images(
         on_plot(fname)
 
 
-# @plt_settings()
-# def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Callable | None = None):
-#     """Plot training results from a results CSV file. The function supports various types of data including
-#     segmentation, pose estimation, and classification. Plots are saved as 'results.png' in the directory where the
-#     CSV is located.
-
-#     Args:
-#         file (str, optional): Path to the CSV file containing the training results.
-#         dir (str, optional): Directory where the CSV file is located if 'file' is not provided.
-#         on_plot (callable, optional): Callback function to be executed after plotting. Takes filename as an argument.
-
-#     Examples:
-#         >>> from ultralytics.utils.plotting import plot_results
-#         >>> plot_results("path/to/results.csv", segment=True)
-#     """
-#     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
-#     import polars as pl
-#     from scipy.ndimage import gaussian_filter1d
-
-#     save_dir = Path(file).parent if file else Path(dir)
-#     files = list(save_dir.glob("results*.csv"))
-#     assert len(files), f"No results.csv files found in {save_dir.resolve()}, nothing to plot."
-
-#     loss_keys, metric_keys = [], []
-#     for i, f in enumerate(files):
-#         try:
-#             data = pl.read_csv(f, infer_schema_length=None)
-#             if i == 0:
-#                 for c in data.columns:
-#                     if "loss" in c:
-#                         loss_keys.append(c)
-#                     elif "metric" in c:
-#                         metric_keys.append(c)
-#                 loss_mid, metric_mid = len(loss_keys) // 2, len(metric_keys) // 2
-#                 columns = (
-#                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
-#                 )
-#                 fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
-#                 ax = ax.ravel()
-#             x = data.select(data.columns[0]).to_numpy().flatten()
-#             for i, j in enumerate(columns):
-#                 y = data.select(j).to_numpy().flatten().astype("float")
-#                 ax[i].plot(x, y, marker=".", label=f.stem, linewidth=2, markersize=8)  # actual results
-#                 ax[i].plot(x, gaussian_filter1d(y, sigma=3), ":", label="smooth", linewidth=2)  # smoothing line
-#                 ax[i].set_title(j, fontsize=12)
-#         except Exception as e:
-#             LOGGER.error(f"Plotting error for {f}: {e}")
-#     ax[1].legend()
-#     fname = save_dir / "results.png"
-#     fig.savefig(fname, dpi=200)
-#     plt.close()
-#     if on_plot:
-#         on_plot(fname)
-
 @plt_settings()
 def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Callable | None = None):
     """Plot training results from a results CSV file. The function supports various types of data including detection,
@@ -1111,24 +1057,26 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
         >>> plot_results("path/to/results.csv")
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
-    import polars as pl
+    import pandas as pd
 
     save_dir = Path(file).parent if file else Path(dir)
     files = list(save_dir.glob("results*.csv"))
-    
+
     # return early if no files found
     if not len(files):
-        return 
+        return
 
     loss_keys, metric_keys = [], []
     fig, ax = None, None
     for i, f in enumerate(files):
         try:
-            data = pl.read_csv(f.read_bytes(), infer_schema_length=None)
+            data = pd.read_csv(f)
+            data.columns = [c.strip() for c in data.columns]
+
             if i == 0:
                 for c in data.columns:
                     # Simple string matching logic remains unchanged
-                    if "loss" in c.lower(): # add lower() for robustness
+                    if "loss" in c.lower():  # add lower() for robustness
                         loss_keys.append(c)
                     elif "metric" in c.lower() or "map" in c.lower() or "precision" in c.lower() or "recall" in c.lower():
                         metric_keys.append(c)
@@ -1139,12 +1087,13 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
                 fig, ax = plt.subplots(2, (len(columns) + 1) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
                 ax = ax.ravel()
                 ax[-1].set_visible(len(columns) % 2 == 0)
-            x = data.select(data.columns[0]).to_numpy().flatten()
-            for i, j in enumerate(columns):
-                y = data.select(j).to_numpy().flatten().astype("float")
-                ax[i].plot(x, y, marker=".", label=f.stem, linewidth=2, markersize=8)  # actual results
-                ax[i].plot(x, _gaussian_filter1d(y, sigma=3), ":", label="smooth", linewidth=2)  # smoothing line
-                ax[i].set_title(j, fontsize=12)
+
+            x = data.iloc[:, 0].values
+            for j, col_name in enumerate(columns):
+                y = data[col_name].values.astype("float")
+                ax[j].plot(x, y, marker=".", label=f.stem, linewidth=2, markersize=8)  # actual results
+                ax[j].plot(x, _gaussian_filter1d(y, sigma=3), ":", label="smooth", linewidth=2)  # smoothing line
+                ax[j].set_title(col_name, fontsize=12)
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
     if ax is not None:
