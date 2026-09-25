@@ -255,9 +255,10 @@ class DetectionTrainer(BaseTrainer):
                 except Exception as e:
                     LOGGER.warning(f"Could not load attack configuration from {args_yaml}: {e}")
 
-        self._attack_weights_arg = attack_weights or overrides.pop(
+        popped_attack_weights = overrides.pop(
             "attack_weights", saved_args.get("attack_weights", "")
         )
+        self._attack_weights_arg = attack_weights or popped_attack_weights
         self._attack_name_arg = overrides.pop(
             "attack_name", saved_args.get("attack_name", "pgd")
         )

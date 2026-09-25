@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=train
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-2:59        
+#SBATCH --time=0-23:59        
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:h100:1
@@ -11,7 +11,6 @@
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 # #SBATCH --qos=devel
-#SBATCH --exclude=rg21806
 
 set -euo pipefail
 
@@ -72,8 +71,8 @@ JOB_ID="${SLURM_JOB_ID:-local}"
 ATTACK_WEIGHTS="${1:-"current"}"
 DATA="${2:-"coco_train_traffic5k.yaml"}"
 EPOCHS="${3:-"100"}"
-ATTACK_NAME="${4:-"mim worstk"}"
-ATTACK_RATIO="${5:-"0.4 0.5"}"
+ATTACK_NAME="${4:-"pgd"}"
+ATTACK_RATIO="${5:-"0.6"}"
 
 # Dynamically calculate attack_num from attack_name
 read -ra ATK_ARR <<< "${ATTACK_NAME}"
@@ -152,27 +151,26 @@ echo "====================="
 #   --name=train_online_pgd_mim_traffic_class_mod_0.75_new \
 #   --resume=runs_new/train_online_pgd_bim_mim_traffic_class_mod_0.25_new/weights/last.pt
 
-# python train_adv_test_run.py \
-#   --model=yolo12l.pt \
-#   --attack_weights="${ATTACK_WEIGHTS}" \
-#   --data="${DATA}" \
-#   --classes 0 1 2 3 5 6 7 9 11 12 \
-#   --imgsz=640 \
-#   --epochs="${EPOCHS}" \
-#   --batch=${GLOBAL_BATCH} \
-#   --device=0 \
-#   --workers=${NUM_WORKERS} \
-#   --attack_num="${ATTACK_NUM}" \
-#   --attack_name="${ATTACK_NAME}" \
-#   --attack_ratio="${ATTACK_RATIO}" \
-#   --project=runs \
-#   --name="${NAME}" \
-#   # --resume="runs/${NAME}/weights/last.pt" \
-
 python train_adv_test_run.py \
-  --device=0 \
+  --model=yolo12l.pt \
+  --attack_weights="${ATTACK_WEIGHTS}" \
+  --data="${DATA}" \
+  --classes 0 1 2 3 5 6 7 9 11 12 \
+  --imgsz=640 \
+  --epochs="${EPOCHS}" \
   --batch=${GLOBAL_BATCH} \
+  --device=0 \
   --workers=${NUM_WORKERS} \
-  --resume="runs/train_current_coco_train_traffic5k_ep100_mim_worstk_0.4_0.5/weights/last.pt"
+  --attack_num="${ATTACK_NUM}" \
+  --attack_name="${ATTACK_NAME}" \
+  --attack_ratio="${ATTACK_RATIO}" \
+  --project=runs \
+  --name="${NAME}" \
+
+# python train_adv_test_run.py \
+#   --device=0 \
+#   --batch=${GLOBAL_BATCH} \
+#   --workers=${NUM_WORKERS} \
+#   --resume="runs/train_current_coco_train_traffic5k_ep100_mim_worstk_0.4_0.5/weights/last.pt"
 
 # 2>&1 | grep --line-buffered -v "expandable_segments: memory mapping failed"

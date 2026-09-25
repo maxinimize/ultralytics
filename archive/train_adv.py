@@ -198,7 +198,8 @@ class DetectionTrainer(BaseTrainer):
 
         if overrides is None:
             overrides = {}
-        self._attack_weights_arg = attack_weights or overrides.pop("attack_weights", "")
+        popped_attack_weights = overrides.pop("attack_weights", "")
+        self._attack_weights_arg = attack_weights or popped_attack_weights
         self._attack_name_arg = overrides.pop("attack_name", "cw")
         self._use_pregenerated_adv_arg = overrides.pop("use_pregenerated_adv", False)
 
