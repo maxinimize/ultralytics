@@ -1,4 +1,5 @@
 ---
+title: Train YOLO26 Models with IBM Watsonx
 comments: true
 description: Dive into our detailed integration guide on using IBM Watson to train a YOLO26 model. Uncover key features and step-by-step instructions on model training.
 keywords: IBM Watsonx, IBM Watsonx AI, What is Watson?, IBM Watson Integration, IBM Watson Features, YOLO26, Ultralytics, Model Training, GPU, TPU, cloud computing
@@ -15,7 +16,7 @@ You can train [Ultralytics YOLO26 models](https://github.com/ultralytics/ultraly
 [Watsonx](https://www.ibm.com/products/watsonx) is IBM's cloud-based platform designed for commercial [generative AI](https://www.ultralytics.com/glossary/generative-ai) and scientific data. IBM Watsonx's three components - `watsonx.ai`, `watsonx.data`, and `watsonx.governance` - come together to create an end-to-end, trustworthy AI platform that can accelerate AI projects aimed at solving business problems. It provides powerful tools for building, training, and [deploying machine learning models](../guides/model-deployment-options.md) and makes it easy to connect with various data sources.
 
 <p align="center">
-  <img width="800" src="https://github.com/ultralytics/docs/releases/download/0/overview-of-ibm-watsonx.avif" alt="Overview of IBM Watsonx">
+  <img width="800" src="https://cdn.ul.run/i/4bdc3428aca8607280cf61dea931dd67.avif" alt="IBM Watsonx AI platform architecture overview">
 </p>
 
 Its user-friendly interface and collaborative capabilities streamline the development process and help with efficient model management and deployment. Whether for computer vision, predictive analytics, [natural language processing](https://www.ultralytics.com/glossary/natural-language-processing-nlp), or other AI applications, IBM Watsonx provides the tools and support needed to drive innovation.
@@ -75,19 +76,16 @@ Then, you can import the needed packages.
     === "Python"
 
         ```python
-        # Import ultralytics
         import ultralytics
 
         ultralytics.checks()
-
-        # Import packages to retrieve and display image files
         ```
 
 ### Step 3: Load the Data
 
 For this tutorial, we will use a [marine litter dataset](https://www.kaggle.com/datasets/atiqishrak/trash-dataset-icra19) available on Kaggle. With this dataset, we will custom-train a YOLO26 model to detect and classify litter and biological objects in underwater images.
 
-We can load the dataset directly into the notebook using the Kaggle API. First, create a free Kaggle account. Once you have created an account, you'll need to generate an API key. Directions for generating your key can be found in the [Kaggle API documentation](https://github.com/Kaggle/kaggle-api/blob/main/docs/README.md) under the section "API credentials".
+We can load the dataset directly into the notebook using the Kaggle API. First, create a free Kaggle account. Once you have created an account, you'll need to generate an API key. Directions for generating your key can be found in the [Kaggle API documentation](https://github.com/Kaggle/kaggle-cli/blob/main/docs/README.md) under the section "API credentials".
 
 Copy and paste your Kaggle username and API key into the following code. Then run the code to install the API and load the dataset into Watsonx.
 
@@ -135,7 +133,7 @@ If you see "trash_ICRA19" among the directory's contents, then it has loaded suc
 We will use the `config.yaml` file and the contents of the dataset directory to train our [object detection](https://www.ultralytics.com/glossary/object-detection) model. Here is a sample image from our marine litter data set.
 
 <p align="center">
-  <img width="400" src="https://github.com/ultralytics/docs/releases/download/0/marine-litter-bounding-box.avif" alt="Marine Litter with Bounding Box">
+  <img width="400" src="https://cdn.ul.run/i/c5011609236bd52b55cb4bdda131c483.avif" alt="Marine Litter with Bounding Box">
 </p>
 
 ### Step 4: Preprocess the Data
@@ -143,13 +141,13 @@ We will use the `config.yaml` file and the contents of the dataset directory to 
 Fortunately, all labels in the marine litter data set are already formatted as YOLO .txt files. However, we need to rearrange the structure of the image and label directories in order to help our model process the image and labels. Right now, our loaded data set directory follows this structure:
 
 <p align="center">
-  <img width="400" src="https://github.com/ultralytics/docs/releases/download/0/marine-litter-bounding-box-1.avif" alt="Loaded Dataset Directory">
+  <img width="400" src="https://cdn.ul.run/i/5c09bf4043815ed8207c803923d2a913.avif" alt="Loaded Dataset Directory">
 </p>
 
 But, YOLO models by default require separate images and labels in subdirectories within the train/val/test split. We need to reorganize the directory into the following structure:
 
 <p align="center">
-  <img width="400" src="https://github.com/ultralytics/docs/releases/download/0/yolo-directory-structure.avif" alt="YOLO Directory Structure">
+  <img width="400" src="https://cdn.ul.run/i/f851268766ed65e402efed6395cb6058.avif" alt="YOLO Directory Structure">
 </p>
 
 To reorganize the data set directory, we can run the following script:
@@ -177,7 +175,7 @@ To reorganize the data set directory, we can run the following script:
                 for filename in os.listdir(subdir_path):
                     if filename.endswith(".txt"):
                         shutil.move(os.path.join(subdir_path, filename), os.path.join(labels_dir, filename))
-                    elif filename.endswith(".jpg") or filename.endswith(".png") or filename.endswith(".jpeg"):
+                    elif filename.endswith((".jpg", ".png", ".jpeg")):
                         shutil.move(os.path.join(subdir_path, filename), os.path.join(images_dir, filename))
                     # Delete .xml files
                     elif filename.endswith(".xml"):
@@ -244,13 +242,13 @@ Run the following command-line code to fine tune a pretrained default YOLO26 mod
     === "CLI"
 
         ```bash
-        !yolo task=detect mode=train data={work_dir}/trash_ICRA19/config.yaml model=yolo26n.pt epochs=2 batch=32 lr0=.04 plots=True
+        !yolo detect train data={work_dir}/trash_ICRA19/config.yaml model=yolo26n.pt epochs=2 batch=32 lr0=.04 plots=True
         ```
 
 Here's a closer look at the parameters in the model training command:
 
-- **task**: It specifies the [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) task for which you are using the specified YOLO model and data set.
-- **mode**: Denotes the purpose for which you are loading the specified model and data. Since we are training a model, it is set to "train." Later, when we test our model's performance, we will set it to "predict."
+- **detect**: The [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) task for which you are using the specified YOLO model and data set.
+- **train**: The mode, which denotes the purpose for which you are loading the specified model and data. Later, when we test our model's performance, we will use `predict`.
 - **epochs**: This delimits the number of times YOLO26 will pass through our entire data set.
 - **batch**: The numerical value stipulates the training [batch sizes](https://www.ultralytics.com/glossary/batch-size). Batches are the number of images a model processes before it updates its parameters.
 - **lr0**: Specifies the model's initial [learning rate](https://www.ultralytics.com/glossary/learning-rate).
@@ -267,7 +265,7 @@ We can now run inference to test the performance of our fine-tuned model:
     === "CLI"
 
         ```bash
-        !yolo task=detect mode=predict source={work_dir}/trash_ICRA19/dataset/test/images model={work_dir}/runs/detect/train/weights/best.pt conf=0.5 iou=.5 save=True save_txt=True
+        !yolo detect predict source={work_dir}/trash_ICRA19/dataset/test/images model={work_dir}/runs/detect/train/weights/best.pt conf=0.5 iou=.5 save=True save_txt=True
         ```
 
 This brief script generates predicted labels for each image in our test set, as well as new output image files that overlay the predicted [bounding box](https://www.ultralytics.com/glossary/bounding-box) atop the original image.
@@ -293,18 +291,18 @@ The code above displays ten images from the test set with their predicted boundi
 
 ### Step 7: Evaluate the Model
 
-We can produce visualizations of the model's [precision](https://www.ultralytics.com/glossary/precision) and recall for each class. These visualizations are saved in the home directory, under the train folder. The precision score is displayed in the P_curve.png:
+We can produce visualizations of the model's [precision](https://www.ultralytics.com/glossary/precision) and recall for each class. These visualizations are saved in the training run directory (`{work_dir}/runs/detect/train/`). The precision score is displayed in the BoxP_curve.png:
 
 <p align="center">
-  <img width="800" src="https://github.com/ultralytics/docs/releases/download/0/precision-confidence-curve.avif" alt="Precision Confidence Curve">
+  <img width="800" src="https://cdn.ul.run/i/fc3ef091a58db523dbbb7d7eb11f83fb.avif" alt="Model precision-confidence evaluation curve">
 </p>
 
 The graph shows an exponential increase in precision as the model's confidence level for predictions increases. However, the model precision has not yet leveled out at a certain confidence level after two [epochs](https://www.ultralytics.com/glossary/epoch).
 
-The [recall](https://www.ultralytics.com/glossary/recall) graph (R_curve.png) displays an inverse trend:
+The [recall](https://www.ultralytics.com/glossary/recall) graph (BoxR_curve.png) displays an inverse trend:
 
 <p align="center">
-  <img width="800" src="https://github.com/ultralytics/docs/releases/download/0/recall-confidence-curve.avif" alt="Recall Confidence Curve">
+  <img width="800" src="https://cdn.ul.run/i/d7910d2e3174c447d49e9cff14de040a.avif" alt="Model recall-confidence evaluation curve">
 </p>
 
 Unlike precision, recall moves in the opposite direction, showing greater recall with lower confidence instances and lower recall with higher confidence instances. This is an apt example of the trade-off in precision and recall for classification models.
@@ -387,7 +385,7 @@ def organize_files(directory):
         for filename in os.listdir(subdir_path):
             if filename.endswith(".txt"):
                 shutil.move(os.path.join(subdir_path, filename), os.path.join(labels_dir, filename))
-            elif filename.endswith(".jpg") or filename.endswith(".png") or filename.endswith(".jpeg"):
+            elif filename.endswith((".jpg", ".png", ".jpeg")):
                 shutil.move(os.path.join(subdir_path, filename), os.path.join(images_dir, filename))
 
 
@@ -396,7 +394,7 @@ if __name__ == "__main__":
     organize_files(directory)
 ```
 
-For more details, refer to our [data preprocessing guide](../guides/preprocessing_annotated_data.md).
+For more details, refer to our [data preprocessing guide](../guides/preprocessing-annotated-data.md).
 
 ### What are the prerequisites for training a YOLO26 model on IBM Watsonx?
 

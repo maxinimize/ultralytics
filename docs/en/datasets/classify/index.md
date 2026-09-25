@@ -8,7 +8,7 @@ keywords: YOLO, image classification, dataset structure, CIFAR-10, Ultralytics, 
 
 ## Dataset Structure for YOLO Classification Tasks
 
-For [Ultralytics](https://www.ultralytics.com/) YOLO classification tasks, the dataset must be organized in a specific split-directory structure under the `root` directory to facilitate proper training, testing, and optional validation processes. This structure includes separate directories for training (`train`) and testing (`test`) phases, with an optional directory for validation (`val`).
+For [Ultralytics](https://www.ultralytics.com) YOLO classification tasks, the dataset must be organized in a specific split-directory structure under the `root` directory. This structure includes a `train` directory and a `val` directory (`valid` and `validation` are also accepted), with an optional `test` directory. If no validation directory exists, the `test` directory is used for validation instead.
 
 Each of these directories should contain one subdirectory for each class in the dataset. The subdirectories are named after the corresponding class and contain all the images for that class. Ensure that each image file is named uniquely and stored in a common format such as JPEG or PNG.
 
@@ -16,7 +16,7 @@ Each of these directories should contain one subdirectory for each class in the 
 
 Consider the [CIFAR-10](cifar10.md) dataset as an example. The folder structure should look like this:
 
-```
+```text
 cifar-10-/
 |
 |-- train/
@@ -37,7 +37,7 @@ cifar-10-/
 |   |
 |   |-- ...
 |
-|-- test/
+|-- test/ (optional)
 |   |-- airplane/
 |   |   |-- 10_airplane.png
 |   |   |-- 11_airplane.png
@@ -55,7 +55,7 @@ cifar-10-/
 |   |
 |   |-- ...
 |
-|-- val/ (optional)
+|-- val/
 |   |-- airplane/
 |   |   |-- 105_airplane.png
 |   |   |-- 106_airplane.png
@@ -105,7 +105,7 @@ This structured approach ensures that the model can effectively learn from well-
 
 ## Supported Datasets
 
-Ultralytics supports the following datasets with automatic download:
+Ultralytics supports the following datasets with automatic download. Most of these datasets are also hosted on [Ultralytics Platform](https://platform.ultralytics.com), where you can browse the images and annotations, view dataset statistics, and clone them for cloud training.
 
 - [Caltech 101](caltech101.md): A dataset containing images of 101 object categories for [image classification](https://www.ultralytics.com/glossary/image-classification) tasks.
 - [Caltech 256](caltech256.md): An extended version of Caltech 101 with 256 object categories and more challenging images.
@@ -117,7 +117,7 @@ Ultralytics supports the following datasets with automatic download:
 - [Imagenette](imagenette.md): A smaller subset of ImageNet that contains 10 easily distinguishable classes for quicker training and testing.
 - [Imagewoof](imagewoof.md): A more challenging subset of ImageNet containing 10 dog breed categories for image classification tasks.
 - [MNIST](mnist.md): A dataset of 70,000 grayscale images of handwritten digits for image classification tasks.
-- [MNIST160](mnist.md): First 8 images of each MNIST category from the MNIST dataset. Dataset contains 160 images total.
+- [MNIST160](mnist.md): First 8 images of each digit (0-9) from both the MNIST train and test splits. Dataset contains 160 images total.
 
 ### Adding your own dataset
 
@@ -127,21 +127,21 @@ If you have your own dataset and would like to use it for training classificatio
 
 ### How do I structure my dataset for YOLO classification tasks?
 
-To structure your dataset for Ultralytics YOLO classification tasks, you should follow a specific split-directory format. Organize your dataset into separate directories for `train`, `test`, and optionally `val`. Each of these directories should contain subdirectories named after each class, with the corresponding images inside. This facilitates smooth training and evaluation processes. For an example, consider the [CIFAR-10](cifar10.md) dataset format:
+To structure your dataset for Ultralytics YOLO classification tasks, you should follow a specific split-directory format. Organize your dataset into separate directories for `train` and `val`, and optionally `test`. Each of these directories should contain subdirectories named after each class, with the corresponding images inside. This facilitates smooth training and evaluation processes. For an example, consider the [CIFAR-10](cifar10.md) dataset format:
 
-```
+```text
 cifar-10-/
 |-- train/
 |   |-- airplane/
 |   |-- automobile/
 |   |-- bird/
 |   ...
-|-- test/
+|-- val/
 |   |-- airplane/
 |   |-- automobile/
 |   |-- bird/
 |   ...
-|-- val/ (optional)
+|-- test/ (optional)
 |   |-- airplane/
 |   |-- automobile/
 |   |-- bird/
@@ -156,7 +156,7 @@ Ultralytics YOLO supports automatic downloading of several datasets for image cl
 
 ### How do I add my own dataset for YOLO image classification?
 
-To use your own dataset with Ultralytics YOLO, ensure it follows the specified directory format required for the classification task, with separate `train`, `test`, and optionally `val` directories, and subdirectories for each class containing the respective images. Once your dataset is structured correctly, point the `data` argument to your dataset's root directory when initializing the training script. Here's an example in Python:
+To use your own dataset with Ultralytics YOLO, ensure it follows the specified directory format required for the classification task, with separate `train` and `val` directories (and optionally `test`), and subdirectories for each class containing the respective images. Once your dataset is structured correctly, point the `data` argument to your dataset's root directory when initializing the training script. Here's an example in Python:
 
 ```python
 from ultralytics import YOLO
@@ -207,4 +207,4 @@ Training a model using Ultralytics YOLO can be done easily in both Python and CL
         yolo classify train data=path/to/data model=yolo26n-cls.pt epochs=100 imgsz=640
         ```
 
-These examples demonstrate the straightforward process of training a YOLO model using either approach. For more information, visit the [Usage](#usage) section and the [Train](https://docs.ultralytics.com/tasks/classify/#train) page for classification tasks.
+These examples demonstrate the straightforward process of training a YOLO model using either approach. For more information, visit the [Usage](#usage) section and the [Train](../../tasks/classify.md#train) page for classification tasks.

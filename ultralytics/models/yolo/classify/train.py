@@ -25,7 +25,7 @@ class ClassificationTrainer(BaseTrainer):
     Attributes:
         model (ClassificationModel): The classification model to be trained.
         data (dict[str, Any]): Dictionary containing dataset information including class names and number of classes.
-        loss_names (list[str]): Names of the loss functions used during training.
+        loss_names (tuple): Names of the loss items, derived from the loss dict returned by the criterion.
         validator (ClassificationValidator): Validator instance for model evaluation.
 
     Methods:
@@ -37,7 +37,6 @@ class ClassificationTrainer(BaseTrainer):
         preprocess_batch: Preprocess a batch of images and classes.
         progress_string: Return a formatted string showing training progress.
         get_validator: Return an instance of ClassificationValidator.
-        label_loss_items: Return a loss dict with labeled training loss items.
         final_eval: Evaluate trained model and save validation results.
         plot_training_samples: Plot training samples with their annotations.
 
@@ -49,13 +48,13 @@ class ClassificationTrainer(BaseTrainer):
         >>> trainer.train()
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         """Initialize a ClassificationTrainer object.
 
         Args:
             cfg (dict[str, Any], optional): Default configuration dictionary containing training parameters.
             overrides (dict[str, Any], optional): Dictionary of parameter overrides for the default configuration.
-            _callbacks (list[Any], optional): List of callback functions to be executed during training.
+            _callbacks (dict, optional): Dictionary of callback functions to be executed during training.
         """
         if overrides is None:
             overrides = {}
@@ -84,7 +83,7 @@ class ClassificationTrainer(BaseTrainer):
             model.load(weights)
 
         for m in model.modules():
-            if not self.args.pretrained and hasattr(m, "reset_parameters"):
+            if self.args.pretrained is False and not self.resume and hasattr(m, "reset_parameters"):
                 m.reset_parameters()
             if isinstance(m, torch.nn.Dropout) and self.args.dropout:
                 m.p = self.args.dropout  # set dropout
@@ -121,7 +120,13 @@ class ClassificationTrainer(BaseTrainer):
         Returns:
             (ClassificationDataset): Dataset for the specified mode.
         """
-        return ClassificationDataset(root=img_path, args=self.args, augment=mode == "train", prefix=mode)
+        return ClassificationDataset(
+            img_path,
+            self.args,
+            augment=mode == "train",
+            prefix="train" if mode == "train" else self.args.split,
+            names=self.data["names"],
+        )
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """Return PyTorch DataLoader with transforms to preprocess images.
@@ -138,7 +143,16 @@ class ClassificationTrainer(BaseTrainer):
         with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
             dataset = self.build_dataset(dataset_path, mode)
 
-        loader = build_dataloader(dataset, batch_size, self.args.workers, rank=rank, drop_last=self.args.compile)
+        if not dataset.samples:
+            raise FileNotFoundError(
+                f"No images found in '{mode}' split of {dataset_path}. "
+                f"See https://docs.ultralytics.com/datasets/classify for cls dataset format."
+            )
+
+        drop_last = self.args.compile and mode == "train"
+        loader = build_dataloader(
+            dataset, batch_size, self.args.workers, rank=rank, drop_last=drop_last, device=self.device
+        )
         # Attach inference transforms
         if mode != "train":
             if is_parallel(self.model):
@@ -149,8 +163,8 @@ class ClassificationTrainer(BaseTrainer):
 
     def preprocess_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Preprocess a batch of images and classes."""
-        batch["img"] = batch["img"].to(self.device, non_blocking=self.device.type == "cuda")
-        batch["cls"] = batch["cls"].to(self.device, non_blocking=self.device.type == "cuda")
+        batch["img"] = batch["img"].to(self.device, non_blocking=self.device.type not in {"cpu", "mps"})
+        batch["cls"] = batch["cls"].to(self.device, non_blocking=self.device.type not in {"cpu", "mps"})
         return batch
 
     def progress_string(self) -> str:
@@ -165,34 +179,16 @@ class ClassificationTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return an instance of ClassificationValidator for validation."""
-        self.loss_names = ["loss"]
         return yolo.classify.ClassificationValidator(
             self.test_loader, self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
-
-    def label_loss_items(self, loss_items: torch.Tensor | None = None, prefix: str = "train"):
-        """Return a loss dict with labeled training loss items tensor.
-
-        Args:
-            loss_items (torch.Tensor, optional): Loss tensor items.
-            prefix (str, optional): Prefix to prepend to loss names.
-
-        Returns:
-            keys (list[str]): List of loss keys if loss_items is None.
-            loss_dict (dict[str, float]): Dictionary of loss items if loss_items is provided.
-        """
-        keys = [f"{prefix}/{x}" for x in self.loss_names]
-        if loss_items is None:
-            return keys
-        loss_items = [round(float(loss_items), 5)]
-        return dict(zip(keys, loss_items))
 
     def plot_training_samples(self, batch: dict[str, torch.Tensor], ni: int):
         """Plot training samples with their annotations.
 
         Args:
             batch (dict[str, torch.Tensor]): Batch containing images and class labels.
-            ni (int): Number of iterations.
+            ni (int): Batch index used for naming the output file.
         """
         batch["batch_idx"] = torch.arange(batch["img"].shape[0])  # add batch index for plotting
         plot_images(

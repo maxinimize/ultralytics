@@ -1,4 +1,5 @@
 ---
+title: YOLO26 on NVIDIA DGX Spark
 comments: true
 description: Learn to deploy Ultralytics YOLO26 on NVIDIA DGX Spark with our detailed guide. Explore performance benchmarks and maximize AI capabilities on this compact desktop AI supercomputer.
 keywords: Ultralytics, YOLO26, NVIDIA DGX Spark, AI deployment, performance benchmarks, deep learning, TensorRT, computer vision, GB10 Grace Blackwell
@@ -9,7 +10,7 @@ keywords: Ultralytics, YOLO26, NVIDIA DGX Spark, AI deployment, performance benc
 This comprehensive guide provides a detailed walkthrough for deploying Ultralytics YOLO26 on [NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/), NVIDIA's compact desktop AI supercomputer. Additionally, it showcases performance benchmarks to demonstrate the capabilities of YOLO26 on this powerful system.
 
 <p align="center">
-  <img width="1024" src="https://github.com/ultralytics/docs/releases/download/0/nvidia-dgx-spark.avif" alt="NVIDIA DGX Spark">
+  <img width="1024" src="https://cdn.ul.run/i/9d933b901c065efa24a018b74f4194f8.avif" alt="NVIDIA DGX Spark AI workstation overview">
 </p>
 
 !!! note
@@ -19,6 +20,17 @@ This comprehensive guide provides a detailed walkthrough for deploying Ultralyti
 ## What is NVIDIA DGX Spark?
 
 NVIDIA DGX Spark is a compact desktop AI supercomputer powered by the NVIDIA GB10 Grace Blackwell Superchip. It delivers up to 1 petaFLOP of AI computing performance with FP4 precision, making it ideal for developers, researchers, and data scientists who need powerful AI capabilities in a desktop form factor.
+
+<p align="center">
+  <br>
+  <iframe loading="lazy" width="720" height="405" src="https://www.youtube.com/embed/VHGfpOrPh-s"
+    title="YouTube video player" frameborder="0"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    allowfullscreen>
+  </iframe>
+  <br>
+  <strong>Watch:</strong> How to Get up to 1000 FPS with Ultralytics YOLO26 on NVIDIA DGX Spark | <a href="https://docs.ultralytics.com/integrations/tensorrt">TensorRT</a> & Batch Inference
+</p>
 
 ### Key Specifications
 
@@ -54,7 +66,7 @@ DGX Spark comes with a built-in [DGX Dashboard](https://docs.nvidia.com/dgx/dgx-
 - **Integrated JupyterLab**: Access local Jupyter Notebooks for development
 
 <p align="center">
-  <img width="1024" src="https://github.com/ultralytics/assets/releases/download/v0.0.0/dgx-dashboard.avif" alt="NVIDIA DGX Dashboard">
+  <img width="1024" src="https://cdn.ul.run/i/e01bd76ad1c4044ec866f4fad213795b.avif" alt="NVIDIA DGX management dashboard interface">
 </p>
 
 #### Accessing the Dashboard
@@ -83,12 +95,16 @@ DGX Spark comes with a built-in [DGX Dashboard](https://docs.nvidia.com/dgx/dgx-
 
 ## Quick Start with Docker
 
-The fastest way to get started with Ultralytics YOLO26 on NVIDIA DGX Spark is to run with pre-built docker images. The same Docker image that supports Jetson AGX Thor (JetPack 7.0) works on DGX Spark with DGX OS.
+The fastest way to get started with Ultralytics YOLO26 on NVIDIA DGX Spark is to run with pre-built docker images. The NVIDIA ARM64 image supports DGX Spark with DGX OS.
 
 ```bash
 t=ultralytics/ultralytics:latest-nvidia-arm64
-sudo docker pull $t && sudo docker run -it --ipc=host --runtime=nvidia --gpus all $t
+sudo docker pull $t && sudo docker run -it --ipc=host --device nvidia.com/gpu=all $t
 ```
+
+The CDI device request above applies to DGX Spark running DGX OS. For PyTorch workloads on Jetson AGX Thor, see the separate host requirements and TensorRT restriction in the [NVIDIA Jetson guide](nvidia-jetson.md).
+
+This image uses NVIDIA PyTorch 26.08, CUDA 13.4, and TensorRT 11. Update the DGX OS host driver to a version supported by [NVIDIA PyTorch 26.08](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html), and rebuild TensorRT engines after changing the image or target GPU.
 
 After this is done, skip to [Use TensorRT on NVIDIA DGX Spark section](#use-tensorrt-on-nvidia-dgx-spark).
 
@@ -98,7 +114,7 @@ For a native installation without Docker, follow these steps.
 
 ### Install Ultralytics Package
 
-Here we will install Ultralytics package on DGX Spark with optional dependencies so that we can export the [PyTorch](https://www.ultralytics.com/glossary/pytorch) models to other different formats. We will mainly focus on [NVIDIA TensorRT exports](../integrations/tensorrt.md) because TensorRT will make sure we can get the maximum performance out of the DGX Spark.
+Here we will install the Ultralytics package on DGX Spark. Export dependencies are installed automatically the first time you export a model, so only the base package is needed here. We will mainly focus on [NVIDIA TensorRT exports](../integrations/tensorrt.md) because TensorRT will make sure we can get the maximum performance out of the DGX Spark.
 
 1. Update packages list, install pip and upgrade to latest
 
@@ -108,10 +124,10 @@ Here we will install Ultralytics package on DGX Spark with optional dependencies
     pip install -U pip
     ```
 
-2. Install `ultralytics` pip package with optional dependencies
+2. Install `ultralytics` pip package
 
     ```bash
-    pip install ultralytics[export]
+    pip install ultralytics
     ```
 
 3. Reboot the device
@@ -141,12 +157,10 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 ### Install `onnxruntime-gpu`
 
-The [onnxruntime-gpu](https://pypi.org/project/onnxruntime-gpu/) package hosted in PyPI does not have `aarch64` binaries for ARM64 systems. So we need to manually install this package. This package is needed for some of the exports.
-
-Here we will download and install `onnxruntime-gpu 1.24.0` with `Python3.12` support.
+Current [ONNX Runtime GPU releases](https://pypi.org/project/onnxruntime-gpu/) provide Linux ARM64 wheels, including Python 3.12. The NVIDIA ARM64 Docker image installs the official package; for native CUDA 13 installations, use:
 
 ```bash
-pip install https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64.whl
+pip install onnxruntime-gpu
 ```
 
 ## Use TensorRT on NVIDIA DGX Spark
@@ -204,92 +218,92 @@ The below table represents the benchmark results for five different models (YOLO
     === "YOLO11n"
 
         | Format          | Status | Size on disk (MB) | mAP50-95(B) | Inference time (ms/im) |
-        |-----------------|--------|-------------------|-------------|------------------------|
-        | PyTorch         | ✅      | 5.4               | 0.5071      | 2.67                   |
-        | TorchScript     | ✅      | 10.5              | 0.5083      | 2.62                   |
-        | ONNX            | ✅      | 10.2              | 0.5074      | 5.92                   |
-        | OpenVINO        | ✅      | 10.4              | 0.5058      | 14.95                  |
-        | TensorRT (FP32) | ✅      | 12.8              | 0.5085      | 1.95                   |
-        | TensorRT (FP16) | ✅      | 7.0               | 0.5068      | 1.01                   |
-        | TensorRT (INT8) | ✅      | 18.6              | 0.4880      | 1.62                   |
-        | TF SavedModel   | ✅      | 25.7              | 0.5076      | 36.39                  |
-        | TF GraphDef     | ✅      | 10.3              | 0.5076      | 41.06                  |
-        | TF Lite         | ✅      | 10.3              | 0.5075      | 64.36                  |
-        | MNN             | ✅      | 10.1              | 0.5075      | 12.14                  |
-        | NCNN            | ✅      | 10.2              | 0.5041      | 12.31                  |
-        | ExecuTorch      | ✅      | 10.2              | 0.5075      | 27.61                  |
+        | --------------- | ------ | ----------------- | ----------- | ---------------------- |
+        | PyTorch         | ✅     | 5.4               | 0.5071      | 2.67                   |
+        | TorchScript     | ✅     | 10.5              | 0.5083      | 2.62                   |
+        | ONNX            | ✅     | 10.2              | 0.5074      | 5.92                   |
+        | OpenVINO        | ✅     | 10.4              | 0.5058      | 14.95                  |
+        | TensorRT (FP32) | ✅     | 12.8              | 0.5085      | 1.95                   |
+        | TensorRT (FP16) | ✅     | 7.0               | 0.5068      | 1.01                   |
+        | TensorRT (INT8) | ✅     | 18.6              | 0.4880      | 1.62                   |
+        | TF SavedModel   | ✅     | 25.7              | 0.5076      | 36.39                  |
+        | TF GraphDef     | ✅     | 10.3              | 0.5076      | 41.06                  |
+        | TF Lite         | ✅     | 10.3              | 0.5075      | 64.36                  |
+        | MNN             | ✅     | 10.1              | 0.5075      | 12.14                  |
+        | NCNN            | ✅     | 10.2              | 0.5041      | 12.31                  |
+        | ExecuTorch      | ✅     | 10.2              | 0.5075      | 27.61                  |
 
     === "YOLO11s"
 
         | Format          | Status | Size on disk (MB) | mAP50-95(B) | Inference time (ms/im) |
-        |-----------------|--------|-------------------|-------------|------------------------|
-        | PyTorch         | ✅      | 18.4              | 0.5767      | 5.38                   |
-        | TorchScript     | ✅      | 36.5              | 0.5781      | 5.48                   |
-        | ONNX            | ✅      | 36.3              | 0.5784      | 8.17                   |
-        | OpenVINO        | ✅      | 36.4              | 0.5809      | 27.12                  |
-        | TensorRT (FP32) | ✅      | 39.8              | 0.5783      | 3.59                   |
-        | TensorRT (FP16) | ✅      | 20.1              | 0.5800      | 1.85                   |
-        | TensorRT (INT8) | ✅      | 17.5              | 0.5664      | 1.88                   |
-        | TF SavedModel   | ✅      | 90.8              | 0.5782      | 66.63                  |
-        | TF GraphDef     | ✅      | 36.3              | 0.5782      | 71.67                  |
-        | TF Lite         | ✅      | 36.3              | 0.5782      | 187.36                 |
-        | MNN             | ✅      | 36.2              | 0.5775      | 27.05                  |
-        | NCNN            | ✅      | 36.2              | 0.5806      | 26.26                  |
-        | ExecuTorch      | ✅      | 36.2              | 0.5782      | 54.73                  |
+        | --------------- | ------ | ----------------- | ----------- | ---------------------- |
+        | PyTorch         | ✅     | 18.4              | 0.5767      | 5.38                   |
+        | TorchScript     | ✅     | 36.5              | 0.5781      | 5.48                   |
+        | ONNX            | ✅     | 36.3              | 0.5784      | 8.17                   |
+        | OpenVINO        | ✅     | 36.4              | 0.5809      | 27.12                  |
+        | TensorRT (FP32) | ✅     | 39.8              | 0.5783      | 3.59                   |
+        | TensorRT (FP16) | ✅     | 20.1              | 0.5800      | 1.85                   |
+        | TensorRT (INT8) | ✅     | 17.5              | 0.5664      | 1.88                   |
+        | TF SavedModel   | ✅     | 90.8              | 0.5782      | 66.63                  |
+        | TF GraphDef     | ✅     | 36.3              | 0.5782      | 71.67                  |
+        | TF Lite         | ✅     | 36.3              | 0.5782      | 187.36                 |
+        | MNN             | ✅     | 36.2              | 0.5775      | 27.05                  |
+        | NCNN            | ✅     | 36.2              | 0.5806      | 26.26                  |
+        | ExecuTorch      | ✅     | 36.2              | 0.5782      | 54.73                  |
 
     === "YOLO11m"
 
         | Format          | Status | Size on disk (MB) | mAP50-95(B) | Inference time (ms/im) |
-        |-----------------|--------|-------------------|-------------|------------------------|
-        | PyTorch         | ✅      | 38.8              | 0.6254      | 11.14                  |
-        | TorchScript     | ✅      | 77.3              | 0.6304      | 12.00                  |
-        | ONNX            | ✅      | 76.9              | 0.6304      | 13.83                  |
-        | OpenVINO        | ✅      | 77.1              | 0.6284      | 62.44                  |
-        | TensorRT (FP32) | ✅      | 79.9              | 0.6305      | 6.96                   |
-        | TensorRT (FP16) | ✅      | 40.6              | 0.6313      | 3.14                   |
-        | TensorRT (INT8) | ✅      | 26.6              | 0.6204      | 3.30                   |
-        | TF SavedModel   | ✅      | 192.4             | 0.6306      | 139.85                 |
-        | TF GraphDef     | ✅      | 76.9              | 0.6306      | 146.76                 |
-        | TF Lite         | ✅      | 76.9              | 0.6306      | 568.18                 |
-        | MNN             | ✅      | 76.8              | 0.6306      | 67.67                  |
-        | NCNN            | ✅      | 76.8              | 0.6308      | 60.49                  |
-        | ExecuTorch      | ✅      | 76.9              | 0.6306      | 120.37                 |
+        | --------------- | ------ | ----------------- | ----------- | ---------------------- |
+        | PyTorch         | ✅     | 38.8              | 0.6254      | 11.14                  |
+        | TorchScript     | ✅     | 77.3              | 0.6304      | 12.00                  |
+        | ONNX            | ✅     | 76.9              | 0.6304      | 13.83                  |
+        | OpenVINO        | ✅     | 77.1              | 0.6284      | 62.44                  |
+        | TensorRT (FP32) | ✅     | 79.9              | 0.6305      | 6.96                   |
+        | TensorRT (FP16) | ✅     | 40.6              | 0.6313      | 3.14                   |
+        | TensorRT (INT8) | ✅     | 26.6              | 0.6204      | 3.30                   |
+        | TF SavedModel   | ✅     | 192.4             | 0.6306      | 139.85                 |
+        | TF GraphDef     | ✅     | 76.9              | 0.6306      | 146.76                 |
+        | TF Lite         | ✅     | 76.9              | 0.6306      | 568.18                 |
+        | MNN             | ✅     | 76.8              | 0.6306      | 67.67                  |
+        | NCNN            | ✅     | 76.8              | 0.6308      | 60.49                  |
+        | ExecuTorch      | ✅     | 76.9              | 0.6306      | 120.37                 |
 
     === "YOLO11l"
 
         | Format          | Status | Size on disk (MB) | mAP50-95(B) | Inference time (ms/im) |
-        |-----------------|--------|-------------------|-------------|------------------------|
-        | PyTorch         | ✅      | 49.0              | 0.6366      | 13.95                  |
-        | TorchScript     | ✅      | 97.6              | 0.6399      | 15.67                  |
-        | ONNX            | ✅      | 97.0              | 0.6399      | 16.62                  |
-        | OpenVINO        | ✅      | 97.3              | 0.6377      | 78.80                  |
-        | TensorRT (FP32) | ✅      | 99.2              | 0.6407      | 8.86                   |
-        | TensorRT (FP16) | ✅      | 50.8              | 0.6350      | 3.85                   |
-        | TensorRT (INT8) | ✅      | 32.5              | 0.6224      | 4.52                   |
-        | TF SavedModel   | ✅      | 242.7             | 0.6409      | 187.45                 |
-        | TF GraphDef     | ✅      | 97.0              | 0.6409      | 193.92                 |
-        | TF Lite         | ✅      | 97.0              | 0.6409      | 728.61                 |
-        | MNN             | ✅      | 96.9              | 0.6369      | 85.21                  |
-        | NCNN            | ✅      | 96.9              | 0.6373      | 77.62                  |
-        | ExecuTorch      | ✅      | 97.0              | 0.6409      | 153.56                 |
+        | --------------- | ------ | ----------------- | ----------- | ---------------------- |
+        | PyTorch         | ✅     | 49.0              | 0.6366      | 13.95                  |
+        | TorchScript     | ✅     | 97.6              | 0.6399      | 15.67                  |
+        | ONNX            | ✅     | 97.0              | 0.6399      | 16.62                  |
+        | OpenVINO        | ✅     | 97.3              | 0.6377      | 78.80                  |
+        | TensorRT (FP32) | ✅     | 99.2              | 0.6407      | 8.86                   |
+        | TensorRT (FP16) | ✅     | 50.8              | 0.6350      | 3.85                   |
+        | TensorRT (INT8) | ✅     | 32.5              | 0.6224      | 4.52                   |
+        | TF SavedModel   | ✅     | 242.7             | 0.6409      | 187.45                 |
+        | TF GraphDef     | ✅     | 97.0              | 0.6409      | 193.92                 |
+        | TF Lite         | ✅     | 97.0              | 0.6409      | 728.61                 |
+        | MNN             | ✅     | 96.9              | 0.6369      | 85.21                  |
+        | NCNN            | ✅     | 96.9              | 0.6373      | 77.62                  |
+        | ExecuTorch      | ✅     | 97.0              | 0.6409      | 153.56                 |
 
     === "YOLO11x"
 
         | Format          | Status | Size on disk (MB) | mAP50-95(B) | Inference time (ms/im) |
-        |-----------------|--------|-------------------|-------------|------------------------|
-        | PyTorch         | ✅      | 109.3             | 0.6992      | 23.19                  |
-        | TorchScript     | ✅      | 218.1             | 0.6900      | 25.75                  |
-        | ONNX            | ✅      | 217.5             | 0.6900      | 27.43                  |
-        | OpenVINO        | ✅      | 217.8             | 0.6872      | 149.44                 |
-        | TensorRT (FP32) | ✅      | 222.7             | 0.6902      | 13.87                  |
-        | TensorRT (FP16) | ✅      | 111.1             | 0.6883      | 6.19                   |
-        | TensorRT (INT8) | ✅      | 62.9              | 0.6793      | 6.62                   |
-        | TF SavedModel   | ✅      | 543.9             | 0.6900      | 335.10                 |
-        | TF GraphDef     | ✅      | 217.5             | 0.6900      | 348.86                 |
-        | TF Lite         | ✅      | 217.5             | 0.6900      | 1578.66                |
-        | MNN             | ✅      | 217.3             | 0.6874      | 168.95                 |
-        | NCNN            | ✅      | 217.4             | 0.6901      | 132.13                 |
-        | ExecuTorch      | ✅      | 217.4             | 0.6900      | 297.17                 |
+        | --------------- | ------ | ----------------- | ----------- | ---------------------- |
+        | PyTorch         | ✅     | 109.3             | 0.6992      | 23.19                  |
+        | TorchScript     | ✅     | 218.1             | 0.6900      | 25.75                  |
+        | ONNX            | ✅     | 217.5             | 0.6900      | 27.43                  |
+        | OpenVINO        | ✅     | 217.8             | 0.6872      | 149.44                 |
+        | TensorRT (FP32) | ✅     | 222.7             | 0.6902      | 13.87                  |
+        | TensorRT (FP16) | ✅     | 111.1             | 0.6883      | 6.19                   |
+        | TensorRT (INT8) | ✅     | 62.9              | 0.6793      | 6.62                   |
+        | TF SavedModel   | ✅     | 543.9             | 0.6900      | 335.10                 |
+        | TF GraphDef     | ✅     | 217.5             | 0.6900      | 348.86                 |
+        | TF Lite         | ✅     | 217.5             | 0.6900      | 1578.66                |
+        | MNN             | ✅     | 217.3             | 0.6874      | 168.95                 |
+        | NCNN            | ✅     | 217.4             | 0.6901      | 132.13                 |
+        | ExecuTorch      | ✅     | 217.4             | 0.6900      | 297.17                 |
 
     Benchmarked with Ultralytics 8.3.249
 
@@ -348,8 +362,8 @@ When using NVIDIA DGX Spark, there are a couple of best practices to follow in o
     For best performance, export models with FP16 or INT8 precision:
 
     ```bash
-    yolo export model=yolo26n.pt format=engine half=True # FP16
-    yolo export model=yolo26n.pt format=engine int8=True # INT8
+    yolo export model=yolo26n.pt format=engine quantize=16 # FP16
+    yolo export model=yolo26n.pt format=engine quantize=8  # INT8
     ```
 
 ## System Updates (Founders Edition)
@@ -400,8 +414,8 @@ TensorRT is highly recommended for deploying YOLO26 models on DGX Spark due to i
 
 ### How does DGX Spark compare to Jetson devices for YOLO26?
 
-DGX Spark offers significantly more compute power than Jetson devices with up to 1 PFLOP of AI performance and 128GB unified memory, compared to Jetson AGX Thor's 2070 TFLOPS and 128GB memory. DGX Spark is designed as a desktop AI supercomputer, while Jetson devices are embedded systems optimized for edge deployment.
+DGX Spark offers up to 1 PFLOP of AI performance and 128GB unified memory, compared to Jetson AGX Thor's 2070 TFLOPS and 128GB memory. DGX Spark is designed as a desktop AI supercomputer, while Jetson devices are embedded systems optimized for edge deployment.
 
 ### Can I use the same Docker image for DGX Spark and Jetson AGX Thor?
 
-Yes! The `ultralytics/ultralytics:latest-nvidia-arm64` Docker image supports both NVIDIA DGX Spark (with DGX OS) and Jetson AGX Thor (with JetPack 7.0), as both use ARM64 architecture with CUDA 13 and similar software stacks.
+For PyTorch workloads, `ultralytics/ultralytics:latest-nvidia-arm64` supports DGX Spark with DGX OS and Thor with JetPack 7.1. The bundled TensorRT 11.2 does not support JetPack, so Jetson TensorRT workflows must use the supported TensorRT 10.x runtime for their JetPack release. See the [Jetson Docker requirements](nvidia-jetson.md#quick-start-with-docker).

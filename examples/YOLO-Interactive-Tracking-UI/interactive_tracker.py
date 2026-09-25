@@ -11,7 +11,7 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.plotting import Annotator, colors
 
 enable_gpu = False  # Set True if running with CUDA
-model_file = "yolo11s.pt"  # Path to model file
+model_file = "yolo26s.pt"  # Path to model file
 show_fps = True  # If True, shows current FPS in top-left corner
 show_conf = False  # Display or hide the confidence score
 save_video = False  # Set True to save output video
@@ -63,8 +63,7 @@ def get_center(x1: int, y1: int, x2: int, y2: int) -> tuple[int, int]:
         y2 (int): Bottom-right Y coordinate.
 
     Returns:
-        center_x (int): X-coordinate of the center point.
-        center_y (int): Y-coordinate of the center point.
+        (tuple[int, int]): X and Y coordinates of the center point.
     """
     return (x1 + x2) // 2, (y1 + y2) // 2
 
@@ -79,8 +78,7 @@ def extend_line_from_edge(mid_x: int, mid_y: int, direction: str, img_shape: tup
         img_shape (tuple[int, int, int]): Image shape in (height, width, channels).
 
     Returns:
-        end_x (int): X-coordinate of the endpoint.
-        end_y (int): Y-coordinate of the endpoint.
+        (tuple[int, int]): X and Y coordinates of the endpoint.
     """
     h, w = img_shape[:2]
     if direction == "down":
@@ -124,7 +122,7 @@ def click_event(event: int, x: int, y: int, flags: int, param) -> None:
         flags (int): Any relevant flags passed by OpenCV.
         param (Any): Additional parameters (not used).
     """
-    global selected_object_id, latest_detections
+    global selected_object_id
     if event == cv2.EVENT_LBUTTONDOWN:
         if not latest_detections:
             return

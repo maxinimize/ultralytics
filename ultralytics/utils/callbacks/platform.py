@@ -6,16 +6,24 @@ import re
 import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from math import isfinite
 from pathlib import Path
 from time import time
 
-from ultralytics.utils import ENVIRONMENT, GIT, LOGGER, PYTHON_VERSION, RANK, SETTINGS, TESTS_RUNNING, colorstr
+from ultralytics.utils import (
+    ENVIRONMENT,
+    GIT,
+    LOGGER,
+    PLATFORM_URL,
+    PYTHON_VERSION,
+    SETTINGS,
+    TESTS_RUNNING,
+    colorstr,
+)
 
 PREFIX = colorstr("Platform: ")
-
-# Configurable platform URL for debugging (e.g. ULTRALYTICS_PLATFORM_URL=http://localhost:3000)
-PLATFORM_URL = os.getenv("ULTRALYTICS_PLATFORM_URL", "https://platform.ultralytics.com").rstrip("/")
-PLATFORM_API_URL = f"{PLATFORM_URL}/api/webhooks"
+_api_key = None
+_executor = ThreadPoolExecutor(max_workers=10)
 
 
 def slugify(text):
@@ -25,103 +33,8 @@ def slugify(text):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9\s-]", "", str(text).lower()).replace(" ", "-")).strip("-")[:128]
 
 
-try:
-    assert not TESTS_RUNNING  # do not log pytest
-    assert SETTINGS.get("platform", False) is True or os.getenv("ULTRALYTICS_API_KEY") or SETTINGS.get("api_key")
-    _api_key = os.getenv("ULTRALYTICS_API_KEY") or SETTINGS.get("api_key")
-    assert _api_key  # verify API key is present
-
-    import requests
-
-    from ultralytics.utils.logger import ConsoleLogger, SystemLogger
-    from ultralytics.utils.torch_utils import model_info_for_loggers
-
-    _executor = ThreadPoolExecutor(max_workers=10)  # Bounded thread pool for async operations
-
-except (AssertionError, ImportError):
-    _api_key = None
-
-
-def resolve_platform_uri(uri, hard=True):
-    """Resolve ul:// URIs to signed URLs by authenticating with Ultralytics Platform.
-
-    Formats:
-        ul://username/datasets/slug  -> Returns signed URL to NDJSON file
-        ul://username/project/model  -> Returns signed URL to .pt file
-
-    Args:
-        uri (str): Platform URI starting with "ul://".
-        hard (bool): Whether to raise an error if resolution fails (FileNotFoundError only).
-
-    Returns:
-        (str | None): Signed URL on success, None if not found and hard=False.
-
-    Raises:
-        ValueError: If API key is missing/invalid or URI format is wrong.
-        PermissionError: If access is denied.
-        RuntimeError: If resource is not ready (e.g., dataset still processing).
-        FileNotFoundError: If resource not found and hard=True.
-        ConnectionError: If network request fails and hard=True.
-    """
-    import requests
-
-    path = uri[5:]  # Remove "ul://"
-    parts = path.split("/")
-
-    api_key = os.getenv("ULTRALYTICS_API_KEY") or SETTINGS.get("api_key")
-    if not api_key:
-        raise ValueError(f"ULTRALYTICS_API_KEY required for '{uri}'. Get key at {PLATFORM_URL}/settings")
-
-    base = PLATFORM_API_URL
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    # ul://username/datasets/slug
-    if len(parts) == 3 and parts[1] == "datasets":
-        username, _, slug = parts
-        url = f"{base}/datasets/{username}/{slug}/export"
-
-    # ul://username/project/model
-    elif len(parts) == 3:
-        username, project, model = parts
-        url = f"{base}/models/{username}/{project}/{model}/download"
-
-    else:
-        raise ValueError(f"Invalid platform URI: {uri}. Use ul://user/datasets/name or ul://user/project/model")
-
-    try:
-        timeout = 3600 if "/datasets/" in url else 90  # NDJSON generation can be slow for large datasets
-        r = requests.head(url, headers=headers, allow_redirects=False, timeout=timeout)
-
-        # Handle redirect responses (301, 302, 303, 307, 308)
-        if 300 <= r.status_code < 400 and "location" in r.headers:
-            return r.headers["location"]  # Return signed URL
-
-        # Handle error responses
-        if r.status_code == 401:
-            raise ValueError(f"Invalid ULTRALYTICS_API_KEY for '{uri}'")
-        if r.status_code == 403:
-            raise PermissionError(f"Access denied for '{uri}'. Check dataset/model visibility settings.")
-        if r.status_code == 404:
-            if hard:
-                raise FileNotFoundError(f"Not found on platform: {uri}")
-            LOGGER.warning(f"Not found on platform: {uri}")
-            return None
-        if r.status_code == 409:
-            raise RuntimeError(f"Resource not ready: {uri}. Dataset may still be processing.")
-
-        # Unexpected response
-        r.raise_for_status()
-        raise RuntimeError(f"Unexpected response from platform for '{uri}': {r.status_code}")
-
-    except requests.exceptions.RequestException as e:
-        if hard:
-            raise ConnectionError(f"Failed to resolve {uri}: {e}") from e
-        LOGGER.warning(f"Failed to resolve {uri}: {e}")
-        return None
-
-
 def _interp_plot(plot, n=101):
-    """Interpolate plot curve data from 1000 to n points to reduce storage size."""
+    """Interpolate plot curve data to n points to reduce storage size."""
     import numpy as np
 
     if not plot.get("x") or not plot.get("y"):
@@ -148,68 +61,136 @@ def _interp_plot(plot, n=101):
     return result
 
 
-def _send(event, data, project, name, model_id=None):
-    """Send event to Platform endpoint. Returns response JSON on success."""
+def _validation_payload(image_metrics, sample_limit=5_000, extremes_limit=100):
+    """Return exact F1 extremes and an evenly ranked sample for correlation analysis."""
+    ranked = sorted(image_metrics.items(), key=lambda item: (item[1]["f1"], item[0]))
+    if len(ranked) > sample_limit:
+        sample = [ranked[round(i * (len(ranked) - 1) / (sample_limit - 1))] for i in range(sample_limit)]
+    else:
+        sample = ranked
+
+    def rows(items):
+        return [[Path(name).stem.split("_", 1)[0], metric["tp"], metric["fp"], metric["fn"]] for name, metric in items]
+
+    return {
+        "population": len(ranked),
+        "sampling": "f1_rank",
+        "rows": rows(sample),
+        "extremes": {"worst": rows(ranked[:extremes_limit]), "best": rows(reversed(ranked[-extremes_limit:]))},
+    }
+
+
+def _sanitize_json_value(value):
+    """Replace non-finite floats in payloads with None so JSON encoding succeeds."""
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_value(v) for v in value]
+    if isinstance(value, float):
+        return value if isfinite(value) else None  # avoid "Out of range float values are not JSON compliant" warnings
+    return value
+
+
+def _send(event, data, project, name, model_id=None, retry=2, timeout=30):
+    """Send a training event using the SDK's retry policy."""
+    global _api_key
+    if not _api_key:
+        return None
+    import httpx
+
+    from ultralytics import APIError, Platform
+
+    identity = {"model_id": model_id} if model_id else {"project": project, "name": name}
     try:
-        payload = {"event": event, "project": project, "name": name, "data": data}
-        if model_id:
-            payload["modelId"] = model_id
-        r = requests.post(
-            f"{PLATFORM_API_URL}/training/metrics",
-            json=payload,
-            headers={"Authorization": f"Bearer {_api_key}"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        LOGGER.debug(f"Platform: Failed to send {event}: {e}")
+        with Platform(
+            api_key=_api_key,
+            base_url=PLATFORM_URL,
+            max_retries=retry - 1,
+            retry_methods=("POST",),
+            http_client=httpx.Client(follow_redirects=True),
+        ) as client:
+            response = client.training.metrics(
+                event=event, data=_sanitize_json_value(data), timeout=timeout, **identity
+            )
+            return response if isinstance(response, dict) else None
+    except Exception as error:
+        if isinstance(error, APIError) and error.status_code == 401:
+            _api_key = None
+        # Console errors must not generate another console event; clearing the key makes 401 safe to log.
+        if event != "console_output" or not _api_key:
+            detail = f"HTTP {error.status_code}" if isinstance(error, APIError) else str(error)
+            LOGGER.warning(f"{PREFIX}Failed to send {event}: {detail}")
         return None
 
 
-def _send_async(event, data, project, name, model_id=None):
-    """Send event asynchronously using bounded thread pool."""
-    _executor.submit(_send, event, data, project, name, model_id)
+def _handle_control_response(trainer, ctx, response):
+    """Apply centralized stop signals returned by Platform webhook responses.
+
+    Notes:
+        ``ctx["cancelled"]`` is the durable cancellation signal. During startup, trainer setup later resets
+        ``trainer.stop``, so early stop requests still rely on ``on_pretrain_routine_end()`` to reapply the flag after
+        setup completes.
+    """
+    if response and response.get("cancelled"):
+        ctx["cancelled"] = True
+        trainer.stop = True
+        LOGGER.info(f"{PREFIX}Training cancelled from Platform ⚠️")
 
 
-def _upload_model(model_path, project, name):
-    """Upload model checkpoint to Platform via signed URL."""
+def _upload_model(model_path, project, name, progress=False, retry=1, model_id=None, run_id=None):
+    """Publish a model checkpoint to its configured Platform storage location."""
+    from ultralytics.utils.uploads import safe_upload
+
+    if not _api_key:
+        return None
+    model_path = Path(model_path)
+    if not model_path.exists():
+        LOGGER.warning(f"{PREFIX}Model file not found: {model_path}")
+        return None
+    model_size = model_path.stat().st_size
+    import httpx
+
+    from ultralytics import APIError, Platform
+
+    identity = {"model_id": model_id} if model_id else {"project": project, "name": name}
+    if run_id:
+        identity["run_id"] = run_id
+
     try:
-        model_path = Path(model_path)
-        if not model_path.exists():
-            return None
-
-        # Get signed upload URL
-        response = requests.post(
-            f"{PLATFORM_API_URL}/models/upload",
-            json={"project": project, "name": name, "filename": model_path.name},
-            headers={"Authorization": f"Bearer {_api_key}"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        # Upload to GCS
-        with open(model_path, "rb") as f:
-            requests.put(
-                data["uploadUrl"],
-                data=f,
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=600,  # 10 min timeout for large models
-            ).raise_for_status()
-
-        # url = f"{PLATFORM_URL}/{project}/{name}"
-        # LOGGER.info(f"{PREFIX}Model uploaded to {url}")
-        return data.get("gcsPath")
-
-    except Exception as e:
-        LOGGER.debug(f"Platform: Failed to upload model: {e}")
+        with Platform(
+            api_key=_api_key,
+            base_url=PLATFORM_URL,
+            max_retries=2,
+            retry_methods=("POST",),
+            http_client=httpx.Client(follow_redirects=True),
+        ) as client:
+            data = client.models.upload_checkpoint(filename=model_path.name, timeout=30, **identity)
+            if not isinstance(data, dict):
+                raise TypeError("Invalid Platform upload response")
+    except Exception as error:
+        detail = f"HTTP {error.status_code}" if isinstance(error, APIError) else str(error)
+        LOGGER.warning(f"{PREFIX}Failed to get upload URL: {detail}")
         return None
 
-
-def _upload_model_async(model_path, project, name):
-    """Upload model asynchronously using bounded thread pool."""
-    _executor.submit(_upload_model, model_path, project, name)
+    # Upload to GCS using safe_upload with retry logic and optional progress bar
+    if safe_upload(file=model_path, url=data["uploadUrl"], retry=retry, progress=progress):
+        gcs_path = data.get("gcsPath")
+        if gcs_path and run_id:
+            saved = _send(
+                "checkpoint_saved",
+                {
+                    "modelPath": gcs_path,
+                    "runId": run_id,
+                    "uploadPath": data.get("uploadPath"),
+                },
+                project,
+                name,
+                model_id,
+                timeout=90,
+            )
+            return {"modelPath": gcs_path, "modelSize": model_size} if saved else None
+        return {"modelPath": gcs_path, "modelSize": model_size}
+    return None
 
 
 def _get_environment_info():
@@ -249,6 +230,8 @@ def _get_environment_info():
                 env["gitBranch"] = GIT.branch
             if GIT.commit:
                 env["gitCommit"] = GIT.commit[:12]  # Short hash
+            if GIT.message:
+                env["gitCommitMessage"] = GIT.message
     except Exception:
         pass
 
@@ -267,37 +250,75 @@ def _get_project_name(trainer):
     """Get slugified project and name from trainer args."""
     raw = str(trainer.args.project)
     parts = raw.split("/", 1)
-    project = f"{parts[0]}/{slugify(parts[1])}" if len(parts) == 2 else slugify(raw)
+    project = f"{parts[0]}/{slugify(parts[1].replace('/', '-'))}" if len(parts) == 2 else slugify(raw)
     return project, slugify(str(trainer.args.name or "train"))
+
+
+def _get_system_metrics(ctx):
+    """Sample the run's system logger without making optional host monitoring a training dependency."""
+    try:
+        if not ctx["system_logger"]:
+            from ultralytics.utils.logger import SystemLogger
+
+            ctx["system_logger"] = SystemLogger(all_drives=True)
+        return ctx["system_logger"].get_metrics(rates=True)
+    except Exception:
+        return None
 
 
 def on_pretrain_routine_start(trainer):
     """Initialize Platform logging at training start."""
-    if RANK not in {-1, 0} or not trainer.args.project:
+    global _api_key
+    if TESTS_RUNNING or not trainer.args.project:
+        return
+    _api_key = os.getenv("ULTRALYTICS_API_KEY") or SETTINGS.get("api_key")
+    if not _api_key:
+        return
+    if sys.version_info < (3, 11):
+        LOGGER.warning(
+            f"{PREFIX}Platform integration requires Python 3.11 or newer. Training will continue without tracking."
+        )
         return
 
-    # Per-trainer state to isolate concurrent training runs
-    trainer._platform_model_id = None
-    trainer._platform_last_upload = time()
-
     project, name = _get_project_name(trainer)
-    url = f"{PLATFORM_URL}/{project}/{name}"
-    LOGGER.info(f"{PREFIX}Streaming to {url}")
+    LOGGER.info(f"{PREFIX}Streaming training metrics to Platform")
+
+    from ultralytics.utils.logger import ConsoleLogger
+
+    # Single dict for all platform callback state
+    ctx = {
+        "model_id": None,
+        "run_id": None,
+        "last_upload": time(),
+        "checkpoint_upload": None,
+        "cancelled": False,
+        "console_logger": None,
+        "system_logger": None,
+    }
+    trainer.platform = ctx
 
     # Create callback to send console output to Platform
     def send_console_output(content, line_count, chunk_id):
-        """Send batched console output to Platform webhook."""
-        _send_async(
+        """Send batched console output and live progress bar frames to Platform webhook."""
+        _executor.submit(
+            _send,
             "console_output",
-            {"chunkId": chunk_id, "content": content, "lineCount": line_count},
+            {
+                "chunkId": chunk_id,
+                "content": content,
+                "lineCount": line_count,
+                "progress": ctx["console_logger"].progress_sent,
+            },
             project,
             name,
-            getattr(trainer, "_platform_model_id", None),
+            ctx["model_id"],
         )
 
-    # Start console capture with batching (5 lines or 5 seconds)
-    trainer._platform_console_logger = ConsoleLogger(batch_size=5, flush_interval=5.0, on_flush=send_console_output)
-    trainer._platform_console_logger.start_capture()
+    # Console capture with batching (5 lines or 5 seconds). Built here, but not started until Platform
+    # has accepted the run below: capturing first left the user's stdout redirected through a dead
+    # integration whenever training_started failed, and its final flush would post a console chunk
+    # carrying no model_id.
+    ctx["console_logger"] = ConsoleLogger(batch_size=5, flush_interval=5.0, on_flush=send_console_output)
 
     # Collect environment info (W&B-style metadata)
     environment = _get_environment_info()
@@ -306,7 +327,7 @@ def on_pretrain_routine_start(trainer):
     # Note: model_info is sent later in on_fit_epoch_end (epoch 0) when the model is actually loaded
     train_args = {k: str(v) for k, v in vars(trainer.args).items()}
 
-    # Send synchronously to get modelId for subsequent webhooks
+    # Send synchronously to get modelId for subsequent webhooks (critical, more retries)
     response = _send(
         "training_started",
         {
@@ -314,17 +335,40 @@ def on_pretrain_routine_start(trainer):
             "epochs": trainer.epochs,
             "device": str(trainer.device),
             "environment": environment,
+            "system": _get_system_metrics(ctx),
         },
         project,
         name,
+        retry=4,
     )
     if response and response.get("modelId"):
-        trainer._platform_model_id = response["modelId"]
+        ctx["model_id"] = response["modelId"]
+        ctx["run_id"] = response.get("runId")
+        # Server returns actual slug (may differ from requested name due to auto-increment, e.g. "train" → "train-2")
+        if response.get("modelSlug"):
+            ctx["model_slug"] = response["modelSlug"]
+            url = f"{PLATFORM_URL}/{project}/{ctx['model_slug']}"
+            LOGGER.info(f"{PREFIX}View model at {url}")
+        ctx["console_logger"].start_capture()  # only now: the run is tracked and model_id is known
+        # Note: trainer.stop is set in on_pretrain_routine_end (after _setup_train resets it)
+        _handle_control_response(trainer, ctx, response)
+    else:
+        LOGGER.warning(f"{PREFIX}Training will not be tracked on Platform")
+        trainer.platform = None  # Disable further callbacks
+
+
+def on_pretrain_routine_end(trainer):
+    """Apply pre-start cancellation after _setup_train resets trainer.stop."""
+    ctx = getattr(trainer, "platform", None)
+    if ctx and ctx["cancelled"]:
+        LOGGER.info(f"{PREFIX}Training cancelled from Platform before starting ✅")
+        trainer.stop = True
 
 
 def on_fit_epoch_end(trainer):
     """Log training and system metrics at epoch end."""
-    if RANK not in {-1, 0} or not trainer.args.project:
+    ctx = getattr(trainer, "platform", None)
+    if not ctx:
         return
 
     project, name = _get_project_name(trainer)
@@ -337,6 +381,8 @@ def on_fit_epoch_end(trainer):
     model_info = None
     if trainer.epoch == 0:
         try:
+            from ultralytics.utils.torch_utils import model_info_for_loggers
+
             info = model_info_for_loggers(trainer)
             model_info = {
                 "parameters": info.get("model/parameters", 0),
@@ -346,41 +392,33 @@ def on_fit_epoch_end(trainer):
         except Exception:
             pass
 
-    # Get system metrics (cache SystemLogger on trainer for efficiency)
-    system = {}
-    try:
-        if not hasattr(trainer, "_platform_system_logger"):
-            trainer._platform_system_logger = SystemLogger()
-        system = trainer._platform_system_logger.get_metrics(rates=True)
-    except Exception:
-        pass
-
     payload = {
         "epoch": trainer.epoch,
         "metrics": metrics,
-        "system": system,
+        "system": _get_system_metrics(ctx),
         "fitness": trainer.fitness,
         "best_fitness": trainer.best_fitness,
     }
     if model_info:
         payload["modelInfo"] = model_info
 
-    _send_async(
-        "epoch_end",
-        payload,
-        project,
-        name,
-        getattr(trainer, "_platform_model_id", None),
-    )
+    def _send_and_check_cancel():
+        """Send epoch_end and check response for cancellation (runs in background thread)."""
+        response = _send("epoch_end", payload, project, name, ctx["model_id"], retry=1)
+        _handle_control_response(trainer, ctx, response)
+
+    _executor.submit(_send_and_check_cancel)
 
 
 def on_model_save(trainer):
     """Upload model checkpoint (rate limited to every 15 min)."""
-    if RANK not in {-1, 0} or not trainer.args.project:
+    ctx = getattr(trainer, "platform", None)
+    if not ctx:
         return
-
     # Rate limit to every 15 minutes (900 seconds)
-    if time() - getattr(trainer, "_platform_last_upload", 0) < 900:
+    if time() - ctx["last_upload"] < 900:
+        return
+    if ctx["checkpoint_upload"] and not ctx["checkpoint_upload"].done():
         return
 
     model_path = trainer.best if trainer.best and Path(trainer.best).exists() else trainer.last
@@ -388,28 +426,45 @@ def on_model_save(trainer):
         return
 
     project, name = _get_project_name(trainer)
-    _upload_model_async(model_path, project, name)
-    trainer._platform_last_upload = time()
+    ctx["checkpoint_upload"] = _executor.submit(
+        _upload_model, model_path, project, name, model_id=ctx["model_id"], run_id=ctx["run_id"]
+    )
+    ctx["last_upload"] = time()
 
 
 def on_train_end(trainer):
-    """Log final results, upload best model, and send validation plot data."""
-    if RANK not in {-1, 0} or not trainer.args.project:
+    """Log final training results and upload the best model to Platform."""
+    ctx = getattr(trainer, "platform", None)  # set only by on_pretrain_routine_start, so unset without an API key
+    if not ctx:
         return
 
     project, name = _get_project_name(trainer)
 
-    # Stop console capture
-    if hasattr(trainer, "_platform_console_logger") and trainer._platform_console_logger:
-        trainer._platform_console_logger.stop_capture()
-        trainer._platform_console_logger = None
+    if ctx["cancelled"]:
+        LOGGER.info(f"{PREFIX}Uploading partial results for cancelled training")
 
-    # Upload best model (blocking to ensure it completes)
-    model_path = None
-    model_size = None
-    if trainer.best and Path(trainer.best).exists():
-        model_size = Path(trainer.best).stat().st_size
-        model_path = _upload_model(trainer.best, project, name)
+    # Stop console capture
+    if ctx["console_logger"]:
+        ctx["console_logger"].stop_capture()
+        ctx["console_logger"] = None
+
+    # Upload best.pt, or last.pt when save=False never wrote best.pt (blocking with progress bar to ensure it completes)
+    artifact = None
+    model_path = trainer.best if trainer.best and Path(trainer.best).exists() else trainer.last
+    if Path(model_path).exists():
+        if ctx["checkpoint_upload"]:
+            ctx["checkpoint_upload"].result()
+        artifact = _upload_model(
+            model_path,
+            project,
+            name,
+            progress=True,
+            retry=3,
+            model_id=ctx["model_id"],
+            run_id=ctx["run_id"],
+        )
+        if not artifact:
+            LOGGER.warning(f"{PREFIX}Model will not be available for download on Platform (upload failed)")
 
     # Collect plots from trainer and validator, deduplicating by type
     plots_by_type = {}
@@ -425,34 +480,39 @@ def on_train_end(trainer):
     names = getattr(getattr(trainer, "validator", None), "names", None) or (trainer.data or {}).get("names")
     class_names = list(names.values()) if isinstance(names, dict) else list(names) if names else None
 
+    # stopper.best_epoch is 1-indexed; -1 aligns with the 0-indexed `epoch` field
+    best_epoch = max(0, getattr(getattr(trainer, "stopper", None), "best_epoch", trainer.epoch + 1) - 1)
+
+    image_metrics = trainer.validator.metrics.box.image_metrics if trainer.args.task == "detect" else {}
+    validation = _validation_payload(image_metrics)
     _send(
         "training_complete",
         {
             "results": {
                 "metrics": {**trainer.metrics, "fitness": trainer.fitness},
-                "bestEpoch": getattr(trainer, "best_epoch", trainer.epoch),
+                "bestEpoch": best_epoch,
                 "bestFitness": trainer.best_fitness,
-                "modelPath": model_path or (str(trainer.best) if trainer.best else None),
-                "modelSize": model_size,
+                **({"calibration": c} if (c := getattr(trainer, "depth_calibration", None)) else {}),
+                **({"validation": validation} if validation["rows"] else {}),
+                **(artifact or {}),
             },
             "classNames": class_names,
             "plots": plots,
+            "runId": ctx["run_id"],
         },
         project,
         name,
-        getattr(trainer, "_platform_model_id", None),
+        ctx["model_id"],
+        retry=4,  # Critical, more retries
     )
-    url = f"{PLATFORM_URL}/{project}/{name}"
+    url = f"{PLATFORM_URL}/{project}/{ctx.get('model_slug', name)}"
     LOGGER.info(f"{PREFIX}View results at {url}")
 
 
-callbacks = (
-    {
-        "on_pretrain_routine_start": on_pretrain_routine_start,
-        "on_fit_epoch_end": on_fit_epoch_end,
-        "on_model_save": on_model_save,
-        "on_train_end": on_train_end,
-    }
-    if _api_key
-    else {}
-)
+callbacks = {
+    "on_pretrain_routine_start": on_pretrain_routine_start,
+    "on_pretrain_routine_end": on_pretrain_routine_end,
+    "on_fit_epoch_end": on_fit_epoch_end,
+    "on_model_save": on_model_save,
+    "on_train_end": on_train_end,
+}

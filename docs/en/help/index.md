@@ -1,4 +1,5 @@
 ---
+title: Help Center & FAQs
 comments: true
 description: Explore the Ultralytics Help Center with guides, FAQs, CI processes, and policies to support your YOLO model experience and contributions.
 keywords: Ultralytics, YOLO, help center, documentation, guides, FAQ, contributing, CI, MRE, CLA, code of conduct, security policy, privacy policy
@@ -18,15 +19,15 @@ Welcome to the Ultralytics Help page. This page brings together practical guides
 - [Security Policy](security.md): Familiarize yourself with our security protocols and the procedure for reporting vulnerabilities.
 - [Privacy Policy](privacy.md): Read our privacy policy to understand how we protect your data and respect your privacy in all our services and operations.
 
-We encourage you to review these resources for a smooth and productive experience. If you need additional support, reach out via [GitHub Issues](https://github.com/ultralytics/ultralytics/issues) or the [Ultralytics Community](https://community.ultralytics.com/).
+We encourage you to review these resources for a smooth and productive experience. If you need additional support, reach out via [GitHub Issues](https://github.com/ultralytics/ultralytics/issues) or the [Ultralytics Community](https://community.ultralytics.com).
 
 ## FAQ
 
 ### What is Ultralytics YOLO and how does it benefit my [machine learning](https://www.ultralytics.com/glossary/machine-learning-ml) projects?
 
-Ultralytics YOLO (You Only Look Once) is a state-of-the-art, real-time [object detection](https://www.ultralytics.com/glossary/object-detection) model. Its latest version, YOLO26, delivers faster, lighter, end-to-end NMS-free inference optimized for edge and low-power devices, making it ideal for a wide range of applications, from real-time video analytics to advanced machine learning research. YOLO's efficiency in detecting objects in images and videos has made it the go-to solution for businesses and researchers looking to integrate robust [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) capabilities into their projects.
+Ultralytics YOLO (You Only Look Once) is a state-of-the-art, real-time [object detection](https://www.ultralytics.com/glossary/object-detection) model. Its latest version, YOLO26, delivers faster, lighter inference with an optional NMS-free end-to-end head, optimized for edge and low-power devices, making it ideal for a wide range of applications, from real-time video analytics to advanced machine learning research. YOLO's efficiency in detecting objects in images and videos has made it the go-to solution for businesses and researchers looking to integrate robust [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) capabilities into their projects.
 
-For more details on YOLO26, visit the [YOLO26 documentation](../models/yolo26.md).
+For more details on the current release, visit the [YOLO26 documentation](../models/yolo26.md). For the upcoming family, explore [YOLO27 (Coming Soon)](../models/yolo27.md); its models are not yet available and no launch date is set.
 
 ### How do I contribute to Ultralytics YOLO repositories?
 

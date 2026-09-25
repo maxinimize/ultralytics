@@ -14,7 +14,7 @@ def split_classify_dataset(source_dir: str | Path, train_ratio: float = 0.8) -> 
     """Split classification dataset into train and val directories in a new directory.
 
     Creates a new directory '{source_dir}_split' with train/val subdirectories, preserving the original class structure
-    with an 80/20 split by default.
+    with an 80/20 split by default. Only files with extensions matching IMG_FORMATS are copied.
 
     Directory structure:
         Before:
@@ -71,7 +71,7 @@ def split_classify_dataset(source_dir: str | Path, train_ratio: float = 0.8) -> 
 
     # Process class directories
     class_dirs = [d for d in source_path.iterdir() if d.is_dir()]
-    total_images = sum(len(list(d.glob("*.*"))) for d in class_dirs)
+    total_images = sum(len([f for f in d.glob("*.*") if f.suffix[1:].lower() in IMG_FORMATS]) for d in class_dirs)
     stats = f"{len(class_dirs)} classes, {total_images} images"
     LOGGER.info(f"Splitting {source_path} ({stats}) into {train_ratio:.0%} train, {1 - train_ratio:.0%} val...")
 
@@ -81,7 +81,7 @@ def split_classify_dataset(source_dir: str | Path, train_ratio: float = 0.8) -> 
         (val_path / class_dir.name).mkdir(exist_ok=True)
 
         # Split and copy files
-        image_files = list(class_dir.glob("*.*"))
+        image_files = [f for f in class_dir.glob("*.*") if f.suffix[1:].lower() in IMG_FORMATS]
         random.shuffle(image_files)
         split_idx = int(len(image_files) * train_ratio)
 
@@ -105,7 +105,7 @@ def autosplit(
 
     Args:
         path (Path): Path to images directory.
-        weights (tuple): Train, validation, and test split fractions.
+        weights (tuple[float, float, float]): Train, validation, and test split fractions.
         annotated_only (bool): If True, only images with an associated txt file are used.
 
     Examples:
@@ -129,7 +129,7 @@ def autosplit(
 
     LOGGER.info(f"Autosplitting images from {path}" + ", using *.txt labeled images only" * annotated_only)
     for i, img in TQDM(zip(indices, files), total=n):
-        if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():  # check label
+        if not annotated_only or Path(img2label_paths([img])[0]).exists():  # check label
             with open(path.parent / txt[i], "a", encoding="utf-8") as f:
                 f.write(f"./{img.relative_to(path.parent).as_posix()}" + "\n")  # add image to txt file
 

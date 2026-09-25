@@ -8,11 +8,10 @@ keywords: Ultralytics, Explorer API, dataset exploration, SQL queries, similarit
 
 !!! warning "Community Note ⚠️"
 
-    As of **`ultralytics>=8.3.10`**, Ultralytics Explorer support is deprecated. Similar (and expanded) dataset exploration features are available in [Ultralytics Platform](https://platform.ultralytics.com/).
+    As of **`ultralytics>=8.3.12`**, Ultralytics Explorer has been removed. To use Explorer, install `pip install ultralytics==8.3.11`. Similar (and expanded) dataset exploration features are available in [Ultralytics Platform](https://platform.ultralytics.com).
 
 ## Introduction
 
-<a href="https://colab.research.google.com/github/ultralytics/ultralytics/blob/main/docs/en/datasets/explorer/explorer.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 The Explorer API is a Python API for exploring your datasets. It supports filtering and searching your dataset using SQL queries, vector similarity search, and semantic search.
 
 <p align="center">
@@ -40,7 +39,7 @@ pip install ultralytics[explorer]
 from ultralytics import Explorer
 
 # Create an Explorer object
-explorer = Explorer(data="coco128.yaml", model="yolo26n.pt")
+explorer = Explorer(data="coco128.yaml", model="yolo11n.pt")
 
 # Create embeddings for your dataset
 explorer.create_embeddings_table()
@@ -79,7 +78,7 @@ You get a pandas DataFrame with the `limit` number of most similar data points t
         from ultralytics import Explorer
 
         # create an Explorer object
-        exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+        exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
         exp.create_embeddings_table()
 
         similar = exp.get_similar(img="https://ultralytics.com/images/bus.jpg", limit=10)
@@ -99,7 +98,7 @@ You get a pandas DataFrame with the `limit` number of most similar data points t
         from ultralytics import Explorer
 
         # create an Explorer object
-        exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+        exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
         exp.create_embeddings_table()
 
         similar = exp.get_similar(idx=1, limit=10)
@@ -122,7 +121,7 @@ You can also plot the similar images using the `plot_similar` method. This metho
         from ultralytics import Explorer
 
         # create an Explorer object
-        exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+        exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
         exp.create_embeddings_table()
 
         plt = exp.plot_similar(img="https://ultralytics.com/images/bus.jpg", limit=10)
@@ -135,7 +134,7 @@ You can also plot the similar images using the `plot_similar` method. This metho
         from ultralytics import Explorer
 
         # create an Explorer object
-        exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+        exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
         exp.create_embeddings_table()
 
         plt = exp.plot_similar(idx=1, limit=10)
@@ -155,7 +154,7 @@ Note: This feature uses LLMs, so results are probabilistic and may be inaccurate
     from ultralytics import Explorer
 
     # create an Explorer object
-    exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+    exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
     exp.create_embeddings_table()
 
     df = exp.ask_ai("show me 100 images with exactly one person and 2 dogs. There can be other objects too")
@@ -176,7 +175,7 @@ You can run SQL queries on your dataset using the `sql_query` method. This metho
     from ultralytics import Explorer
 
     # create an Explorer object
-    exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+    exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
     exp.create_embeddings_table()
 
     df = exp.sql_query("WHERE labels LIKE '%person%' AND labels LIKE '%dog%'")
@@ -193,7 +192,7 @@ You can also plot the results of a SQL query using the `plot_sql_query` method. 
     from ultralytics import Explorer
 
     # create an Explorer object
-    exp = Explorer(data="coco128.yaml", model="yolo26n.pt")
+    exp = Explorer(data="coco128.yaml", model="yolo11n.pt")
     exp.create_embeddings_table()
 
     # plot the SQL Query
@@ -240,7 +239,7 @@ Here are some examples of what you can do with the table:
     ```python
     from ultralytics import Explorer
 
-    exp = Explorer(model="yolo26n.pt")
+    exp = Explorer(model="yolo11n.pt")
     exp.create_embeddings_table()
     table = exp.table
 
@@ -301,7 +300,7 @@ sim_idx["im_file"][sim_count > 30]
 
 ### Visualize Embedding Space
 
-You can also visualize the embedding space using the plotting tool of your choice. For example here is a simple example using matplotlib:
+You can also visualize the embedding space using the plotting tool of your choice. For example here is a simple example using Matplotlib:
 
 ```python
 import matplotlib.pyplot as plt
@@ -331,13 +330,6 @@ Start creating your own CV dataset exploration reports using the Explorer API. F
 
 Try our [GUI Demo](dashboard.md) based on Explorer API
 
-## Coming Soon
-
-- [ ] Merge specific labels from datasets. Example - Import all `person` labels from COCO and `car` labels from Cityscapes
-- [ ] Remove images that have a higher similarity index than the given threshold
-- [ ] Automatically persist new datasets after merging/removing entries
-- [ ] Advanced Dataset Visualizations
-
 ## FAQ
 
 ### What is the Ultralytics Explorer API used for?
@@ -362,7 +354,7 @@ You can use the Ultralytics Explorer API to perform similarity searches by creat
 from ultralytics import Explorer
 
 # Create an Explorer object
-explorer = Explorer(data="coco128.yaml", model="yolo26n.pt")
+explorer = Explorer(data="coco128.yaml", model="yolo11n.pt")
 explorer.create_embeddings_table()
 
 # Search for similar images to a given image
@@ -384,7 +376,7 @@ The Ask AI feature allows users to filter datasets using natural language querie
 from ultralytics import Explorer
 
 # Create an Explorer object
-explorer = Explorer(data="coco128.yaml", model="yolo26n.pt")
+explorer = Explorer(data="coco128.yaml", model="yolo11n.pt")
 explorer.create_embeddings_table()
 
 # Query with natural language

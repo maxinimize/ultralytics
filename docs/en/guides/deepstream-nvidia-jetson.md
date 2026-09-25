@@ -1,4 +1,5 @@
 ---
+title: YOLO26 on Jetson DeepStream & TensorRT
 comments: true
 description: Learn how to deploy Ultralytics YOLO26 on NVIDIA Jetson devices using TensorRT and DeepStream SDK. Explore performance benchmarks and maximize AI capabilities.
 keywords: Ultralytics, YOLO26, NVIDIA Jetson, JetPack, AI deployment, embedded systems, deep learning, TensorRT, DeepStream SDK, computer vision
@@ -17,9 +18,11 @@ keywords: Ultralytics, YOLO26, NVIDIA Jetson, JetPack, AI deployment, embedded s
   <strong>Watch:</strong> How to use Ultralytics YOLO26 models with NVIDIA Deepstream on Jetson Orin NX 🚀
 </p>
 
-This comprehensive guide provides a detailed walkthrough for deploying Ultralytics YOLO26 on [NVIDIA Jetson](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/) devices using DeepStream SDK and TensorRT. Here we use TensorRT to maximize the inference performance on the Jetson platform.
+This comprehensive guide provides a detailed walkthrough for deploying Ultralytics YOLO26 on [NVIDIA Jetson](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/) devices using DeepStream SDK and TensorRT. Here we use [TensorRT](../integrations/tensorrt.md) to maximize the inference performance on the Jetson platform.
 
-<img width="1024" src="https://github.com/ultralytics/docs/releases/download/0/deepstream-nvidia-jetson.avif" alt="DeepStream on NVIDIA Jetson">
+This guide walks through [DeepStream configuration for YOLO26](#deepstream-configuration-for-yolo26), [INT8 calibration](#int8-calibration), [multi-stream setup](#multistream-setup), and [benchmark results](#benchmark-results).
+
+<img width="1024" src="https://cdn.ul.run/i/e1a3abefffbe04f2b32bb08d151e9e62.avif" alt="NVIDIA DeepStream SDK on Jetson platform">
 
 !!! note
 
@@ -36,9 +39,10 @@ Before you start to follow this guide:
 
 - Visit our documentation, [Quick Start Guide: NVIDIA Jetson with Ultralytics YOLO26](nvidia-jetson.md) to set up your NVIDIA Jetson device with Ultralytics YOLO26
 - Install [DeepStream SDK](https://developer.nvidia.com/deepstream-getting-started) according to the JetPack version
-    - For JetPack 4.6.4, install [DeepStream 6.0.1](https://docs.nvidia.com/metropolis/deepstream/6.0.1/dev-guide/text/DS_Quickstart.html)
-    - For JetPack 5.1.3, install [DeepStream 6.3](https://docs.nvidia.com/metropolis/deepstream/6.3/dev-guide/text/DS_Quickstart.html)
-    - For JetPack 6.1, install [DeepStream 7.1](https://docs.nvidia.com/metropolis/deepstream/7.0/dev-guide/text/DS_Overview.html)
+    - For JetPack 4.6.4, install [DeepStream 6.0.1](https://archive.docs.nvidia.com/metropolis/deepstream/6.0.1/dev-guide/text/DS_Quickstart.html)
+    - For JetPack 5.1.3, install [DeepStream 6.3](https://archive.docs.nvidia.com/metropolis/deepstream/6.3/dev-guide/text/DS_Quickstart.html)
+    - For JetPack 6.1, install [DeepStream 7.1](https://docs.nvidia.com/metropolis/deepstream/7.1/text/DS_Overview.html)
+    - For JetPack 7.1, install [DeepStream 9.0](https://docs.nvidia.com/metropolis/deepstream/9.0/text/DS_Overview.html)
 
 !!! tip
 
@@ -51,11 +55,7 @@ Here we are using [marcoslucianops/DeepStream-Yolo](https://github.com/marcosluc
 1.  Install Ultralytics with necessary dependencies
 
     ```bash
-    cd ~
-    pip install -U pip
-    git clone https://github.com/ultralytics/ultralytics
-    cd ultralytics
-    pip install -e ".[export]" onnxslim
+    pip install ultralytics onnx onnxslim
     ```
 
 2.  Clone the DeepStream-Yolo repository
@@ -65,14 +65,7 @@ Here we are using [marcoslucianops/DeepStream-Yolo](https://github.com/marcosluc
     git clone https://github.com/marcoslucianops/DeepStream-Yolo
     ```
 
-3.  Copy the `export_yolo26.py` file from `DeepStream-Yolo/utils` directory to the `ultralytics` folder
-
-    ```bash
-    cp ~/DeepStream-Yolo/utils/export_yolo26.py ~/ultralytics
-    cd ultralytics
-    ```
-
-4.  Download Ultralytics YOLO26 detection model (.pt) of your choice from [YOLO26 releases](https://github.com/ultralytics/assets/releases). Here we use [yolo26s.pt](https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26s.pt).
+3.  Download an Ultralytics YOLO26 detection model (.pt) of your choice from the [YOLO26 project](https://platform.ultralytics.com/ultralytics/yolo26). Here we use [yolo26s.pt](https://platform.ultralytics.com/ultralytics/yolo26/yolo26s).
 
     ```bash
     wget https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26s.pt
@@ -80,65 +73,31 @@ Here we are using [marcoslucianops/DeepStream-Yolo](https://github.com/marcosluc
 
     !!! note
 
-        You can also use a [custom-trained YOLO26 model](https://docs.ultralytics.com/modes/train/).
+        You can also use a [custom-trained YOLO26 model](../modes/train.md).
 
-5.  Convert model to ONNX
+4.  Convert the model to ONNX and write the `labels.txt` file DeepStream reads the class names from
 
-    ```bash
-    python3 export_yolo26.py -w yolo26s.pt
+    ```python
+    from ultralytics import YOLO
+
+    model = YOLO("yolo26s.pt")
+    model.export(format="onnx", nms=False, agnostic_nms=True)  # creates 'yolo26s.onnx'
+    with open("labels.txt", "w") as f:
+        f.write("\n".join(model.names.values()))
     ```
 
-    !!! note "Pass the below arguments to the above command"
+    !!! note "Export arguments"
 
-        For DeepStream 5.1, remove the `--dynamic` arg and use `opset` 12 or lower. The default `opset` is 17.
+        `nms=False` exports the NMS-free head, and `agnostic_nms=True` keeps a single class per detection so that `cluster-mode=4` (no clustering) in the DeepStream config does not draw a box twice. Add `imgsz=1280` to change the inference size (default: 640), `batch=4` for a batch size of 4 (the exported batch is static, so it must match `batch-size` in the DeepStream config), and `opset=12` for TensorRT 8.2 or older (DeepStream 6.0.1 and earlier). See the [export arguments](../modes/export.md#arguments) for the full list.
 
-        ```bash
-        --opset 12
-        ```
-
-        To change the inference size (default: 640)
-
-        ```bash
-        -s SIZE
-        --size SIZE
-        -s HEIGHT WIDTH
-        --size HEIGHT WIDTH
-        ```
-
-        Example for 1280:
-
-        ```bash
-        -s 1280
-        or
-        -s 1280 1280
-        ```
-
-        To simplify the ONNX model (DeepStream >= 6.0)
-
-        ```bash
-        --simplify
-        ```
-
-        To use dynamic batch-size (DeepStream >= 6.1)
-
-        ```bash
-        --dynamic
-        ```
-
-        To use static batch-size (example for batch-size = 4)
-
-        ```bash
-        --batch 4
-        ```
-
-6.  Copy the generated `.onnx` model file and `labels.txt` file to the `DeepStream-Yolo` folder
+5.  Copy the generated `.onnx` model file and `labels.txt` file to the `DeepStream-Yolo` folder
 
     ```bash
-    cp yolo26s.pt.onnx labels.txt ~/DeepStream-Yolo
+    cp yolo26s.onnx labels.txt ~/DeepStream-Yolo
     cd ~/DeepStream-Yolo
     ```
 
-7.  Set the CUDA version according to the JetPack version installed
+6.  Set the CUDA version according to the JetPack version installed
 
     For JetPack 4.6.4:
 
@@ -158,24 +117,45 @@ Here we are using [marcoslucianops/DeepStream-Yolo](https://github.com/marcosluc
     export CUDA_VER=12.6
     ```
 
-8.  Compile the library
+    For JetPack 7.1:
+
+    ```bash
+    export CUDA_VER=13.0
+    ```
+
+7.  Compile the library
 
     ```bash
     make -C nvdsinfer_custom_impl_Yolo clean && make -C nvdsinfer_custom_impl_Yolo
     ```
 
-9.  Edit the `config_infer_primary_yolo26.txt` file according to your model (for YOLO26s with 80 classes)
+8.  Edit the `config_infer_primary_yolo26.txt` file according to your model (for YOLO26s with 80 classes)
 
     ```bash
     [property]
     ...
-    onnx-file=yolo26s.pt.onnx
+    onnx-file=yolo26s.onnx
     ...
     num-detected-classes=80
     ...
+    parse-bbox-func-name=NvDsInferParseYolo
+    ...
     ```
 
-10. Edit the `deepstream_app_config` file
+    !!! note "YOLO26 accuracy settings"
+
+        YOLO26 resizes the input with center padding and runs without NMS. For the best [accuracy](https://www.ultralytics.com/glossary/accuracy), add the following to the `[property]` section of `config_infer_primary_yolo26.txt`:
+
+        ```bash
+        [property]
+        ...
+        maintain-aspect-ratio=1
+        symmetric-padding=1
+        cluster-mode=4
+        ...
+        ```
+
+9.  Edit the `deepstream_app_config` file
 
     ```bash
     ...
@@ -184,7 +164,7 @@ Here we are using [marcoslucianops/DeepStream-Yolo](https://github.com/marcosluc
     config-file=config_infer_primary_yolo26.txt
     ```
 
-11. You can also change the video source in `deepstream_app_config` file. Here, a default video file is loaded
+10. You can also change the video source in `deepstream_app_config` file. Here, a default video file is loaded
 
     ```bash
     ...
@@ -203,7 +183,7 @@ deepstream-app -c deepstream_app_config.txt
 
     It will take a long time to generate the TensorRT engine file before starting the inference. So please be patient.
 
-<div align=center><img width=1000 src="https://github.com/ultralytics/docs/releases/download/0/yolov8-with-deepstream.avif" alt="YOLO26 with deepstream"></div>
+<div align=center><img width=1000 src="https://cdn.ul.run/i/42c8bde3499593b9dea44594eacfccda.avif" alt="YOLO26 with deepstream"></div>
 
 !!! tip
 
@@ -290,7 +270,9 @@ If you want to use INT8 precision for inference, you need to follow the steps be
     ...
     ```
 
-### Run Inference
+### Run INT8 Inference
+
+Run the same command to build the INT8 engine and start inference:
 
 ```bash
 deepstream-app -c deepstream_app_config.txt
@@ -300,13 +282,13 @@ deepstream-app -c deepstream_app_config.txt
 
 <p align="center">
   <br>
-  <iframe loading="lazy" width="720" height="405" src="https://www.youtube.com/embed/wWmXKIteRLA"
+  <iframe loading="lazy" width="720" height="405" src="https://www.youtube.com/embed/BpSuXSUzEYY"
     title="YouTube video player" frameborder="0"
     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
     allowfullscreen>
   </iframe>
   <br>
-  <strong>Watch:</strong> How to Run Multiple Streams with DeepStream SDK on Jetson Nano using Ultralytics YOLO26 🎉
+  <strong>Watch:</strong> How to Run Multi-Stream Inference with Ultralytics YOLO26 using NVIDIA DeepStream on Jetson Orin 🚀
 </p>
 
 To set up multiple streams under a single DeepStream application, make the following changes to the `deepstream_app_config.txt` file:
@@ -319,34 +301,51 @@ To set up multiple streams under a single DeepStream application, make the follo
     columns=2
     ```
 
-2. Set `num-sources=4` and add the `uri` entries for all four streams.
+2. Add a separate `[sourceN]` group for each stream, each with its own `uri` and `num-sources=1`.
 
     ```bash
     [source0]
     enable=1
     type=3
-    uri=path/to/video1.jpg
-    uri=path/to/video2.jpg
-    uri=path/to/video3.jpg
-    uri=path/to/video4.jpg
-    num-sources=4
+    uri=file:///path/to/video1.mp4
+    num-sources=1
+
+    [source1]
+    enable=1
+    type=3
+    uri=file:///path/to/video2.mp4
+    num-sources=1
+
+    [source2]
+    enable=1
+    type=3
+    uri=file:///path/to/video3.mp4
+    num-sources=1
+
+    [source3]
+    enable=1
+    type=3
+    uri=file:///path/to/video4.mp4
+    num-sources=1
     ```
 
-### Run Inference
+### Run Multi-Stream Inference
+
+Run the same command to launch all streams in the tiled display:
 
 ```bash
 deepstream-app -c deepstream_app_config.txt
 ```
 
-<div align=center><img width=1000 src="https://github.com/ultralytics/docs/releases/download/0/multistream-setup.avif" alt="Multistream setup"></div>
+<div align=center><img width=1000 src="https://cdn.ul.run/i/05593b559056db5d9d9320800650c67e.avif" alt="DeepStream multi-camera streaming configuration"></div>
 
 ## Benchmark Results
 
-The following benchmarks summarizes how YOLO26 models perform at different TensorRT precision levels with an input size of 640x640 on NVIDIA Jetson Orin NX 16GB.
+The following [benchmarks](../modes/benchmark.md) summarize how YOLO11 models perform at different TensorRT precision levels with an input size of 640x640 on NVIDIA Jetson Orin NX 16GB. YOLO26 uses the same DeepStream export and inference workflow described above.
 
 ### Comparison Chart
 
-<div align=center><img width=1000 src="https://github.com/ultralytics/assets/releases/download/v0.0.0/jetson-deepstream-benchmarks.avif" alt="Jetson DeepStream Benchmarks Chart"></div>
+<div align=center><img width=1000 src="https://cdn.ul.run/i/74e5a09c38eabbfb5514b1ee60caf698.avif" alt="NVIDIA Jetson DeepStream performance benchmarks"></div>
 
 ### Detailed Comparison Table
 
@@ -355,42 +354,42 @@ The following benchmarks summarizes how YOLO26 models perform at different Tenso
     === "YOLO11n"
 
         | Format          | Status | Inference time (ms/im) |
-        |-----------------|--------|------------------------|
-        | TensorRT (FP32) | ✅      | 8.64                   |
-        | TensorRT (FP16) | ✅      | 5.27                   |
-        | TensorRT (INT8) | ✅      | 4.54                   |
+        | --------------- | ------ | ---------------------- |
+        | TensorRT (FP32) | ✅     | 8.64                   |
+        | TensorRT (FP16) | ✅     | 5.27                   |
+        | TensorRT (INT8) | ✅     | 4.54                   |
 
     === "YOLO11s"
 
         | Format          | Status | Inference time (ms/im) |
-        |-----------------|--------|------------------------|
-        | TensorRT (FP32) | ✅      | 14.53                  |
-        | TensorRT (FP16) | ✅      | 7.91                   |
-        | TensorRT (INT8) | ✅      | 6.05                   |
+        | --------------- | ------ | ---------------------- |
+        | TensorRT (FP32) | ✅     | 14.53                  |
+        | TensorRT (FP16) | ✅     | 7.91                   |
+        | TensorRT (INT8) | ✅     | 6.05                   |
 
     === "YOLO11m"
 
         | Format          | Status | Inference time (ms/im) |
-        |-----------------|--------|------------------------|
-        | TensorRT (FP32) | ✅      | 32.05                  |
-        | TensorRT (FP16) | ✅      | 15.55                  |
-        | TensorRT (INT8) | ✅      | 10.43                  |
+        | --------------- | ------ | ---------------------- |
+        | TensorRT (FP32) | ✅     | 32.05                  |
+        | TensorRT (FP16) | ✅     | 15.55                  |
+        | TensorRT (INT8) | ✅     | 10.43                  |
 
     === "YOLO11l"
 
         | Format          | Status | Inference time (ms/im) |
-        |-----------------|--------|------------------------|
-        | TensorRT (FP32) | ✅      | 39.68                  |
-        | TensorRT (FP16) | ✅      | 19.88                  |
-        | TensorRT (INT8) | ✅      | 13.64                  |
+        | --------------- | ------ | ---------------------- |
+        | TensorRT (FP32) | ✅     | 39.68                  |
+        | TensorRT (FP16) | ✅     | 19.88                  |
+        | TensorRT (INT8) | ✅     | 13.64                  |
 
     === "YOLO11x"
 
         | Format          | Status | Inference time (ms/im) |
-        |-----------------|--------|------------------------|
-        | TensorRT (FP32) | ✅      | 80.65                  |
-        | TensorRT (FP16) | ✅      | 39.06                  |
-        | TensorRT (INT8) | ✅      | 22.83                  |
+        | --------------- | ------ | ---------------------- |
+        | TensorRT (FP32) | ✅     | 80.65                  |
+        | TensorRT (FP16) | ✅     | 39.06                  |
+        | TensorRT (INT8) | ✅     | 22.83                  |
 
 ## Acknowledgments
 
@@ -412,22 +411,33 @@ Yes, the guide for deploying Ultralytics YOLO26 with the DeepStream SDK and Tens
 
 ### How can I convert a YOLO26 model to ONNX for DeepStream?
 
-To convert a YOLO26 model to ONNX format for deployment with DeepStream, use the `utils/export_yolo26.py` script from the [DeepStream-Yolo](https://github.com/marcoslucianops/DeepStream-Yolo) repository.
+Export the model with the NMS-free head using the Ultralytics exporter, and write the `labels.txt` file DeepStream reads the class names from:
 
-Here's an example command:
+```python
+from ultralytics import YOLO
 
-```bash
-python3 utils/export_yolo26.py -w yolo26s.pt --opset 12 --simplify
+model = YOLO("yolo26s.pt")
+model.export(format="onnx", nms=False, agnostic_nms=True)  # creates 'yolo26s.onnx'
+with open("labels.txt", "w") as f:
+    f.write("\n".join(model.names.values()))
 ```
 
-For more details on model conversion, check out our [model export section](../modes/export.md).
+Add `opset=12` for TensorRT 8.2 or older (DeepStream 6.0.1 and earlier). For more details on model conversion, check out our [model export section](../modes/export.md).
+
+### How do I run INT8 inference with YOLO26 on DeepStream?
+
+To run INT8 inference, calibrate the model on a representative image set and switch the DeepStream config to INT8 mode. Download the COCO val2017 images, select around 1000 calibration images, set the `INT8_CALIB_IMG_PATH` and `INT8_CALIB_BATCH_SIZE` environment variables, then update `config_infer_primary_yolo26.txt` with `model-engine-file=model_b1_gpu0_int8.engine`, `int8-calib-file=calib.table`, and `network-mode=1`. See the [INT8 Calibration](#int8-calibration) section for the full steps. INT8 currently requires TensorRT 8.x.
+
+### How do I run multiple camera streams with DeepStream on Jetson?
+
+To process multiple streams in a single DeepStream application, edit the `deepstream_app_config.txt` file to add a tiled-display grid and list each source URI. Set the `rows` and `columns` under `[tiled-display]` to build the grid, add a separate `[sourceN]` group per stream with its own `uri` and `num-sources=1`, and adjust the grid to fit the number of streams. See the [MultiStream Setup](#multistream-setup) section for a complete example.
 
 ### What are the performance benchmarks for YOLO on NVIDIA Jetson Orin NX?
 
-The performance of YOLO26 models on NVIDIA Jetson Orin NX 16GB varies based on TensorRT precision levels. For example, YOLO26s models achieve:
+The performance of YOLO11 models on NVIDIA Jetson Orin NX 16GB varies based on TensorRT precision levels. For example, YOLO11s models achieve:
 
-- **FP32 Precision**: 14.6 ms/im, 68.5 FPS
-- **FP16 Precision**: 7.94 ms/im, 126 FPS
-- **INT8 Precision**: 5.95 ms/im, 168 FPS
+- **FP32 Precision**: 14.53 ms/im, 68.8 FPS
+- **FP16 Precision**: 7.91 ms/im, 126 FPS
+- **INT8 Precision**: 6.05 ms/im, 165 FPS
 
-These benchmarks underscore the efficiency and capability of using TensorRT-optimized YOLO26 models on NVIDIA Jetson hardware. For further details, see our [Benchmark Results](#benchmark-results) section.
+These benchmarks underscore the efficiency and capability of using TensorRT-optimized YOLO11 models on NVIDIA Jetson hardware. For further details, see our [Benchmark Results](#benchmark-results) section.

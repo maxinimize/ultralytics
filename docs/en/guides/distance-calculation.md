@@ -1,4 +1,5 @@
 ---
+title: Distance Calculation with YOLO26
 comments: true
 description: Learn how to calculate distances between objects using Ultralytics YOLO26 for accurate spatial positioning and scene understanding.
 keywords: Ultralytics, YOLO26, distance calculation, computer vision, object tracking, spatial positioning
@@ -8,7 +9,7 @@ keywords: Ultralytics, YOLO26, distance calculation, computer vision, object tra
 
 ## What is Distance Calculation?
 
-Measuring the gap between two objects is known as distance calculation within a specified space. In the case of [Ultralytics YOLO26](https://github.com/ultralytics/ultralytics), the [bounding box](https://www.ultralytics.com/glossary/bounding-box) centroid is employed to calculate the distance for bounding boxes highlighted by the user.
+Distance calculation is the process of measuring the space between two detected objects within an image or video frame. In the case of [Ultralytics YOLO26](https://github.com/ultralytics/ultralytics), the [bounding box](https://www.ultralytics.com/glossary/bounding-box) centroid is employed to calculate the distance for bounding boxes highlighted by the user.
 
 <p align="center">
   <br>
@@ -23,9 +24,9 @@ Measuring the gap between two objects is known as distance calculation within a 
 
 ## Visuals
 
-|                                         Distance Calculation using Ultralytics YOLO26                                         |
-| :---------------------------------------------------------------------------------------------------------------------------: |
-| ![Ultralytics YOLO26 Distance Calculation](https://github.com/ultralytics/docs/releases/download/0/distance-calculation.avif) |
+|                             Distance Calculation using Ultralytics YOLO26                              |
+| :----------------------------------------------------------------------------------------------------: |
+| ![Ultralytics YOLO26 Distance Calculation](https://cdn.ul.run/i/240145bb1ea3874f24026e935256a577.avif) |
 
 ## Advantages of Distance Calculation
 
@@ -39,12 +40,14 @@ Measuring the gap between two objects is known as distance calculation within a 
 
     - Click any two bounding boxes with the left mouse button to calculate distance.
     - Use the right mouse button to delete all drawn points.
-    - Left-click anywhere in the frame to add new points.
 
 ???+ warning "Distance is an estimate"
 
-    Distance is an estimate and may not be fully accurate because it is calculated using 2D data,
-    which lacks depth information.
+    Distance is an estimate and may not be fully accurate because it is calculated using 2D data, which lacks depth information.
+
+## Calculate Distances with YOLO26
+
+The `DistanceCalculation` solution tracks objects across frames and measures the Euclidean distance, in pixels, between the centroids of any two bounding boxes you select with the mouse. Run the example below, then left-click two objects to draw the connecting line and read the distance; right-click to clear your selection.
 
 !!! example "Distance Calculation using Ultralytics YOLO"
 
@@ -92,17 +95,16 @@ Measuring the gap between two objects is known as distance calculation within a 
 Here's a table with the `DistanceCalculation` arguments:
 
 {% from "macros/solutions-args.md" import param_table %}
-{{ param_table(["model"]) }}
+{{ param_table(["model", "line_width", "verbose"]) }}
 
 You can also make use of various `track` arguments in the `DistanceCalculation` solution.
 
-{% from "macros/track-args.md" import param_table %}
-{{ param_table(["tracker", "conf", "iou", "classes", "verbose", "device"]) }}
+{% include "macros/solutions-track-args.md" %}
 
 Moreover, the following visualization arguments are available:
 
 {% from "macros/visualization-args.md" import param_table %}
-{{ param_table(["show", "line_width", "show_conf", "show_labels"]) }}
+{{ param_table(["show", "show_conf", "show_labels"]) }}
 
 ## Implementation Details
 
@@ -143,18 +145,18 @@ Using distance calculation with Ultralytics YOLO26 offers several advantages:
 
 ### Can I perform distance calculation in real-time video streams with Ultralytics YOLO26?
 
-Yes, you can perform distance calculation in real-time video streams with Ultralytics YOLO26. The process involves capturing video frames using [OpenCV](https://www.ultralytics.com/glossary/opencv), running YOLO26 [object detection](https://www.ultralytics.com/glossary/object-detection), and using the `DistanceCalculation` class to calculate distances between objects in successive frames. For a detailed implementation, see the [video stream example](#distance-calculation-using-ultralytics-yolo26).
+Yes, you can perform distance calculation in real-time video streams with Ultralytics YOLO26. The process involves capturing video frames using [OpenCV](https://www.ultralytics.com/glossary/opencv), running YOLO26 [object detection](https://www.ultralytics.com/glossary/object-detection), and using the `DistanceCalculation` class to calculate distances between objects in successive frames. For a detailed implementation, see the [video stream example](#calculate-distances-with-yolo26).
 
 ### How do I delete points drawn during distance calculation using Ultralytics YOLO26?
 
-To delete points drawn during distance calculation with Ultralytics YOLO26, you can use a right mouse click. This action will clear all the points you have drawn. For more details, refer to the note section under the [distance calculation example](#distance-calculation-using-ultralytics-yolo26).
+To delete points drawn during distance calculation with Ultralytics YOLO26, you can use a right mouse click. This action will clear all the points you have drawn. For more details, refer to the note section under the [distance calculation example](#calculate-distances-with-yolo26).
 
 ### What are the key arguments for initializing the DistanceCalculation class in Ultralytics YOLO26?
 
 The key arguments for initializing the `DistanceCalculation` class in Ultralytics YOLO26 include:
 
 - `model`: Path to the YOLO26 model file.
-- `tracker`: Tracking algorithm to use (default is 'botsort.yaml').
+- `tracker`: Tracking algorithm to use (Solutions default to `botsort.yaml`).
 - `conf`: Confidence threshold for detections.
 - `show`: Flag to display the output.
 

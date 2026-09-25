@@ -1,4 +1,5 @@
 ---
+title: OBB Dataset Formats for YOLO
 comments: true
 description: Discover OBB dataset formats for Ultralytics YOLO models. Learn about their structure, application, and format conversions to enhance your object detection training.
 keywords: Oriented Bounding Box, OBB Datasets, YOLO, Ultralytics, Object Detection, Dataset Formats
@@ -14,17 +15,17 @@ Training a precise [object detection](https://www.ultralytics.com/glossary/objec
 
 The YOLO OBB format designates bounding boxes by their four corner points with coordinates normalized between 0 and 1. It follows this format:
 
-```bash
+```text
 class_index x1 y1 x2 y2 x3 y3 x4 y4
 ```
 
 Internally, YOLO processes losses and outputs in the `xywhr` format, which represents the [bounding box](https://www.ultralytics.com/glossary/bounding-box)'s center point (xy), width, height, and rotation.
 
-<p align="center"><img width="800" src="https://github.com/ultralytics/docs/releases/download/0/obb-format-examples.avif" alt="OBB format examples"></p>
+<p align="center"><img width="800" src="https://cdn.ul.run/i/d8afded69a70a2bd2a033a6064dd4900.avif" alt="Oriented bounding box annotation format examples"></p>
 
 An example of a `*.txt` label file for the above image, which contains an object of class `0` in OBB format, could look like:
 
-```bash
+```text
 0 0.780811 0.743961 0.782371 0.74686 0.777691 0.752174 0.776131 0.749758
 ```
 
@@ -38,6 +39,28 @@ The Ultralytics framework uses a YAML file format to define the dataset and mode
     --8<-- "ultralytics/cfg/datasets/dota8.yaml"
     ```
 
+Each of `train`, `val`, and `test` accepts a directory, a list of directories, or a `*.txt` file listing one image path per line (paths starting with `./` resolve relative to the `*.txt` file). A `*.txt` file is useful to train on a subset of a directory, skip unlabeled images, or combine images from multiple sources into one split.
+
+!!! example "Image paths as a `*.txt` file"
+
+    === "dataset.yaml"
+
+        ```yaml
+        path: datasets/dota8 # dataset root
+        train: train.txt # a directory, a list e.g. [images/a, images/b], or a *.txt file
+        val: val.txt
+        names:
+          0: plane
+        ```
+
+    === "train.txt"
+
+        ```text
+        ./images/im0.jpg
+        ./images/im1.jpg
+        /data/shared/im2.jpg
+        ```
+
 ## Usage
 
 To train a model using these OBB formats:
@@ -49,8 +72,8 @@ To train a model using these OBB formats:
         ```python
         from ultralytics import YOLO
 
-        # Create a new YOLO26n-OBB model from scratch
-        model = YOLO("yolo26n-obb.yaml")
+        # Load a pretrained YOLO26n-OBB model
+        model = YOLO("yolo26n-obb.pt")
 
         # Train the model on the DOTAv1 dataset
         results = model.train(data="DOTAv1.yaml", epochs=100, imgsz=1024)
@@ -59,18 +82,20 @@ To train a model using these OBB formats:
     === "CLI"
 
         ```bash
-        # Train a new YOLO26n-OBB model on the DOTAv1 dataset
+        # Train a pretrained YOLO26n-OBB model on the DOTAv1 dataset
         yolo obb train data=DOTAv1.yaml model=yolo26n-obb.pt epochs=100 imgsz=1024
         ```
 
 ## Supported Datasets
 
-Currently, the following datasets with oriented bounding boxes are supported:
+Currently, the following datasets with oriented bounding boxes are supported. Most of these datasets are also hosted on [Ultralytics Platform](https://platform.ultralytics.com), where you can browse the images and annotations, view dataset statistics, and clone them for cloud training.
 
 - [DOTA-v1](dota-v2.md#dota-v10): The first version of the DOTA dataset, providing a comprehensive set of aerial images with oriented bounding boxes for object detection.
 - [DOTA-v1.5](dota-v2.md#dota-v15): An intermediate version of the DOTA dataset, offering additional annotations and improvements over DOTA-v1 for enhanced object detection tasks.
 - [DOTA-v2](dota-v2.md#dota-v20): DOTA (A Large-scale Dataset for Object Detection in Aerial Images) version 2, emphasizes detection from aerial perspectives and contains oriented bounding boxes with 1.7 million instances and 11,268 images.
 - [DOTA8](dota8.md): A small, 8-image subset of the full DOTA dataset suitable for testing workflows and Continuous Integration (CI) checks of OBB training in the `ultralytics` repository.
+- [DOTA8 Multispectral](https://platform.ultralytics.com/ultralytics/datasets/dota8-multispectral): An 8-image, 10-channel TIFF subset for testing multispectral OBB training on Ultralytics Platform.
+- [DOTA128](dota128.md): A 128-image subset of the DOTA dataset with all images in the train folder (used for both train and val), providing a good balance between size and diversity for testing OBB models.
 
 ### Incorporating your own OBB dataset
 
@@ -149,6 +174,7 @@ Currently, Ultralytics supports the following datasets for OBB training:
 - [DOTA-v1.5](dota-v2.md): An intermediate version of the DOTA dataset, offering additional annotations and improvements over DOTA-v1 for enhanced object detection tasks.
 - [DOTA-v2](dota-v2.md): This dataset includes 1.7 million instances with oriented bounding boxes and 11,268 images, primarily focusing on aerial object detection.
 - [DOTA8](dota8.md): A smaller, 8-image subset of the DOTA dataset used for testing and [continuous integration](../../help/CI.md) (CI) checks.
+- [DOTA128](dota128.md): A 128-image subset with all images in the train folder (used for both train and val), offering more diversity than DOTA8 while remaining manageable for initial OBB model development and experimentation.
 
 These datasets are tailored for scenarios where OBBs offer a significant advantage, such as aerial and satellite image analysis.
 

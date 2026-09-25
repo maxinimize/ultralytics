@@ -30,6 +30,10 @@ def _update_out(out, out_name, out_value, auxiliary=True, update_aux=True):
 class SAM3SemanticModel(torch.nn.Module):
     """SAM3 model for semantic segmentation with vision-language backbone."""
 
+    mask_threshold: float = 0.0
+    # Max text prompts per grounding pass; each prompt is a batch item, so VRAM scales linearly with the count
+    max_text_batch: int = 16
+
     def __init__(
         self,
         backbone: SAM3VLBackbone,
@@ -151,7 +155,6 @@ class SAM3SemanticModel(torch.nn.Module):
             "encoder_hidden_states": memory["memory"],
             "pos_embed": memory["pos_embed"],
             "padding_mask": memory["padding_mask"],
-            "spatial_shapes": memory["spatial_shapes"],
             "valid_ratios": memory["valid_ratios"],
             "vis_feat_sizes": vis_feat_sizes,
             # encoded text features (or other prompts)
@@ -182,7 +185,7 @@ class SAM3SemanticModel(torch.nn.Module):
             memory_key_padding_mask=src_mask,
             pos=pos_embed,
             reference_boxes=None,
-            spatial_shapes=encoder_out["spatial_shapes"],
+            spatial_shapes=encoder_out["vis_feat_sizes"],
             valid_ratios=encoder_out["valid_ratios"],
             tgt_mask=None,
             memory_text=prompt,
@@ -286,19 +289,40 @@ class SAM3SemanticModel(torch.nn.Module):
         self, backbone_out: dict[str, torch.Tensor], text_ids: torch.Tensor, geometric_prompt: Prompt = None
     ):
         """Forward pass for grounding (detection + segmentation) given input images and text."""
+        if len(text_ids) > self.max_text_batch and (
+            geometric_prompt is None or geometric_prompt.box_embeddings.shape[0] == 0
+        ):
+            # Chunk text prompts to bound peak VRAM; prompts are independent batch items so results concatenate
+            # exactly. An empty geometric prompt carries no boxes, so slicing its batch dim preserves numerics.
+            outs = []
+            for i in range(0, len(text_ids), self.max_text_batch):
+                prompt = None
+                if geometric_prompt is not None:
+                    prompt = Prompt(
+                        box_embeddings=geometric_prompt.box_embeddings[:, i : i + self.max_text_batch],
+                        box_mask=geometric_prompt.box_mask[i : i + self.max_text_batch],
+                        box_labels=geometric_prompt.box_labels[:, i : i + self.max_text_batch],
+                    )
+                outs.append(self.forward_grounding(backbone_out, text_ids[i : i + self.max_text_batch], prompt))
+            return {
+                k: torch.cat([o[k] for o in outs]) if isinstance(v, torch.Tensor) else v for k, v in outs[0].items()
+            }
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = SAM2Model._prepare_backbone_features(
             self, backbone_out, batch=len(text_ids)
         )
         backbone_out.update({k: v for k, v in self.text_embeddings.items()})
-        with torch.profiler.record_function("SAM3Image._encode_prompt"):
-            prompt, prompt_mask = self._encode_prompt(img_feats, img_pos_embeds, vis_feat_sizes, geometric_prompt)
         # index text features (note that regardless of early or late fusion, the batch size of
         # `txt_feats` is always the number of *prompts* in the encoder)
         txt_feats = backbone_out["language_features"][:, text_ids]
         txt_masks = backbone_out["language_mask"][text_ids]
-        # encode text
-        prompt = torch.cat([txt_feats, prompt], dim=0)
-        prompt_mask = torch.cat([txt_masks, prompt_mask], dim=1)
+        if geometric_prompt is not None:
+            with torch.profiler.record_function("SAM3Image._encode_prompt"):
+                geo_prompt, geo_mask = self._encode_prompt(img_feats, img_pos_embeds, vis_feat_sizes, geometric_prompt)
+            prompt = torch.cat([txt_feats, geo_prompt], dim=0)
+            prompt_mask = torch.cat([txt_masks, geo_mask], dim=1)
+        else:
+            prompt = txt_feats
+            prompt_mask = txt_masks
 
         # Run the encoder
         with torch.profiler.record_function("SAM3Image._run_encoder"):

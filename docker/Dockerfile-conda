@@ -24,8 +24,7 @@ RUN apt-get update && \
     # Install conda packages
     # mkl required to fix 'OSError: libmkl_intel_lp64.so.2: cannot open shared object file: No such file or directory'
     conda config --set solver libmamba && \
-    conda install -y pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia && \
-    conda install -y -c conda-forge ultralytics mkl && \
+    CONDA_OVERRIDE_CUDA=13.0 conda install -y -c conda-forge pytorch-gpu=2.13.0 torchvision=0.28.0 cuda-version=13.0 ultralytics mkl && \
     conda clean -afy && \
     # Remove extra build files
     rm -rf /var/lib/apt/lists/* /root/.config/Ultralytics/persistent_cache.json
@@ -39,5 +38,7 @@ ADD https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt .
 # Example (build): t=ultralytics/ultralytics:latest-conda && docker build -f docker/Dockerfile-conda -t $t .
 # Example (push): docker push $t
 # Example (pull): t=ultralytics/ultralytics:latest-conda && docker pull $t
-# Example (run): docker run -it --ipc=host $t
-# Example (run-with-volume): docker run -it --ipc=host -v "$PWD/shared/datasets:/datasets" $t
+# Example (run): docker run -it --ipc=host --device nvidia.com/gpu=all $t
+# Example (run-with-volume): docker run -it --ipc=host --device nvidia.com/gpu=all -v "$PWD/shared/datasets:/datasets" $t
+# CDI requires Docker >= 28.2.0 and nvidia-container-toolkit >= 1.18.
+# Legacy --gpus all can lose GPU access after host systemd daemon reloads (nvidia-container-toolkit#48).

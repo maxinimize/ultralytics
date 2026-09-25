@@ -5,11 +5,11 @@ keywords: YOLO26, image classification, AI, machine learning, pretrained models,
 model_name: yolo26n-cls
 ---
 
-# Image Classification
+# Image Classification with Ultralytics YOLO {#image-classification}
 
-<img width="1024" src="https://github.com/ultralytics/docs/releases/download/0/image-classification-examples.avif" alt="Image classification examples">
+<img width="1024" src="https://cdn.ul.run/i/f61d24ccd6fd778924222927dacaf105.avif" alt="Ultralytics YOLO image classification of objects and scenes">
 
-[Image classification](https://www.ultralytics.com/glossary/image-classification) is the simplest of the three tasks and involves classifying an entire image into one of a set of predefined classes.
+[Image classification](https://www.ultralytics.com/glossary/image-classification) is the simplest of the supported tasks and involves classifying an entire image into one of a set of predefined classes.
 
 The output of an image classifier is a single class label and a confidence score. Image classification is useful when you need to know only what class an image belongs to and don't need to know where objects of that class are located or what their exact shape is.
 
@@ -30,14 +30,17 @@ The output of an image classifier is a single class label and a confidence score
 
 ## [Models](https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/models/26)
 
-YOLO26 pretrained Classify models are shown here. Detect, Segment, and Pose models are pretrained on the [COCO](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml) dataset, while Classify models are pretrained on the [ImageNet](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/ImageNet.yaml) dataset.
+YOLO26 Classify models pretrained on the [ImageNet](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/ImageNet.yaml) dataset are shown below.
 
-[Models](https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/models) are downloaded automatically from the latest Ultralytics [release](https://github.com/ultralytics/assets/releases) on first use.
+[Models](https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/models) download automatically from the latest Ultralytics [release](https://github.com/ultralytics/assets/releases) on first use.
 
 {% include "macros/yolo-cls-perf.md" %}
 
-- **acc** values are model accuracies on the [ImageNet](https://www.image-net.org/) dataset validation set. <br>Reproduce by `yolo val classify data=path/to/ImageNet device=0`
-- **Speed** averaged over ImageNet val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce by `yolo val classify data=path/to/ImageNet batch=1 device=0|cpu`
+- **acc** values are model accuracies on the [ImageNet](https://www.image-net.org/) dataset validation set. <br>Reproduce with `yolo classify val data=path/to/ImageNet device=0`
+- **Speed** averaged over ImageNet val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce with `yolo classify val data=path/to/ImageNet batch=1 device=0|cpu`
+- **Params** and **FLOPs** values are for the fused model after `model.fuse()`, which merges Conv and BatchNorm layers. Pretrained checkpoints retain the full training architecture and may show higher counts.
+
+See the [unreleased YOLO27 preview](../models/yolo27.md#performance-metrics) for preliminary classification speed and model sizes.
 
 ## Train
 
@@ -72,84 +75,82 @@ Train YOLO26n-cls on the MNIST160 dataset for 100 [epochs](https://www.ultralyti
         yolo classify train data=mnist160 model=yolo26n-cls.yaml pretrained=yolo26n-cls.pt epochs=100 imgsz=64
         ```
 
-!!! tip
-
-    Ultralytics YOLO classification uses [`torchvision.transforms.RandomResizedCrop`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.RandomResizedCrop.html) for training and [`torchvision.transforms.CenterCrop`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.CenterCrop.html) for validation and inference.
-    These cropping-based transforms assume square inputs and may inadvertently crop out important regions from images with extreme aspect ratios, potentially causing loss of critical visual information during training.
-    To preserve the full image while maintaining its proportions, consider using [`torchvision.transforms.Resize`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.Resize.html) instead of cropping transforms.
-
-    You can implement this by customizing your augmentation pipeline through a custom `ClassificationDataset` and `ClassificationTrainer`.
-
-
-    ```python
-    import torch
-    import torchvision.transforms as T
-
-    from ultralytics import YOLO
-    from ultralytics.data.dataset import ClassificationDataset
-    from ultralytics.models.yolo.classify import ClassificationTrainer, ClassificationValidator
-
-
-    class CustomizedDataset(ClassificationDataset):
-        """A customized dataset class for image classification with enhanced data augmentation transforms."""
-
-        def __init__(self, root: str, args, augment: bool = False, prefix: str = ""):
-            """Initialize a customized classification dataset with enhanced data augmentation transforms."""
-            super().__init__(root, args, augment, prefix)
-
-            # Add your custom training transforms here
-            train_transforms = T.Compose(
-                [
-                    T.Resize((args.imgsz, args.imgsz)),
-                    T.RandomHorizontalFlip(p=args.fliplr),
-                    T.RandomVerticalFlip(p=args.flipud),
-                    T.RandAugment(interpolation=T.InterpolationMode.BILINEAR),
-                    T.ColorJitter(brightness=args.hsv_v, contrast=args.hsv_v, saturation=args.hsv_s, hue=args.hsv_h),
-                    T.ToTensor(),
-                    T.Normalize(mean=torch.tensor(0), std=torch.tensor(1)),
-                    T.RandomErasing(p=args.erasing, inplace=True),
-                ]
-            )
-
-            # Add your custom validation transforms here
-            val_transforms = T.Compose(
-                [
-                    T.Resize((args.imgsz, args.imgsz)),
-                    T.ToTensor(),
-                    T.Normalize(mean=torch.tensor(0), std=torch.tensor(1)),
-                ]
-            )
-            self.torch_transforms = train_transforms if augment else val_transforms
-
-
-    class CustomizedTrainer(ClassificationTrainer):
-        """A customized trainer class for YOLO classification models with enhanced dataset handling."""
-
-        def build_dataset(self, img_path: str, mode: str = "train", batch=None):
-            """Build a customized dataset for classification training and the validation during training."""
-            return CustomizedDataset(root=img_path, args=self.args, augment=mode == "train", prefix=mode)
-
-
-    class CustomizedValidator(ClassificationValidator):
-        """A customized validator class for YOLO classification models with enhanced dataset handling."""
-
-        def build_dataset(self, img_path: str, mode: str = "train"):
-            """Build a customized dataset for classification standalone validation."""
-            return CustomizedDataset(root=img_path, args=self.args, augment=mode == "train", prefix=self.args.split)
-
-
-    model = YOLO("yolo26n-cls.pt")
-    model.train(data="imagenet1000", trainer=CustomizedTrainer, epochs=10, imgsz=224, batch=64)
-    model.val(data="imagenet1000", validator=CustomizedValidator, imgsz=224, batch=64)
-    ```
+See full `train` mode details in the [Train](../modes/train.md) page. Classification models can also be trained with [Ultralytics Platform cloud training](../platform/train/cloud-training.md).
 
 ### Dataset format
 
-YOLO classification dataset format can be found in detail in the [Dataset Guide](../datasets/classify/index.md).
+YOLO classification dataset format can be found in detail in the [Dataset Guide](../datasets/classify/index.md). Classification datasets can also be managed and labeled with [Ultralytics Platform annotation tools](../platform/data/annotation.md).
+
+### Custom transforms
+
+Ultralytics YOLO classification uses [`torchvision.transforms.RandomResizedCrop`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.RandomResizedCrop.html) for training and [`torchvision.transforms.CenterCrop`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.CenterCrop.html) for validation and inference.
+These cropping-based transforms assume square inputs and can crop out important regions of images with extreme aspect ratios. To keep the whole image, replace the crops with [`torchvision.transforms.Resize`](https://docs.pytorch.org/vision/stable/generated/torchvision.transforms.Resize.html), which scales to `imgsz` × `imgsz` instead of cropping, through a custom `ClassificationDataset`, `ClassificationTrainer`, and `ClassificationValidator`:
+
+```python
+import torch
+import torchvision.transforms as T
+
+from ultralytics import YOLO
+from ultralytics.data.dataset import ClassificationDataset
+from ultralytics.models.yolo.classify import ClassificationTrainer, ClassificationValidator
+
+
+class CustomizedDataset(ClassificationDataset):
+    """A customized dataset class for image classification with enhanced data augmentation transforms."""
+
+    def __init__(self, root: str, args, augment: bool = False, prefix: str = ""):
+        """Initialize a customized classification dataset with enhanced data augmentation transforms."""
+        super().__init__(root, args, augment, prefix)
+
+        # Add your custom training transforms here
+        train_transforms = T.Compose(
+            [
+                T.Resize((args.imgsz, args.imgsz)),
+                T.RandomHorizontalFlip(p=args.fliplr),
+                T.RandomVerticalFlip(p=args.flipud),
+                T.RandAugment(interpolation=T.InterpolationMode.BILINEAR),
+                T.ColorJitter(brightness=args.hsv_v, contrast=args.hsv_v, saturation=args.hsv_s, hue=args.hsv_h),
+                T.ToTensor(),
+                T.Normalize(mean=torch.tensor(0), std=torch.tensor(1)),
+                T.RandomErasing(p=args.erasing, inplace=True),
+            ]
+        )
+
+        # Add your custom validation transforms here
+        val_transforms = T.Compose(
+            [
+                T.Resize((args.imgsz, args.imgsz)),
+                T.ToTensor(),
+                T.Normalize(mean=torch.tensor(0), std=torch.tensor(1)),
+            ]
+        )
+        self.torch_transforms = train_transforms if augment else val_transforms
+
+
+class CustomizedTrainer(ClassificationTrainer):
+    """A customized trainer class for YOLO classification models with enhanced dataset handling."""
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch=None):
+        """Build a customized dataset for classification training and the validation during training."""
+        return CustomizedDataset(root=img_path, args=self.args, augment=mode == "train", prefix=mode)
+
+
+class CustomizedValidator(ClassificationValidator):
+    """A customized validator class for YOLO classification models with enhanced dataset handling."""
+
+    def build_dataset(self, img_path: str):
+        """Build a customized dataset for classification standalone validation (no augmentation)."""
+        return CustomizedDataset(root=img_path, args=self.args, augment=False, prefix=self.args.split)
+
+
+model = YOLO("yolo26n-cls.pt")
+model.train(data="imagenet", trainer=CustomizedTrainer, epochs=10, imgsz=224, batch=64)
+model.val(data="imagenet", validator=CustomizedValidator, imgsz=224, batch=64)
+```
 
 ## Val
 
-Validate trained YOLO26n-cls model [accuracy](https://www.ultralytics.com/glossary/accuracy) on the MNIST160 dataset. No arguments are needed as the `model` retains its training `data` and arguments as model attributes.
+Validate trained YOLO26n-cls model [accuracy](https://www.ultralytics.com/glossary/accuracy). No arguments are needed, as the `model` retains its training `data` and arguments as model attributes: `path/to/best.pt` from the [Train](#train) example validates on MNIST160. Official weights record a training dataset path that doesn't exist on your machine, so they fall back to the task default `imagenet10` with a warning. Pass `data` to validate on another dataset.
 
 !!! example
 
@@ -171,13 +172,13 @@ Validate trained YOLO26n-cls model [accuracy](https://www.ultralytics.com/glossa
     === "CLI"
 
         ```bash
-        yolo classify val model=yolo26n-cls.pt  # val official model
-        yolo classify val model=path/to/best.pt # val custom model
+        yolo classify val model=yolo26n-cls.pt data=imagenet10       # val official model
+        yolo classify val model=path/to/best.pt data=path/to/dataset # val custom model
         ```
 
 !!! tip
 
-    As mentioned in the [training section](#train), you can handle extreme aspect ratios during training by using a custom `ClassificationTrainer`. You need to apply the same approach for consistent validation results by implementing a custom `ClassificationValidator` when calling the `val()` method. Refer to the complete code example in the [training section](#train) for implementation details.
+    A model trained with [custom transforms](#custom-transforms) needs the matching `ClassificationValidator` passed to `val()`, otherwise validation crops where training resized.
 
 ## Predict
 
@@ -196,6 +197,12 @@ Use a trained YOLO26n-cls model to run predictions on images.
 
         # Predict with the model
         results = model("https://ultralytics.com/images/bus.jpg")  # predict on an image
+
+        # Access the results
+        for result in results:
+            top1 = result.probs.top1  # top predicted class ID
+            top1_conf = result.probs.top1conf  # top prediction confidence
+            top1_name = result.names[top1]  # top predicted class name
         ```
 
     === "CLI"
@@ -206,6 +213,21 @@ Use a trained YOLO26n-cls model to run predictions on images.
         ```
 
 See full `predict` mode details in the [Predict](../modes/predict.md) page.
+
+### Results Output
+
+Image classification returns one `Results` object per image. The primary prediction field is `result.probs`, which
+contains the class probability vector and helpers for top predictions.
+
+| Attribute               | Type            | Shape   | Description            |
+| ----------------------- | --------------- | ------- | ---------------------- |
+| `result.probs`          | `Probs`         | `(C,)`  | Class probabilities.   |
+| `result.probs.data`     | `torch.float32` | `(C,)`  | Probability per class. |
+| `result.probs.top1`     | `int`           | `()`    | Top class ID.          |
+| `result.probs.top1conf` | `torch.float32` | `()`    | Top confidence.        |
+| `result.probs.top5`     | `list[int]`     | `(<=5)` | Top-5 class IDs.       |
+
+For task-specific `Results` fields across every task, see the [Predict Results by Task](../modes/predict.md#results-by-task) section.
 
 ## Export
 
@@ -220,7 +242,7 @@ Export a YOLO26n-cls model to a different format like ONNX, CoreML, etc.
 
         # Load a model
         model = YOLO("yolo26n-cls.pt")  # load an official model
-        model = YOLO("path/to/best.pt")  # load a custom-trained model
+        model = YOLO("path/to/best.pt")  # load a custom model
 
         # Export the model
         model.export(format="onnx")
@@ -230,7 +252,7 @@ Export a YOLO26n-cls model to a different format like ONNX, CoreML, etc.
 
         ```bash
         yolo export model=yolo26n-cls.pt format=onnx  # export official model
-        yolo export model=path/to/best.pt format=onnx # export custom-trained model
+        yolo export model=path/to/best.pt format=onnx # export custom model
         ```
 
 Available YOLO26-cls export formats are in the table below. You can export to any format using the `format` argument, i.e., `format='onnx'` or `format='engine'`. You can predict or validate directly on exported models, i.e., `yolo predict model=yolo26n-cls.onnx`. Usage examples are shown for your model after export completes.
@@ -275,6 +297,34 @@ For more configuration options, visit the [Configuration](../usage/cfg.md) page.
 
 Pretrained YOLO26 classification models can be found in the [Models](https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/models/26) section. Models like `yolo26n-cls.pt`, `yolo26s-cls.pt`, `yolo26m-cls.pt`, etc., are pretrained on the [ImageNet](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/ImageNet.yaml) dataset and can be easily downloaded and used for various image classification tasks.
 
+### How do I validate a trained YOLO26 classification model?
+
+To validate a trained model's accuracy on a dataset like MNIST160, you can use the following Python or CLI commands:
+
+!!! example
+
+    === "Python"
+
+        ```python
+        from ultralytics import YOLO
+
+        # Load a model
+        model = YOLO("path/to/best.pt")  # load the trained model
+
+        # Validate the model
+        metrics = model.val()  # no arguments needed, uses the dataset and settings from training
+        metrics.top1  # top1 accuracy
+        metrics.top5  # top5 accuracy
+        ```
+
+    === "CLI"
+
+        ```bash
+        yolo classify val model=path/to/best.pt data=mnist160 # validate the trained model
+        ```
+
+For more information, visit the [Validate](#val) section.
+
 ### How can I export a trained YOLO26 model to different formats?
 
 You can export a trained YOLO26 model to various formats using Python or CLI commands. For instance, to export a model to ONNX format:
@@ -300,31 +350,3 @@ You can export a trained YOLO26 model to various formats using Python or CLI com
         ```
 
 For detailed export options, refer to the [Export](../modes/export.md) page.
-
-### How do I validate a trained YOLO26 classification model?
-
-To validate a trained model's accuracy on a dataset like MNIST160, you can use the following Python or CLI commands:
-
-!!! example
-
-    === "Python"
-
-        ```python
-        from ultralytics import YOLO
-
-        # Load a model
-        model = YOLO("yolo26n-cls.pt")  # load the trained model
-
-        # Validate the model
-        metrics = model.val()  # no arguments needed, uses the dataset and settings from training
-        metrics.top1  # top1 accuracy
-        metrics.top5  # top5 accuracy
-        ```
-
-    === "CLI"
-
-        ```bash
-        yolo classify val model=yolo26n-cls.pt # validate the trained model
-        ```
-
-For more information, visit the [Validate](#val) section.

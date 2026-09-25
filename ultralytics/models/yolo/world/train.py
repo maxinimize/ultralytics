@@ -12,15 +12,15 @@ from ultralytics.data import build_yolo_dataset
 from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.nn.tasks import WorldModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
+from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import unwrap_model
 
 
 def on_pretrain_routine_end(trainer) -> None:
     """Set up model classes and text encoder at the end of the pretrain routine."""
-    if RANK in {-1, 0}:
-        # Set class names for evaluation
-        names = [name.split("/", 1)[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
-        unwrap_model(trainer.ema.ema).set_classes(names, cache_clip_model=False)
+    # Set on all ranks: validation runs on every rank, but txt_feats/nc are not DDP buffers so they don't sync
+    names = [name.split("/", 1)[0] for name in list(trainer.test_loader.dataset.data["names"].values())]
+    trainer.ema.ema.set_classes(names, cache_clip_model=False)
 
 
 class WorldTrainer(DetectionTrainer):
@@ -52,13 +52,13 @@ class WorldTrainer(DetectionTrainer):
         >>> trainer.train()
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         """Initialize a WorldTrainer object with given arguments.
 
         Args:
             cfg (dict[str, Any]): Configuration for the trainer.
             overrides (dict[str, Any], optional): Configuration overrides.
-            _callbacks (list[Any], optional): List of callback functions.
+            _callbacks (dict, optional): Dictionary of callback functions.
         """
         if overrides is None:
             overrides = {}
@@ -87,7 +87,9 @@ class WorldTrainer(DetectionTrainer):
         )
         if weights:
             model.load(weights)
-        self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
+        # the caller's Model shares this dict, so a bare append outlives the trainer and stacks on every later one
+        if on_pretrain_routine_end not in self.callbacks["on_pretrain_routine_end"]:
+            self.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
         return model
 
@@ -150,7 +152,7 @@ class WorldTrainer(DetectionTrainer):
         cache_path = cache_dir / f"text_embeddings_{model.replace(':', '_').replace('/', '_')}.pt"
         if cache_path.exists():
             LOGGER.info(f"Reading existed cache from '{cache_path}'")
-            txt_map = torch.load(cache_path, map_location=self.device)
+            txt_map = torch_load(cache_path, map_location=self.device)
             if sorted(txt_map.keys()) == sorted(texts):
                 return txt_map
         LOGGER.info(f"Caching text embeddings to '{cache_path}'")
@@ -167,7 +169,7 @@ class WorldTrainer(DetectionTrainer):
         # Add text features
         texts = list(itertools.chain(*batch["texts"]))
         txt_feats = torch.stack([self.text_embeddings[text] for text in texts]).to(
-            self.device, non_blocking=self.device.type == "cuda"
+            self.device, non_blocking=self.device.type not in {"cpu", "mps"}
         )
         batch["txt_feats"] = txt_feats.reshape(len(batch["texts"]), -1, txt_feats.shape[-1])
         return batch

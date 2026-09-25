@@ -243,7 +243,7 @@ class SAM2Model(torch.nn.Module):
             fixed_no_obj_ptr (bool): Whether to have a fixed no-object pointer when there is no object present.
             soft_no_obj_ptr (bool): Whether to mix in no-object pointer softly for easier recovery and error mitigation.
             use_mlp_for_obj_ptr_proj (bool): Whether to use MLP for object pointer projection.
-            no_obj_embed_spatial (bool): Whether add no obj embedding to spatial frames.
+            no_obj_embed_spatial (bool): Whether to add no-object embedding to spatial frames.
             sam_mask_decoder_extra_args (dict | None): Extra arguments for constructing the SAM mask decoder.
             compile_image_encoder (bool): Whether to compile the image encoder for faster inference.
         """
@@ -415,11 +415,10 @@ class SAM2Model(torch.nn.Module):
 
         Args:
             backbone_features (torch.Tensor): Image features with shape (B, C, H, W).
-            point_inputs (dict[str, torch.Tensor] | None): Dictionary containing point prompts.
-            'point_coords': Tensor of shape (B, P, 2) with float32 dtype, containing absolute pixel-unit coordinates in
-                (x, y) format for P input points.
-            'point_labels': Tensor of shape (B, P) with int32 dtype, where 1 means positive clicks, 0 means negative
-                clicks, and -1 means padding.
+            point_inputs (dict[str, torch.Tensor] | None): Dictionary containing point prompts with keys 'point_coords'
+                (Tensor of shape (B, P, 2) with float32 dtype, containing absolute pixel-unit coordinates in (x, y)
+                format for P input points) and 'point_labels' (Tensor of shape (B, P) with int32 dtype, where 1 means
+                positive clicks, 0 means negative clicks, and -1 means padding).
             mask_inputs (torch.Tensor | None): Mask of shape (B, 1, H*16, W*16), float or bool, with the same spatial
                 size as the image.
             high_res_features (list[torch.Tensor] | None): List of two feature maps with shapes (B, C, 4*H, 4*W) and (B,
@@ -434,7 +433,7 @@ class SAM2Model(torch.nn.Module):
             low_res_masks (torch.Tensor): Tensor of shape (B, 1, H*4, W*4) with the best low-resolution mask.
             high_res_masks (torch.Tensor): Tensor of shape (B, 1, H*16, W*16) with the best high-resolution mask.
             obj_ptr (torch.Tensor): Tensor of shape (B, C) with object pointer vector for the output mask.
-            object_score_logits (torch.Tensor): Tensor of shape (B) with object score logits.
+            object_score_logits (torch.Tensor): Tensor of shape (B, 1) with object score logits.
 
         Examples:
             >>> backbone_features = torch.rand(1, 256, 32, 32)
@@ -990,12 +989,12 @@ class SAM2Model(torch.nn.Module):
     def _apply_non_overlapping_constraints(pred_masks):
         """Apply non-overlapping constraints to masks, keeping the highest scoring object per location."""
         batch_size = pred_masks.shape[0]
-        if batch_size == 1:
+        if batch_size < 2:
             return pred_masks
 
         device = pred_masks.device
         # "max_obj_inds": object index of the object with the highest score at each location
-        max_obj_inds = torch.argmax(pred_masks, dim=0, keepdim=True)
+        max_obj_inds = pred_masks.max(dim=0, keepdim=True).indices
         # "batch_obj_inds": object index of each object slice (along dim 0) in `pred_masks`
         batch_obj_inds = torch.arange(batch_size, device=device)[:, None, None, None]
         keep = max_obj_inds == batch_obj_inds

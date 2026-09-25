@@ -1,4 +1,5 @@
 ---
+title: Contributor License Agreement (CLA)
 description: Review the terms for contributing to Ultralytics projects. Learn about copyright, patent licenses, and moral rights for your contributions.
 keywords: Ultralytics, Contributor License Agreement, open source, contributions, copyright license, patent license, moral rights
 ---
@@ -123,8 +124,6 @@ If your contribution includes third-party content, you must clearly mark it and 
 
 Ultralytics is not obligated to use or incorporate your contributions into any projects. The decision to use your contributions is entirely at Ultralytics' discretion, meaning that while your contributions are valuable, they may not always align with the project's current needs or directions.
 
----
+### Who do I contact with questions about the CLA?
 
-**Need More Help?**
-
-If you have any further questions or need clarification regarding the Contributor License Agreement, please contact us at hello@ultralytics.com. For more information about contributing to Ultralytics projects, see our [Contributing Guide](https://docs.ultralytics.com/help/contributing/).
+Email hello@ultralytics.com with any questions about the Contributor License Agreement. For guidance on the contribution process itself, see the [Contributing Guide](contributing.md).

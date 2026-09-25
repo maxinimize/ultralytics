@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ultralytics.utils.loss import FocalLoss, VarifocalLoss
 from ultralytics.utils.metrics import bbox_iou
@@ -94,8 +94,8 @@ class DETRLoss(nn.Module):
 
         Notes:
             The function supports different classification loss types:
-            - Varifocal Loss (if self.vfl is True and num_gts > 0)
-            - Focal Loss (if self.fl is True)
+            - Varifocal Loss (if self.vfl is not None and num_gts > 0)
+            - Focal Loss (if self.fl is not None)
             - BCE Loss (default fallback)
         """
         # Logits: [b, query, num_classes], gt_class: list[[n, 1]]
@@ -142,8 +142,9 @@ class DETRLoss(nn.Module):
 
         loss = {}
         if len(gt_bboxes) == 0:
-            loss[name_bbox] = torch.tensor(0.0, device=self.device)
-            loss[name_giou] = torch.tensor(0.0, device=self.device)
+            # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
+            loss[name_bbox] = pred_bboxes[..., :0].sum()
+            loss[name_giou] = pred_bboxes[..., :0].sum()
             return loss
 
         loss[name_bbox] = self.loss_gain["bbox"] * F.l1_loss(pred_bboxes, gt_bboxes, reduction="sum") / len(gt_bboxes)
@@ -391,7 +392,7 @@ class DETRLoss(nn.Module):
 
 
 class RTDETRDetectionLoss(DETRLoss):
-    """Real-Time DeepTracker (RT-DETR) Detection Loss class that extends the DETRLoss.
+    """Real-Time DEtection TRansformer (RT-DETR) Detection Loss class that extends the DETRLoss.
 
     This class computes the detection loss for the RT-DETR model, which includes the standard detection loss as well as
     an additional denoising training loss when provided with denoising metadata.
@@ -426,41 +427,36 @@ class RTDETRDetectionLoss(DETRLoss):
             assert len(batch["gt_groups"]) == len(dn_pos_idx)
 
             # Get the match indices for denoising
-            match_indices = self.get_dn_match_indices(dn_pos_idx, dn_num_group, batch["gt_groups"])
+            match_indices = self.get_dn_match_indices(dn_pos_idx, dn_num_group, dn_meta["dn_gt_idx"])
 
             # Compute the denoising training loss
             dn_loss = super().forward(dn_bboxes, dn_scores, batch, postfix="_dn", match_indices=match_indices)
             total_loss.update(dn_loss)
         else:
             # If no denoising metadata is provided, set denoising loss to zero
-            total_loss.update({f"{k}_dn": torch.tensor(0.0, device=self.device) for k in total_loss.keys()})
+            total_loss.update({f"{k}_dn": torch.tensor(0.0, device=self.device) for k in total_loss})
 
         return total_loss
 
     @staticmethod
     def get_dn_match_indices(
-        dn_pos_idx: list[torch.Tensor], dn_num_group: int, gt_groups: list[int]
+        dn_pos_idx: list[torch.Tensor], dn_num_group: int, dn_gt_idx: list[torch.Tensor]
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Get match indices for denoising.
 
         Args:
             dn_pos_idx (list[torch.Tensor]): List of tensors containing positive indices for denoising.
             dn_num_group (int): Number of denoising groups.
-            gt_groups (list[int]): List of integers representing number of ground truths per image.
+            dn_gt_idx (list[torch.Tensor]): Ground truth index each image's denoising queries reconstruct.
 
         Returns:
             (list[tuple[torch.Tensor, torch.Tensor]]): List of tuples containing matched indices for denoising.
         """
         dn_match_indices = []
-        idx_groups = torch.as_tensor([0, *gt_groups[:-1]]).cumsum_(0)
-        for i, num_gt in enumerate(gt_groups):
-            if num_gt > 0:
-                gt_idx = torch.arange(end=num_gt, dtype=torch.long) + idx_groups[i]
-                gt_idx = gt_idx.repeat(dn_num_group)
-                assert len(dn_pos_idx[i]) == len(gt_idx), (
-                    f"Expected the same length, but got {len(dn_pos_idx[i])} and {len(gt_idx)} respectively."
-                )
-                dn_match_indices.append((dn_pos_idx[i], gt_idx))
-            else:
-                dn_match_indices.append((torch.zeros([0], dtype=torch.long), torch.zeros([0], dtype=torch.long)))
+        for i, gt_idx in enumerate(dn_gt_idx):
+            gt_idx = gt_idx.repeat(dn_num_group)
+            assert len(dn_pos_idx[i]) == len(gt_idx), (
+                f"Expected the same length, but got {len(dn_pos_idx[i])} and {len(gt_idx)} respectively."
+            )
+            dn_match_indices.append((dn_pos_idx[i], gt_idx))
         return dn_match_indices

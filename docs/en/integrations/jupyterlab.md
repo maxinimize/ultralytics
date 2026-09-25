@@ -1,4 +1,5 @@
 ---
+title: Train YOLO26 Models with JupyterLab
 comments: true
 description: Learn how to use JupyterLab to train and experiment with Ultralytics YOLO26 models. Discover key features, setup instructions, and solutions to common issues.
 keywords: JupyterLab, YOLO26, Ultralytics, Model Training, Deep Learning, Interactive Coding, Data Science, Machine Learning, Jupyter Notebook, Model Development
@@ -81,13 +82,13 @@ Navigate to the directory where you saved the notebook file using your terminal.
 
 Once you've run this command, it will open JupyterLab in your default web browser, as shown below.
 
-![Image Showing How JupyterLab Opens On the Browser](https://github.com/ultralytics/docs/releases/download/0/jupyterlab-browser-launch.avif)
+![Image Showing How JupyterLab Opens On the Browser](https://cdn.ul.run/i/bc28af7bd2f339462f3c526c5882a5cc.avif)
 
 ### Step 4: Start Experimenting
 
 In JupyterLab, open the tutorial.ipynb notebook. You can now start running the cells to explore and experiment with YOLO26.
 
-![Image Showing Opened YOLO26 Notebook in JupyterLab](https://github.com/ultralytics/docs/releases/download/0/opened-yolov8-notebook-jupyterlab.avif)
+![Image Showing Opened YOLO26 Notebook in JupyterLab](https://cdn.ul.run/i/a67ca8a43c4988537d071b40ec70fd3f.avif)
 
 JupyterLab's interactive environment allows you to modify code, visualize outputs, and document your findings all in one place. You can try out different configurations and understand how YOLO26 works.
 
@@ -104,7 +105,7 @@ If you want to learn more about JupyterLab, here are resources to get you starte
 
 ## Summary
 
-We've explored how JupyterLab can be a powerful tool for experimenting with Ultralytics YOLO26 models. Using its flexible and interactive environment, you can easily set up JupyterLab on your local machine and start working with YOLO26. JupyterLab makes it simple to [train](../guides/model-training-tips.md) and [evaluate](../guides/model-testing.md) your models, visualize outputs, and [document your findings](../guides/model-monitoring-and-maintenance.md) all in one place.
+We've explored how JupyterLab can be a powerful tool for experimenting with Ultralytics YOLO26 models. Using its flexible and interactive environment, you can easily set up JupyterLab on your local machine and start working with YOLO26. JupyterLab makes it simple to [train](../guides/model-training-tips.md) and [evaluate](../guides/model-evaluation-insights.md) your models, visualize outputs, and [document your findings](../guides/model-monitoring-and-maintenance.md) all in one place.
 
 Unlike other platforms such as [Google Colab](../integrations/google-colab.md), JupyterLab runs locally on your machine, giving you more control over your computing environment while still providing an interactive notebook experience. This makes it particularly valuable for developers who need consistent access to their development environment without relying on cloud resources.
 
@@ -143,12 +144,9 @@ To train a YOLO26 model using JupyterLab:
 5. Visualize training results using JupyterLab's built-in plotting capabilities:
 
     ```python
-    import matplotlib
-
     from ultralytics.utils.plotting import plot_results
 
-    matplotlib.use("inline")  # or 'notebook' for interactive
-    plot_results(results)
+    plot_results("runs/detect/train/results.csv")
     ```
 
 JupyterLab's interactive environment allows you to easily modify parameters, visualize results, and iterate on your model training process.
@@ -170,20 +168,16 @@ These features allow for a seamless development experience when working with YOL
 
 To optimize YOLO26 model performance in JupyterLab:
 
-1. Use the autobatch feature to determine the optimal batch size:
+1. Use AutoBatch to pick the largest batch size that fits in GPU memory:
 
     ```python
-    from ultralytics.utils.autobatch import autobatch
-
-    optimal_batch_size = autobatch(model)
+    results = model.train(data="path/to/data.yaml", batch=-1)
     ```
 
 2. Implement [hyperparameter tuning](../guides/hyperparameter-tuning.md) using libraries like Ray Tune:
 
     ```python
-    from ultralytics.utils.tuner import run_ray_tune
-
-    best_results = run_ray_tune(model, data="path/to/data.yaml")
+    result_grid = model.tune(data="path/to/data.yaml", use_ray=True)
     ```
 
 3. Visualize and analyze model metrics using JupyterLab's plotting capabilities:
@@ -191,7 +185,7 @@ To optimize YOLO26 model performance in JupyterLab:
     ```python
     from ultralytics.utils.plotting import plot_results
 
-    plot_results(results.results_dict)
+    plot_results("runs/detect/train/results.csv")
     ```
 
 4. Experiment with different model architectures and [export formats](../modes/export.md) to find the best balance of speed and [accuracy](https://www.ultralytics.com/glossary/accuracy) for your specific use case.

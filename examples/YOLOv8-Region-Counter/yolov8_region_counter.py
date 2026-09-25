@@ -79,13 +79,12 @@ def mouse_callback(event: int, x: int, y: int, flags: int, param: Any) -> None:
             current_region["offset_y"] = y
 
     # Mouse left button up event
-    elif event == cv2.EVENT_LBUTTONUP:
-        if current_region is not None and current_region["dragging"]:
-            current_region["dragging"] = False
+    elif event == cv2.EVENT_LBUTTONUP and current_region is not None and current_region["dragging"]:
+        current_region["dragging"] = False
 
 
 def run(
-    weights: str = "yolo11n.pt",
+    weights: str = "yolo26n.pt",
     source: str | None = None,
     device: str = "cpu",
     view_img: bool = False,
@@ -104,7 +103,7 @@ def run(
 
     Args:
         weights (str): Path to the YOLO model weights file.
-        source (str): Path to the input video file.
+        source (str | None): Path to the input video file.
         device (str): Processing device specification ('cpu', '0', '1', etc.).
         view_img (bool): Display results in a live window.
         save_img (bool): Save processed video to file.
@@ -119,7 +118,7 @@ def run(
         >>> run(source="video.mp4", view_img=True)
 
         Run with custom model and specific classes
-        >>> run(weights="yolo11s.pt", source="traffic.mp4", classes=[0, 2, 3], device="0")
+        >>> run(weights="yolo26s.pt", source="traffic.mp4", classes=[0, 2, 3], device="0")
     """
     vid_frame_count = 0
 
@@ -229,7 +228,7 @@ def run(
 def parse_opt() -> argparse.Namespace:
     """Parse command line arguments for the region counting application."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default="yolo11n.pt", help="initial weights path")
+    parser.add_argument("--weights", type=str, default="yolo26n.pt", help="initial weights path")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--source", type=str, required=True, help="video file path")
     parser.add_argument("--view-img", action="store_true", help="show results")

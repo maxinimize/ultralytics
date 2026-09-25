@@ -8,13 +8,11 @@ keywords: Ultralytics Explorer, CV datasets, semantic search, SQL queries, vecto
 
 !!! warning "Community Note ⚠️"
 
-    As of **`ultralytics>=8.3.10`**, Ultralytics Explorer support is deprecated. Similar (and expanded) dataset exploration features are available in [Ultralytics Platform](https://platform.ultralytics.com/).
+    As of **`ultralytics>=8.3.12`**, Ultralytics Explorer has been removed. To use Explorer, install `pip install ultralytics==8.3.11`. Similar (and expanded) dataset exploration features are available in [Ultralytics Platform](https://platform.ultralytics.com).
 
 <p>
-    <img width="1709" alt="Ultralytics Explorer Screenshot 1" src="https://github.com/ultralytics/docs/releases/download/0/explorer-dashboard-screenshot-1.avif">
+    <img width="1709" alt="Ultralytics Explorer dataset visualization GUI" src="https://cdn.ul.run/i/21d5ef59dc96909047855598246a1e42.avif">
 </p>
-
-<a href="https://colab.research.google.com/github/ultralytics/ultralytics/blob/main/docs/en/datasets/explorer/explorer.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 
 Ultralytics Explorer is a tool for exploring CV datasets using semantic search, SQL queries, vector similarity search, and natural language prompts. It also provides a Python API for accessing the same functionality.
 
@@ -39,7 +37,7 @@ pip install ultralytics[explorer]
 
 !!! tip
 
-    Explorer works on embedding/semantic search & SQL querying and is powered by [LanceDB](https://lancedb.com/) serverless vector database. Unlike traditional in-memory DBs, it is persisted on disk without sacrificing performance, so you can scale locally to large datasets like COCO without running out of memory.
+    Explorer works on embedding/semantic search & SQL querying and is powered by [LanceDB](https://www.lancedb.com/) serverless vector database. Unlike traditional in-memory DBs, it is persisted on disk without sacrificing performance, so you can scale locally to large datasets like COCO without running out of memory.
 
 ## Explorer API
 
@@ -61,14 +59,14 @@ yolo explorer
     You can set it like this - `yolo settings openai_api_key="..."`
 
 <p>
-    <img width="1709" alt="Ultralytics Explorer OpenAI Integration" src="https://github.com/ultralytics/docs/releases/download/0/ultralytics-explorer-openai-integration.avif">
+    <img width="1709" alt="Ultralytics Explorer OpenAI Integration" src="https://cdn.ul.run/i/d5d6b20ee49dca3e705ef6a95dc71807.avif">
 </p>
 
 ## FAQ
 
 ### What is Ultralytics Explorer and how can it help with CV datasets?
 
-Ultralytics Explorer is a powerful tool designed for exploring [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) (CV) datasets through semantic search, SQL queries, vector similarity search, and even natural language. This versatile tool provides both a GUI and a Python API, allowing users to seamlessly interact with their datasets. By leveraging technologies like [LanceDB](https://lancedb.com/), Ultralytics Explorer ensures efficient, scalable access to large datasets without excessive memory usage. Whether you're performing detailed dataset analysis or exploring data patterns, Ultralytics Explorer streamlines the entire process.
+Ultralytics Explorer is a powerful tool designed for exploring [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) (CV) datasets through semantic search, SQL queries, vector similarity search, and even natural language. This versatile tool provides both a GUI and a Python API, allowing users to seamlessly interact with their datasets. By leveraging technologies like [LanceDB](https://www.lancedb.com/), Ultralytics Explorer ensures efficient, scalable access to large datasets without excessive memory usage. Whether you're performing detailed dataset analysis or exploring data patterns, Ultralytics Explorer streamlines the entire process.
 
 Learn more about the [Explorer API](api.md).
 
@@ -80,7 +78,7 @@ To manually install the optional dependencies needed for Ultralytics Explorer, y
 pip install ultralytics[explorer]
 ```
 
-These dependencies are essential for the full functionality of semantic search and SQL querying. By including libraries powered by [LanceDB](https://lancedb.com/), the installation ensures that the database operations remain efficient and scalable, even for large datasets like [COCO](../detect/coco.md).
+These dependencies are essential for the full functionality of semantic search and SQL querying. By including libraries powered by [LanceDB](https://www.lancedb.com/), the installation ensures that the database operations remain efficient and scalable, even for large datasets like [COCO](../detect/coco.md).
 
 ### How can I use the GUI version of Ultralytics Explorer?
 
@@ -106,8 +104,4 @@ For more on this feature and how to integrate it, see our [GUI Explorer Usage](#
 
 ### Can I run Ultralytics Explorer in Google Colab?
 
-Yes, Ultralytics Explorer can be run in Google Colab, providing a convenient and powerful environment for dataset exploration. You can start by opening the provided Colab notebook, which is pre-configured with all the necessary settings:
-
-<a href="https://colab.research.google.com/github/ultralytics/ultralytics/blob/main/docs/en/datasets/explorer/explorer.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
-
-This setup allows you to explore your datasets fully, taking advantage of Google's cloud resources. Learn more in our [Google Colab Guide](../../integrations/google-colab.md).
+Yes. Install the pinned release with `pip install ultralytics==8.3.11` in a Colab notebook and follow the [VOC Exploration Example](explorer.md) to build embeddings and run searches on Google's cloud resources. Learn more in our [Google Colab Guide](../../integrations/google-colab.md).
