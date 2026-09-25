@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 try:
     from art.estimators.classification import PyTorchClassifier
-except Exception:
+except (ImportError, AttributeError):
     from art.estimators.classification.pytorch import PyTorchClassifier
 
 
@@ -302,12 +302,22 @@ def build_single_labels_from_batch(batch: dict, policy: str = "largest_box") -> 
 
 def run_attack_on_batch(attacker, batch: dict, *, label_policy: str = "largest_box") -> Optional[torch.Tensor]:
     """
-    Apply either a detector-style attacker or a classifier-style attacker to a batch.
+    Apply an attacker to a training/validation batch.
 
-    Detector attackers receive YOLO detector targets.
-    Classifier attackers receive one class label per image, chosen via the single-label bridge.
+    Batch-aware spatial attacks are handled first because they must update both
+    images and detection targets. Existing detector/classifier attacks keep the
+    original image-only return path unchanged.
     """
     imgs = batch["img"]
+
+    # Spatial attacks such as Worst-of-k must transform GT boxes together with
+    # the image. forward_batch() updates batch_idx/cls/bboxes in-place and still
+    # returns an image tensor, preserving the existing caller contract.
+    forward_batch = getattr(attacker, "forward_batch", None)
+    if callable(forward_batch) and bool(getattr(attacker, "batch_aware", False)):
+        adv = forward_batch(batch)
+        return adv.to(imgs.dtype)
+
     mode = infer_attack_mode(attacker)
 
     if mode == "detector":
@@ -315,7 +325,10 @@ def run_attack_on_batch(attacker, batch: dict, *, label_policy: str = "largest_b
         if targets is None or targets.numel() == 0:
             return None
         adv = attacker.forward(imgs.float(), targets)
-        return adv.to(imgs.dtype)
+        del targets
+        res_adv = adv.to(imgs.dtype)
+        del adv
+        return res_adv
 
     labels, attacked_idx = build_single_labels_from_batch(batch, policy=label_policy)
     if labels is None or attacked_idx is None or attacked_idx.numel() == 0:
@@ -324,6 +337,7 @@ def run_attack_on_batch(attacker, batch: dict, *, label_policy: str = "largest_b
     adv_imgs = imgs.clone()
     adv_subset = attacker.forward(imgs[attacked_idx].float(), labels)
     adv_imgs[attacked_idx] = adv_subset.to(imgs.dtype)
+    del adv_subset, labels, attacked_idx
     return adv_imgs
 
 
@@ -365,5 +379,8 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
     if normalized in {"autoattack"}:
         from ultralytics.attacks.art_autoattack import ARTAutoAttack
         return ARTAutoAttack(model=model, **kwargs)
+    if normalized in {"worstk"}:
+        from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
+        return SpatialWorstOfK(model=model, **kwargs)
 
     raise ValueError(f"Unsupported attack name: {name}")

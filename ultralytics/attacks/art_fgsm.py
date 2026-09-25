@@ -66,32 +66,6 @@ class ARTFGSM(Attacker):
         x_adv = torch.from_numpy(x_adv_np).to(self.device).type_as(x)
         return x_adv
 
-    # @staticmethod
-    # def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> List[Dict[str, np.ndarray]]:
-    #     out: List[Dict[str, np.ndarray]] = []
-    #     t = targets.detach().cpu()
-    #     for i in range(batch_size):
-    #         ti = t[t[:, 0] == i]
-    #         if ti.numel() == 0:
-    #             out.append({"boxes": np.zeros((0, 4), dtype=np.float32),
-    #                         "labels": np.zeros((0,), dtype=np.int64)})
-    #             continue
-    #         xywh = ti[:, 2:6].clone()
-    #         xywh[:, 0] *= W; xywh[:, 1] *= H
-    #         xywh[:, 2] *= W; xywh[:, 3] *= H
-    #         xyxy = torch.zeros_like(xywh)
-    #         xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
-    #         xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
-    #         xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
-    #         xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
-
-    #         labels = ti[:, 1].to(torch.int64)
-    #         out.append({
-    #             "boxes": xyxy.numpy().astype(np.float32),
-    #             "labels": labels.numpy().astype(np.int64),
-    #         })
-    #     return out
-
     @staticmethod
     def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> List[Dict[str, np.ndarray]]:
         """Convert YOLO targets to ART label format.

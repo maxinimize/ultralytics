@@ -57,3 +57,21 @@ def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
         attack_model.eval()
     
     return attack_model
+
+
+class BatchContainer:
+    """Small dict/object hybrid matching the batch interface used by Ultralytics detection losses."""
+
+    def __init__(self, **kwargs):
+        self._data = kwargs
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._data

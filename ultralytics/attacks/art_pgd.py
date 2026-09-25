@@ -11,184 +11,15 @@ from ultralytics.utils.nms import non_max_suppression
 try:
     # newer versions of ART using the generic object detector
     from art.estimators.object_detection import PyTorchObjectDetector as ARTDetector
-except Exception:
+except (ImportError, AttributeError):
     # older versions of ART
     from art.estimators.object_detection import PyTorchYolo as ARTDetector
 
 from art.attacks.evasion import ProjectedGradientDescent
 
 
-class BatchContainer:
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-        self._data = kwargs
-    
-    def __getitem__(self, key):
-        return self._data[key]
-    
-    def get(self, key, default=None):
-        return self._data.get(key, default)
-    
-    def __contains__(self, key):
-        return key in self._data
+from ultralytics.attacks.attack_utils import BatchContainer
 
-# class YoloV5ForART(nn.Module):
-#     """
-#     wrap YOLOv5 to fit ART's (images, targets) -> losses interface.
-#     """
-#     def __init__(self, yolo_model: nn.Module, img_size: int):
-#         super().__init__()
-#         self.model = yolo_model
-#         self.img_size = img_size
-#         self._loss_fn = unwrap_model(self.model).loss
-
-#     # @torch.enable_grad()
-#     # def forward(self, images: torch.Tensor, targets=None):
-#     #     """
-#     #     images: (N,C,H,W) float in [0,1]
-#     #     targets: list[dict] with keys 'boxes'(xyxy, pixel), 'labels' (int64)
-#     #     return: if targets is None, return torchvision style outputs;
-#     #     """
-#     #     # YOLOv5 forward
-#     #     preds = self.model(images, augment=False)
-
-#     #     if targets is None:
-#     #         # if targets is None, return torchvision style outputs;
-#     #         dets = non_max_suppression(preds, conf_thres=0.001, iou_thres=0.6, max_det=300)
-#     #         out = []
-#     #         for det in dets:
-#     #             if det is None or len(det) == 0:
-#     #                 out.append({"boxes": torch.zeros((0, 4), device=images.device),
-#     #                             "labels": torch.zeros((0,), dtype=torch.int64, device=images.device),
-#     #                             "scores": torch.zeros((0,), device=images.device)})
-#     #             else:
-#     #                 boxes = det[:, :4]          # xyxy
-#     #                 scores = det[:, 4]
-#     #                 labels = det[:, 5].long()
-#     #                 out.append({"boxes": boxes, "labels": labels, "scores": scores})
-#     #         return out
-
-#     #     # ART → YOLOv5：list[dict](xyxy)  ->  Tensor(N,6)  xywh
-#     #     n, _, H, W = images.shape
-#     #     yolo_tgts = []
-#     #     for i, tgt in enumerate(targets):
-#     #         if tgt["boxes"] is None or len(tgt["boxes"]) == 0:
-#     #             continue
-#     #         b = torch.as_tensor(tgt["boxes"], device=images.device, dtype=torch.float32)  # (K,4) xyxy
-#     #         c = torch.as_tensor(tgt["labels"], device=images.device, dtype=torch.int64)   # (K,)
-#     #         # xyxy -> xywh (pixel)
-#     #         xy = (b[:, 0:2] + b[:, 2:4]) * 0.5
-#     #         wh = (b[:, 2:4] - b[:, 0:2]).clamp(min=1e-6)
-#     #         # -> [0,1]
-#     #         xy[:, 0] /= W; xy[:, 1] /= H
-#     #         wh[:, 0] /= W; wh[:, 1] /= H
-#     #         # -> [img_idx, cls, x, y, w, h]
-#     #         img_idx = torch.full((b.size(0), 1), i, device=images.device, dtype=torch.float32)
-#     #         cls = c.to(dtype=torch.float32).unsqueeze(1)
-#     #         yolo_tgts.append(torch.cat([img_idx, cls, xy, wh], dim=1))
-
-#     #     if len(yolo_tgts) == 0:
-#     #         yolo_targets = images.new_zeros((0, 6))
-#     #     else:
-#     #         yolo_targets = torch.cat(yolo_tgts, dim=0)
-
-#     #     # compute loss
-#     #     total_loss, _ = self._loss_fn(preds, yolo_targets)
-#     #     # only return total_loss with gradient (loss_items are detached, cannot be used for backprop)
-#     #     return {"loss": total_loss}
-
-#     @torch.enable_grad()
-#     def forward(self, images: torch.Tensor, targets=None):
-#         """
-#         images: (N,C,H,W) float in [0,1]
-#         targets: list[dict] with keys 'boxes'(xyxy, pixel), 'labels' (int64)
-#         """
-#         from ultralytics.utils import LOGGER
-        
-#         preds = self.model(images, augment=False)
-
-#         if targets is None:
-#             # inference mode
-#             dets = non_max_suppression(preds, conf_thres=0.001, iou_thres=0.6, max_det=300)
-#             out = []
-#             for det in dets:
-#                 if det is None or len(det) == 0:
-#                     out.append({
-#                         "boxes": torch.zeros((0, 4), device=images.device),
-#                         "labels": torch.zeros((0,), dtype=torch.int64, device=images.device),
-#                         "scores": torch.zeros((0,), device=images.device)
-#                     })
-#                 else:
-#                     boxes = det[:, :4]
-#                     scores = det[:, 4]
-#                     labels = det[:, 5].long()
-#                     out.append({"boxes": boxes, "labels": labels, "scores": scores})
-#             return out
-
-#         # training mode: ART format -> YOLO format
-#         n, _, H, W = images.shape
-#         yolo_tgts = []
-        
-#         for i, tgt in enumerate(targets):
-#             boxes = tgt.get("boxes")
-#             labels = tgt.get("labels")
-            
-#             if boxes is None or labels is None:
-#                 continue
-            
-#             b = torch.as_tensor(boxes, device=images.device, dtype=torch.float32)
-#             c = torch.as_tensor(labels, device=images.device, dtype=torch.int64)
-            
-#             if b.numel() == 0 or c.numel() == 0 or b.size(0) == 0:
-#                 continue
-            
-#             if b.dim() == 1:
-#                 b = b.unsqueeze(0)
-#             if c.dim() == 0:
-#                 c = c.unsqueeze(0)
-            
-#             # check boxes columns
-#             if b.size(-1) != 4:
-#                 LOGGER.warning(f"Invalid boxes shape: {b.shape}, expected (N, 4)")
-#                 continue
-            
-#             xy = (b[:, 0:2] + b[:, 2:4]) * 0.5
-#             wh = (b[:, 2:4] - b[:, 0:2]).clamp(min=1e-6)
-            
-#             xy[:, 0] /= W; xy[:, 1] /= H
-#             wh[:, 0] /= W; wh[:, 1] /= H
-            
-#             # check normalized values
-#             if torch.any(torch.isnan(xy)) or torch.any(torch.isnan(wh)):
-#                 LOGGER.warning(f"NaN detected in normalized targets, skipping")
-#                 continue
-            
-#             img_idx = torch.full((b.size(0), 1), i, device=images.device, dtype=torch.float32)
-#             cls = c.to(dtype=torch.float32).unsqueeze(1)
-            
-#             yolo_tgts.append(torch.cat([img_idx, cls, xy, wh], dim=1))
-
-#         # handle empty targets
-#         if len(yolo_tgts) == 0:
-#             # critical: return a small dummy loss to avoid calling _loss_fn
-#             LOGGER.debug(f"No valid targets in batch, returning dummy loss")
-#             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
-        
-#         yolo_targets = torch.cat(yolo_tgts, dim=0)
-        
-#         # check yolo_targets shape
-#         if yolo_targets.size(0) == 0 or yolo_targets.size(1) != 6:
-#             LOGGER.warning(f"Invalid yolo_targets shape: {yolo_targets.shape}")
-#             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
-        
-#         # compute loss (only when there are valid targets)
-#         try:
-#             total_loss, _ = self._loss_fn(preds, yolo_targets)
-#             return {"loss": total_loss}
-#         except Exception as e:
-#             LOGGER.warning(f"Loss computation failed: {e}, returning dummy loss")
-#             return {"loss": torch.tensor(0.0, device=images.device, requires_grad=True)}
 
 class YoloV5ForART(nn.Module):
     """
@@ -205,10 +36,11 @@ class YoloV5ForART(nn.Module):
         
         # ensure model is in eval mode but allow gradients
         self.model.eval()
-        # for p in self.model.parameters():
-        #     p.requires_grad = True
-            
         self.current_paths = []
+
+    def zero_grad(self, set_to_none: bool = False):
+        """Prevent ART from clearing outer training model accumulated parameter gradients."""
+        pass
 
     @torch.enable_grad()
     def forward(self, images: torch.Tensor, targets=None):
@@ -306,27 +138,12 @@ class YoloV5ForART(nn.Module):
                      LOGGER.warning("⚠️ torch.is_grad_enabled() IS FALSE inside wrapper! Forcing it.")
                      torch.set_grad_enabled(True)
 
-                # # DEBUG
-                # LOGGER.info(f"DEBUG DIAGNOSTICS:")
-                # LOGGER.info(f"  Model training mode: {self.model.training}")
-                # try:
-                #     p = next(self.model.parameters())
-                #     LOGGER.info(f"  Model param requires_grad: {p.requires_grad}")
-                #     LOGGER.info(f"  Model param device: {p.device}")
-                # except Exception:
-                #     LOGGER.info("  Could not check model params")
-                
-                # LOGGER.info(f"  Input images: shape={images.shape}, req_grad={images.requires_grad}, is_leaf={images.is_leaf}")
-                # LOGGER.info(f"  Grad enabled: {torch.is_grad_enabled()}")
-                
                 # set train mode to get feature maps (for loss computation)
                 # but force BN layers to eval mode (use pretrained statistics)
                 self.model.train()
                 for m in self.model.modules():
                     if isinstance(m, (torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
                         m.eval()
-                
-                # LOGGER.info(f"Model training mode after set: {self.model.training}")
 
                 # forward propagation
                 preds = self.model(images, augment=False)
@@ -354,34 +171,14 @@ class YoloV5ForART(nn.Module):
 
                 # Verify graph integrity
                 if not final_loss.requires_grad:
-                    LOGGER.warning(f"Critical: Loss does not require grad! Input req_grad={images.requires_grad}")
-                    # Debug preds
-                    if isinstance(preds, (list, tuple)) and len(preds) > 0:
-                        LOGGER.warning(f"DEBUG: preds[0] req_grad={preds[0].requires_grad}")
-                    # Construct a valid dummy loss connected to input
-                    final_loss = (images * 0).sum() 
+                    raise RuntimeError(f"Adversarial loss does not require grad! Input req_grad={images.requires_grad}")
 
-            self.model.train(original_training)
-            
             if images.requires_grad and not images.is_leaf:
-                 images.retain_grad()
+                images.retain_grad()
 
             return {"loss": final_loss}
-            
-        except Exception as e:
-            LOGGER.warning(f"Loss computation failed: {e}")
-            
+        finally:
             self.model.train(original_training)
-            
-            import traceback
-            LOGGER.debug(traceback.format_exc())
-            
-            # Return a safe dummy loss
-            dummy = torch.tensor(0.0, device=images.device, requires_grad=True)
-            if images.requires_grad:
-                 dummy = dummy + (images.mean() * 0.0)
-            
-            return {"loss": dummy}
 
 class ARTPGD(Attacker):
     attack_mode = "detector"
@@ -394,14 +191,13 @@ class ARTPGD(Attacker):
       epoch   -> PGD.max_iter
     """
     def __init__(self, model, config=None, target=None,
-                 epsilon=0.05, lr=0.005, epoch=20, img_size=640):
+                 epsilon=0.031372549, lr=0.00784313725, epoch=5, img_size=640):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
 
-        # might not be necessary as batchnorm/dropout will be disabled in ART wrapper later
+        # Set model to eval mode (batchnorm/dropout will also be handled in ART wrapper)
         self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(True)
+        # Note: Do not force p.requires_grad_(True) to preserve frozen layers and avoid parameter gradient calculation
 
         # wrap yolo model for ART
         wrapped = YoloV5ForART(self.model, img_size)
@@ -445,33 +241,6 @@ class ARTPGD(Attacker):
         x_adv_np = self.attack.generate(x=x_np, y=y_art)
         x_adv = torch.from_numpy(x_adv_np).to(self.device).type_as(x)
         return x_adv
-
-    # @staticmethod
-    # def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> List[Dict[str, np.ndarray]]:
-    #     out: List[Dict[str, np.ndarray]] = []
-    #     t = targets.detach().cpu()
-    #     for i in range(batch_size):
-    #         ti = t[t[:, 0] == i]
-    #         if ti.numel() == 0:
-    #             out.append({"boxes": np.zeros((0, 4), dtype=np.float32),
-    #                         "labels": np.zeros((0,), dtype=np.int64)})
-    #             continue
-    #         # xywh -> xyxy
-    #         xywh = ti[:, 2:6].clone()
-    #         xywh[:, 0] *= W; xywh[:, 1] *= H
-    #         xywh[:, 2] *= W; xywh[:, 3] *= H
-    #         xyxy = torch.zeros_like(xywh)
-    #         xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
-    #         xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
-    #         xyxy[:, 2] = xywh[:, 0] + xywh[:, 2] / 2
-    #         xyxy[:, 3] = xywh[:, 1] + xywh[:, 3] / 2
-
-    #         labels = ti[:, 1].to(torch.int64)
-    #         out.append({
-    #             "boxes": xyxy.numpy().astype(np.float32),
-    #             "labels": labels.numpy().astype(np.int64),
-    #         })
-    #     return out
 
     @staticmethod
     def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> List[Dict[str, np.ndarray]]:

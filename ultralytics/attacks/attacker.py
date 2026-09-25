@@ -13,12 +13,7 @@ class Attacker(ABC):
         self.config = config
         self.epsilon = epsilon
         self.model = model
-    
-    # def _random_init(self, x):
-    #     x = x + (torch.rand(x.size(), dtype=x.dtype, device=x.device) - 0.5) * 2 * self.epsilon
-    #     x = torch.clamp(x,*self.clamp)
-    #     return x
 
-    def __call__(self, x,y):
+    def __call__(self, x, y):
         x_adv = self.forward(x,y)
         return x_adv

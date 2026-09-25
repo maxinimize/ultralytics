@@ -40,8 +40,8 @@ class ARTBIM(Attacker):
         config=None,
         target=None,
         epsilon: float = 0.05,
-        lr: float = 0.005,
-        epoch: int = 20,
+        lr: float = 0.02,
+        epoch: int = 5,
         img_size: int = 640,
         *,
         eps: Optional[float] = None,
@@ -72,8 +72,7 @@ class ARTBIM(Attacker):
         self.attack_losses = tuple(attack_losses)
 
         self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad_(True)
+        # Note: Do not force p.requires_grad_(True) to preserve frozen layers and avoid parameter gradient calculation
 
         self.wrapped_model = YoloV5ForART(self.model, self.img_size)
         resolved_device_type = device_type or ("gpu" if self.device.type == "cuda" else "cpu")
