@@ -55,29 +55,22 @@ def parse_list_arg(val, type_conv=str):
 
 
 class YOLODatasetAdvTest(YOLODataset):
-    """Dataset class for loading clean images and their corresponding pre-generated adversarial images with multiple attacks."""
+    """Dataset class for loading clean images and mapping to multiple online adversarial attack types."""
 
     def __init__(self, cfg, img_path, batch, data, mode="train", rect=False, stride=32, **kwargs):
         """Initialize YOLODatasetAdvTest with configuration and extract attack parameters."""
         self.cfg = cfg
-        self.attack_num = int(getattr(cfg, "attack_num", 1))
         
-        # Parse attack name and ratio
+        # Parse attack names and ratios directly without artificial attack_num truncation
         self.attack_names = parse_list_arg(getattr(cfg, "attack_name", "pgd"), str)
         self.attack_ratios = parse_list_arg(getattr(cfg, "attack_ratio", 0.5), float)
         
-        # Align lengths with attack_num
-        if len(self.attack_names) < self.attack_num:
-            last = self.attack_names[-1] if self.attack_names else "pgd"
-            self.attack_names.extend([last] * (self.attack_num - len(self.attack_names)))
-        else:
-            self.attack_names = self.attack_names[:self.attack_num]
-            
-        if len(self.attack_ratios) < self.attack_num:
+        # Align lengths of ratios with attack_names
+        if len(self.attack_ratios) < len(self.attack_names):
             last = self.attack_ratios[-1] if self.attack_ratios else 0.5
-            self.attack_ratios.extend([last] * (self.attack_num - len(self.attack_ratios)))
-        else:
-            self.attack_ratios = self.attack_ratios[:self.attack_num]
+            self.attack_ratios.extend([last] * (len(self.attack_names) - len(self.attack_ratios)))
+        elif len(self.attack_ratios) > len(self.attack_names):
+            self.attack_ratios = self.attack_ratios[:len(self.attack_names)]
 
         super().__init__(
             img_path=img_path,
@@ -98,14 +91,11 @@ class YOLODatasetAdvTest(YOLODataset):
             **kwargs
         )
         
-        self.use_pregenerated_adv = getattr(self.cfg, "use_pregenerated_adv", False)
-        
         # Build virtual samples
         self.build_virtual_samples()
         
-        # Setup separate transform pipelines
+        # Setup clean transform pipeline
         self.transforms_raw = self.build_transforms(self.cfg)
-        self.transforms_adv = self.build_adv_transforms(self.cfg)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         """Build transforms for clean images."""
@@ -131,41 +121,10 @@ class YOLODatasetAdvTest(YOLODataset):
         )
         return transforms
 
-    def build_adv_transforms(self, hyp: dict | None = None) -> Compose:
-        """Build minimal transforms for adversarial images."""
-        transforms = [LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)]
-        transforms = Compose(transforms)
-        transforms.append(
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=hyp.mask_ratio,
-                mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,
-            )
-        )
-        return transforms
-
     def build_virtual_samples(self):
         """Build virtual samples mapped to raw or specific adversarial counterparts based on ratios."""
-        self.adv_indices_by_attack = {}
         n_raw = len(self.im_files)
-        
-        for att in self.attack_names:
-            self.adv_indices_by_attack[att] = []
-            if self.use_pregenerated_adv:
-                for i, f in enumerate(self.im_files):
-                    p = Path(f)
-                    adv_path = p.parent / f"{p.stem}_{att}{p.suffix}"
-                    if adv_path.exists():
-                        self.adv_indices_by_attack[att].append(i)
-                LOGGER.info(f"YOLODatasetAdvTest: Found {len(self.adv_indices_by_attack[att])}/{n_raw} pre-generated images for attack: {att}")
-            else:
-                self.adv_indices_by_attack[att] = list(range(n_raw))
+        self.adv_indices_by_attack = {att: list(range(n_raw)) for att in self.attack_names}
 
         ratio_sum = sum(self.attack_ratios)
 
@@ -202,58 +161,13 @@ class YOLODatasetAdvTest(YOLODataset):
         random.shuffle(self.virtual_samples)
         LOGGER.info(f"YOLODatasetAdvTest: Built {len(self.virtual_samples)} virtual samples.")
 
-    def load_adv_image(self, i: int, attack_name: str, rect_mode: bool = True) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
-        """Load pre-generated adversarial image from disk."""
-        orig_path = self.im_files[i]
-        p = Path(orig_path)
-        adv_path = p.parent / f"{p.stem}_{attack_name}{p.suffix}"
-        
-        if not adv_path.exists():
-            LOGGER.warning(f"Adversarial image not found: {adv_path}. Falling back to clean image {orig_path}.")
-            adv_path = orig_path
-
-        im = cv2.imread(str(adv_path), flags=self.cv2_flag)
-        if im is None:
-            raise FileNotFoundError(f"Failed to load image: {adv_path}")
-            
-        h0, w0 = im.shape[:2]
-        if rect_mode:
-            r = self.imgsz / max(h0, w0)
-            if r != 1:
-                w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-        elif not (h0 == w0 == self.imgsz):
-            im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-        if im.ndim == 2:
-            im = im[..., None]
-        return im, (h0, w0), im.shape[:2]
-
     def __getitem__(self, index: int) -> dict[str, Any]:
-        """Return transformed clean or adversarial label information for given virtual index."""
+        """Return transformed clean label information with assigned attack category for given virtual index."""
         orig_idx, sample_type = self.virtual_samples[index]
-        
-        if sample_type == "raw":
-            label = self.get_image_and_label(orig_idx)
-            label = self.transforms_raw(label)
-            label["sample_type"] = "raw"
-            label["attack_name"] = None
-        else:
-            if self.use_pregenerated_adv:
-                original_load_image = self.load_image
-                try:
-                    self.load_image = lambda idx, rect_mode=True: self.load_adv_image(idx, sample_type, rect_mode=rect_mode)
-                    label = self.get_image_and_label(orig_idx)
-                finally:
-                    self.load_image = original_load_image
-                label = self.transforms_adv(label)
-            else:
-                # If on-the-fly, load raw image and use raw transforms (adversarial is generated in training loop)
-                label = self.get_image_and_label(orig_idx)
-                label = self.transforms_raw(label)
-            
-            label["sample_type"] = sample_type
-            label["attack_name"] = sample_type
-            
+        label = self.get_image_and_label(orig_idx)
+        label = self.transforms_raw(label)
+        label["sample_type"] = sample_type
+        label["attack_name"] = sample_type if sample_type != "raw" else None
         return label
 
     def __len__(self) -> int:
@@ -323,15 +237,36 @@ class YOLODatasetAdvTest(YOLODataset):
 class DetectionTrainer(BaseTrainer):
     """A class extending the BaseTrainer class for training based on a detection model."""
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None, attack_weights = ""):
+    def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks=None, attack_weights=""):
         """Initialize a DetectionTrainer object for training YOLO object detection model."""
         if overrides is None:
             overrides = {}
-        self._attack_weights_arg = attack_weights or overrides.pop("attack_weights", "")
-        self._attack_name_arg = overrides.pop("attack_name", "cw")
-        self._use_pregenerated_adv_arg = overrides.pop("use_pregenerated_adv", False)
-        self._attack_num_arg = overrides.pop("attack_num", 1)
-        self._attack_ratio_arg = overrides.pop("attack_ratio", 0.5)
+
+        # If resuming, attempt to recover original adversarial training arguments from saved args.yaml
+        saved_args = {}
+        resume = overrides.get("resume", False)
+        if resume and isinstance(resume, (str, Path)) and str(resume).endswith(".pt"):
+            args_yaml = Path(resume).resolve().parent.parent / "args.yaml"
+            if args_yaml.exists():
+                try:
+                    import yaml
+                    with open(args_yaml, "r") as f:
+                        saved_args = yaml.safe_load(f) or {}
+                except Exception as e:
+                    LOGGER.warning(f"Could not load attack configuration from {args_yaml}: {e}")
+
+        self._attack_weights_arg = attack_weights or overrides.pop(
+            "attack_weights", saved_args.get("attack_weights", "")
+        )
+        self._attack_name_arg = overrides.pop(
+            "attack_name", saved_args.get("attack_name", "pgd")
+        )
+        self._attack_ratio_arg = overrides.pop(
+            "attack_ratio", saved_args.get("attack_ratio", 0.5)
+        )
+        attack_num_arg = overrides.pop(
+            "attack_num", saved_args.get("attack_num", None)
+        )
 
         super().__init__(cfg, overrides, _callbacks)
 
@@ -339,29 +274,22 @@ class DetectionTrainer(BaseTrainer):
             self.args.attack_weights = self._attack_weights_arg
         if not hasattr(self.args, "attack_name"):
             self.args.attack_name = self._attack_name_arg
-        if not hasattr(self.args, "use_pregenerated_adv"):
-            self.args.use_pregenerated_adv = self._use_pregenerated_adv_arg
-        if not hasattr(self.args, "attack_num"):
-            self.args.attack_num = self._attack_num_arg
         if not hasattr(self.args, "attack_ratio"):
             self.args.attack_ratio = self._attack_ratio_arg
 
         self.attack_names = parse_list_arg(self.args.attack_name, str)
         self.attack_ratios = parse_list_arg(self.args.attack_ratio, float)
-        self.attack_num = int(self.args.attack_num)
+        self.attack_num = int(attack_num_arg) if attack_num_arg is not None else (
+            int(self.args.attack_num) if hasattr(self.args, "attack_num") and self.args.attack_num is not None else len(self.attack_names)
+        )
+        self.args.attack_num = self.attack_num
         
-        # Align lengths
-        if len(self.attack_names) < self.attack_num:
-            last = self.attack_names[-1] if self.attack_names else "pgd"
-            self.attack_names.extend([last] * (self.attack_num - len(self.attack_names)))
-        else:
-            self.attack_names = self.attack_names[:self.attack_num]
-            
-        if len(self.attack_ratios) < self.attack_num:
+        # Align lengths of ratios with attack_names
+        if len(self.attack_ratios) < len(self.attack_names):
             last = self.attack_ratios[-1] if self.attack_ratios else 0.5
-            self.attack_ratios.extend([last] * (self.attack_num - len(self.attack_ratios)))
-        else:
-            self.attack_ratios = self.attack_ratios[:self.attack_num]
+            self.attack_ratios.extend([last] * (len(self.attack_names) - len(self.attack_ratios)))
+        elif len(self.attack_ratios) > len(self.attack_names):
+            self.attack_ratios = self.attack_ratios[:len(self.attack_names)]
 
         self.attack_model = None
         self.attacker = None
@@ -424,10 +352,16 @@ class DetectionTrainer(BaseTrainer):
         attack_weights = getattr(self.args, "attack_weights", None)
         LOGGER.info(f"Debug: attack_weights from args = {attack_weights}")
 
-        if attack_weights:
-            try:
-                LOGGER.info(f"Attempting to load attack model from: {attack_weights}")
-                imgsz = getattr(self.args, "imgsz", 640)
+        use_current_model = (attack_weights is None) or (str(attack_weights).strip().lower() in {"", "none", "current"})
+
+        try:
+            imgsz = getattr(self.args, "imgsz", 640)
+            if use_current_model:
+                LOGGER.info("Adversarial training: using CURRENT training model as attack generator (white-box AT).")
+                self.attack_model = None
+                target_attack_model = unwrap_model(self.model)
+            else:
+                LOGGER.info(f"Adversarial training: loading fixed attack model from: {attack_weights}")
                 self.attack_model = setup_attack_model(
                     attack_weights,
                     device=self.device,
@@ -436,27 +370,23 @@ class DetectionTrainer(BaseTrainer):
                     imgsz=imgsz,
                 )
                 LOGGER.info(f"Attack model loaded successfully from {attack_weights}")
-
                 self.attack_model.eval()
-                for p in self.attack_model.parameters():
-                    p.requires_grad = True
+                target_attack_model = self.attack_model
 
-                self.attackers = {}
-                for att in self.attack_names:
-                    self.attackers[att] = build_attacker(att, model=self.attack_model, img_size=imgsz)
-                    LOGGER.info(f"attacker initialized: {att}")
-                
-                # Keep self.attacker for validation (which uses the first attack)
-                self.attacker = self.attackers[self.attack_names[0]]
-            except Exception as e:
-                LOGGER.warning(f"Failed to load attack model or attacker: {e}")
-                import traceback
-                LOGGER.warning(traceback.format_exc())
-                self.attack_model = None
-                self.attacker = None
-                self.attackers = {}
-        else:
-            LOGGER.info("No attack weights provided, adversarial training disabled")
+            self.attackers = {}
+            for att in self.attack_names:
+                self.attackers[att] = build_attacker(att, model=target_attack_model, img_size=imgsz)
+                LOGGER.info(f"attacker initialized: {att}")
+
+            # Keep self.attacker for validation (which uses the first attack)
+            self.attacker = self.attackers[self.attack_names[0]]
+        except Exception as e:
+            LOGGER.warning(f"Failed to load attack model or attacker: {e}")
+            import traceback
+            LOGGER.warning(traceback.format_exc())
+            self.attack_model = None
+            self.attacker = None
+            self.attackers = {}
 
     def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
         """Return a YOLO detection model."""
@@ -470,18 +400,12 @@ class DetectionTrainer(BaseTrainer):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
 
         validator_args = copy(self.args)
-        if hasattr(validator_args, 'attack_weights'):
-            delattr(validator_args, 'attack_weights')
-        if hasattr(validator_args, 'attack_name'):
-            delattr(validator_args, 'attack_name')
-        if hasattr(validator_args, 'use_pregenerated_adv'):
-            delattr(validator_args, 'use_pregenerated_adv')
-        for arg in ['attack_num', 'attack_ratio']:
+        for arg in ['attack_weights', 'attack_name', 'attack_ratio', 'attack_num']:
             if hasattr(validator_args, arg):
                 delattr(validator_args, arg)
 
         validator = DetectionValidatorAdv(
-            self.test_loader, save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks
+            getattr(self, "test_loader", None), save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks
         )
         validator.attacker = getattr(self, "attacker", None)
         validator.attackers = getattr(self, "attackers", {})
@@ -659,28 +583,45 @@ class DetectionTrainer(BaseTrainer):
 
                     sub_batches = self.split_batch_by_type(batch)
 
-                    # If on-the-fly, generate adversarial images for present attack groups
-                    if not getattr(self.args, "use_pregenerated_adv", False) and getattr(self, "attackers", None):
-                        for att, attacker in self.attackers.items():
-                            if att in sub_batches:
-                                sub_batch = sub_batches[att]
-                                try:
-                                    if hasattr(attacker, "proxy_model"):
-                                        attacker.proxy_model.current_paths = sub_batch.get("im_file", [])
-                                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                                        attacker.estimator.model.current_paths = sub_batch.get("im_file", [])
-                                    if self.attack_model is not None and hasattr(self.attack_model, "current_paths"):
-                                        self.attack_model.current_paths = sub_batch.get("im_file", [])
+                    # Generate adversarial images for present attack groups on-the-fly
+                    has_generated_adv = False
+                    if getattr(self, "attackers", None):
+                        is_current_model = (getattr(self, "attack_model", None) is None)
+                        if is_current_model:
+                            param_grad_states = [p.requires_grad for p in self.model.parameters()]
+                            for p in self.model.parameters():
+                                p.requires_grad = False
 
-                                    with torch.amp.autocast(device_type="cuda", enabled=False):
-                                        imgs_adv = run_attack_on_batch(attacker, sub_batch, label_policy="largest_box")
+                        try:
+                            for att, attacker in self.attackers.items():
+                                if att in sub_batches:
+                                    sub_batch = sub_batches[att]
+                                    try:
+                                        if hasattr(attacker, "proxy_model"):
+                                            attacker.proxy_model.current_paths = sub_batch.get("im_file", [])
+                                        if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                                            attacker.estimator.model.current_paths = sub_batch.get("im_file", [])
+                                        if self.attack_model is not None and hasattr(self.attack_model, "current_paths"):
+                                            self.attack_model.current_paths = sub_batch.get("im_file", [])
 
-                                    if imgs_adv is not None:
-                                        sub_batch["img"] = imgs_adv.to(sub_batch["img"].dtype).to(self.device)
-                                except Exception as e:
-                                    LOGGER.warning(f"Adversarial generation failed for {att}: {e}. Keeping raw images.")
-                                    import traceback
-                                    LOGGER.warning(traceback.format_exc())
+                                        with torch.amp.autocast(device_type="cuda", enabled=False):
+                                            imgs_adv = run_attack_on_batch(attacker, sub_batch, label_policy="largest_box")
+
+                                        if imgs_adv is not None:
+                                            sub_batch["img"] = imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)
+                                            has_generated_adv = True
+                                            del imgs_adv
+                                    except Exception as e:
+                                        LOGGER.warning(f"Adversarial generation failed for {att}: {e}. Keeping raw images.")
+                                        import traceback
+                                        LOGGER.warning(traceback.format_exc())
+                        finally:
+                            if is_current_model:
+                                for p, state in zip(self.model.parameters(), param_grad_states):
+                                    p.requires_grad = state
+
+                        if has_generated_adv:
+                            torch.cuda.empty_cache()
 
                     raw_ratio = max(0.0, 1.0 - sum(self.attack_ratios))
                     group_weights = {"raw": raw_ratio}
@@ -731,6 +672,9 @@ class DetectionTrainer(BaseTrainer):
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()
                     last_opt_step = ni
+
+                    if i % 20 == 0:
+                        torch.cuda.empty_cache()
 
                     if self.args.time:
                         self.stop = (time.time() - self.train_time_start) > (self.args.time * 3600)

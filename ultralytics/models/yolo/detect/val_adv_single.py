@@ -65,6 +65,9 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
+        self.feature_distillation = bool(getattr(self.args, "feature_distillation", False))
+        self.fd = None
+        self._fd_checked = False
 
     def __call__(self, trainer=None, model=None):
         """Execute validation process, running inference on dataloader and computing performance metrics.
@@ -138,6 +141,17 @@ class DetectionValidator(BaseValidator):
         bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
         self.init_metrics(unwrap_model(model))
         self.jdict = []  # empty before each val
+
+        # Initialize Feature Distillation once per validation run if enabled
+        if self.feature_distillation:
+            from ultralytics.defenses.feature_distillation import FeatureDistillation
+            self.fd = FeatureDistillation(allow_padding=False).to(self.device)
+            self.fd.eval()
+            LOGGER.info("Feature Distillation defense initialized for validation.")
+        else:
+            self.fd = None
+        self._fd_checked = False
+
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
@@ -213,58 +227,87 @@ class DetectionValidator(BaseValidator):
         attacker = getattr(self, "attacker", None)
         if attacker:
             try:
-                attack_name = getattr(self, "attack_name", None)
                 im_files = batch.get("im_file", [])
-                
-                # Caching logic (set use_cache to False to bypass reading and writing .pt cache files)
-                use_cache = False
-                all_cached = False
-                cache_paths = []
-                cached_imgs = []
-                
-                if use_cache and attack_name and im_files:
-                    all_cached = True
-                    for f in im_files:
-                        path = Path(f)
-                        cache_path = path.parent / f"{path.stem}_{attack_name}.pt"
-                        cache_paths.append(cache_path)
-                        if cache_path.exists():
-                            try:
-                                cached_imgs.append(torch.load(cache_path, map_location=self.device))
-                            except Exception as e:
-                                LOGGER.warning(f"Failed to load cache {cache_path}: {e}")
-                                all_cached = False
-                                break
-                        else:
-                            all_cached = False
-                            break
+                if hasattr(attacker, "proxy_model"):
+                    attacker.proxy_model.current_paths = im_files
+                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                    attacker.estimator.model.current_paths = im_files
 
-                if all_cached and len(cached_imgs) == len(im_files):
-                    batch["img"] = torch.stack(cached_imgs).to(batch["img"].dtype).to(self.device)
-                else:
-                    if hasattr(attacker, "proxy_model"):
-                        attacker.proxy_model.current_paths = im_files
-                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                        attacker.estimator.model.current_paths = im_files
-
-                    with torch.amp.autocast(device_type="cuda", enabled=False):
-                        imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
-                    if imgs_adv is not None:
-                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                        batch["img"] = imgs_adv_cast
-                        
-                        # Save the generated images to cache
-                        if use_cache and attack_name and im_files:
-                            for i, cache_path in enumerate(cache_paths):
-                                if not cache_path.exists():
-                                    try:
-                                        torch.save(imgs_adv_cast[i].detach().cpu(), cache_path)
-                                    except Exception as e:
-                                        LOGGER.warning(f"Failed to save cache {cache_path}: {e}")
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
+                if imgs_adv is not None:
+                    imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
+                    batch["img"] = imgs_adv_cast
+                    del imgs_adv, imgs_adv_cast
+                    torch.cuda.empty_cache()
             except Exception as e:
                 LOGGER.warning(f"Adversarial generation failed: {e}. Skipping attack for this batch.")
 
+        # Feature Distillation defense (validation image -> attack -> Feature Distillation -> YOLO)
+        if self.feature_distillation:
+            if self.fd is None:
+                from ultralytics.defenses.feature_distillation import FeatureDistillation
+                self.fd = FeatureDistillation(allow_padding=False).to(self.device)
+                self.fd.eval()
+            if not getattr(self, "_fd_checked", False):
+                self._check_fd_input(batch["img"])
+                self._fd_checked = True
+            batch["img"] = self.fd(batch["img"])
+
         return batch
+
+    def _check_fd_input(self, images: torch.Tensor) -> None:
+        """Validate that input tensor satisfies Feature Distillation requirements before first use.
+
+        Requirement 1:
+            - Must be [B, 3, H, W] floating-point Tensor.
+            - Pixel range must be [0, 1].
+        Requirement 2:
+            - H and W must both be divisible by 8.
+        """
+        if not isinstance(images, torch.Tensor):
+            raise TypeError(f"Requirement 1 failed: Expected torch.Tensor, got {type(images)}")
+
+        if images.ndim != 4:
+            raise ValueError(
+                f"Requirement 1 failed: Expected 4D tensor with shape [B, 3, H, W], got {tuple(images.shape)}"
+            )
+
+        b, c, h, w = images.shape
+        if c != 3:
+            raise ValueError(
+                f"Requirement 1 failed: Expected 3 color channels (C=3), got C={c} in shape {tuple(images.shape)}"
+            )
+
+        if not images.is_floating_point():
+            raise TypeError(
+                f"Requirement 1 failed: Expected floating-point tensor, got dtype={images.dtype}"
+            )
+
+        img_min = float(images.min().item()) if images.numel() > 0 else 0.0
+        img_max = float(images.max().item()) if images.numel() > 0 else 0.0
+        tol = 1e-4
+        if img_min < -tol or img_max > 1.0 + tol:
+            raise ValueError(
+                f"Requirement 1 failed: Pixel range must be within [0, 1], but observed min={img_min:.6f}, max={img_max:.6f}. "
+                "Values outside [0, 1] violate Requirement 1; please check input scaling."
+            )
+
+        if h % 8 != 0 or w % 8 != 0:
+            raise ValueError(
+                f"Requirement 2 failed: Both H and W must be divisible by 8. "
+                f"Received H={h} (H % 8 = {h % 8}), W={w} (W % 8 = {w % 8})."
+            )
+
+        LOGGER.info(
+            f"[FeatureDistillation] First-use input verification passed:\n"
+            f"  - shape:  {tuple(images.shape)} ([B, 3, H, W])\n"
+            f"  - dtype:  {images.dtype}\n"
+            f"  - device: {images.device}\n"
+            f"  - min:    {img_min:.6f}\n"
+            f"  - max:    {img_max:.6f}\n"
+            f"  - H/W:    H={h} (divisible by 8), W={w} (divisible by 8)"
+        )
 
     def init_metrics(self, model: torch.nn.Module) -> None:
         """Initialize evaluation metrics for YOLO detection validation.

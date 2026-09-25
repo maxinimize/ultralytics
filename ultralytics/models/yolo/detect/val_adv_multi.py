@@ -181,18 +181,23 @@ class DetectionValidator(BaseValidator):
 
         # Determine the runs to execute
         has_multiple_attacks = False
-        attack_names = getattr(self, "attack_names", [])
-        ratios = getattr(self, "attack_ratios", [])
+        raw_att = (
+            getattr(self, "attack_names", None)
+            or getattr(self, "attack_name", None)
+            or getattr(self.args, "attack_names", None)
+            or getattr(self.args, "attack_name", None)
+        )
+        attack_names = parse_list_arg(raw_att, str)
 
-        # Fallback to attack_name/ratio string parsing if attack_names/ratios are empty
-        if not attack_names:
-            single_att = getattr(self, "attack_name", None) or getattr(self.args, "attack_name", None)
-            if single_att:
-                attack_names = parse_list_arg(single_att, str)
-        if not ratios:
-            single_ratio = getattr(self, "ratio", None) or getattr(self.args, "ratio", None)
-            if single_ratio is not None:
-                ratios = parse_list_arg(single_ratio, float)
+        raw_ratio = (
+            getattr(self, "attack_ratios", None)
+            or getattr(self, "attack_ratio", None)
+            or getattr(self, "ratio", None)
+            or getattr(self.args, "attack_ratios", None)
+            or getattr(self.args, "attack_ratio", None)
+            or getattr(self.args, "ratio", None)
+        )
+        ratios = parse_list_arg(raw_ratio, float)
 
         if len(attack_names) > 1 or (len(attack_names) == 1 and ratios):
             attack_num = len(attack_names)
@@ -206,23 +211,12 @@ class DetectionValidator(BaseValidator):
             ratio_sum = sum(ratios)
             weights = {}
 
-            # if ratio_sum < 1.0:
-            #     weights["raw"] = 1.0 - ratio_sum
-            #     for att, r in zip(attack_names, ratios):
-            #         weights[att] = weights.get(att, 0.0) + r
-            # else:
-            #     weights["raw"] = 0.0
-            #     for att, r in zip(attack_names, ratios):
-            #         weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
-
             if ratio_sum > 0:
                 for att, r in zip(attack_names, ratios):
                     weights[att] = weights.get(att, 0.0) + (r / ratio_sum)
             else:
                 for att in attack_names:
                     weights[att] = 1.0 / len(attack_names)
-
-            # unique_runs = ["raw"]
             unique_runs = []
             for att in attack_names:
                 if att not in unique_runs and att != "raw":
@@ -408,52 +402,18 @@ class DetectionValidator(BaseValidator):
         if attacker:
             try:
                 im_files = batch.get("im_file", [])
+                if hasattr(attacker, "proxy_model"):
+                    attacker.proxy_model.current_paths = im_files
+                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                    attacker.estimator.model.current_paths = im_files
 
-                # Caching logic (set use_cache to False to bypass reading and writing .pt cache files)
-                use_cache = False
-                all_cached = False
-                cache_paths = []
-                cached_imgs = []
-
-                if use_cache and attack_name and im_files:
-                    all_cached = True
-                    for f in im_files:
-                        path = Path(f)
-                        cache_path = path.parent / f"{path.stem}_{attack_name}.pt"
-                        cache_paths.append(cache_path)
-                        if cache_path.exists():
-                            try:
-                                cached_imgs.append(torch.load(cache_path, map_location=self.device))
-                            except Exception as e:
-                                LOGGER.warning(f"Failed to load cache {cache_path}: {e}")
-                                all_cached = False
-                                break
-                        else:
-                            all_cached = False
-                            break
-
-                if all_cached and len(cached_imgs) == len(im_files):
-                    batch["img"] = torch.stack(cached_imgs).to(batch["img"].dtype).to(self.device)
-                else:
-                    if hasattr(attacker, "proxy_model"):
-                        attacker.proxy_model.current_paths = im_files
-                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                        attacker.estimator.model.current_paths = im_files
-
-                    with torch.amp.autocast(device_type="cuda", enabled=False):
-                        imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
-                    if imgs_adv is not None:
-                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                        batch["img"] = imgs_adv_cast
-
-                        # Save the generated images to cache
-                        if use_cache and attack_name and im_files:
-                            for i, cache_path in enumerate(cache_paths):
-                                if not cache_path.exists():
-                                    try:
-                                        torch.save(imgs_adv_cast[i].detach().cpu(), cache_path)
-                                    except Exception as e:
-                                        LOGGER.warning(f"Failed to save cache {cache_path}: {e}")
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
+                if imgs_adv is not None:
+                    imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
+                    batch["img"] = imgs_adv_cast
+                    del imgs_adv, imgs_adv_cast
+                    torch.cuda.empty_cache()
             except Exception as e:
                 LOGGER.warning(f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch.")
 
