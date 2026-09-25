@@ -71,8 +71,8 @@ JOB_ID="${SLURM_JOB_ID:-local}"
 ATTACK_WEIGHTS="${1:-"current"}"
 DATA="${2:-"coco_train_traffic5k.yaml"}"
 EPOCHS="${3:-"100"}"
-ATTACK_NAME="${4:-"pgd"}"
-ATTACK_RATIO="${5:-"0.6"}"
+ATTACK_NAME="${4:-"pgd bim mim"}"
+ATTACK_RATIO="${5:-"0.25 0.25 0.25"}"
 
 # Dynamically calculate attack_num from attack_name
 read -ra ATK_ARR <<< "${ATTACK_NAME}"
@@ -151,16 +151,42 @@ echo "====================="
 #   --name=train_online_pgd_mim_traffic_class_mod_0.75_new \
 #   --resume=runs_new/train_online_pgd_bim_mim_traffic_class_mod_0.25_new/weights/last.pt
 
+# === Stage dataset to $SLURM_TMPDIR if tarball exists (Fast Local NVMe) ===
+DATA_ARG="${DATA}"
+DATASET_TAR="/project/6000635/czhan295/datasets/coco_traffic5k.tar"
+
+if [ -n "${SLURM_TMPDIR:-}" ] && [ -f "${DATASET_TAR}" ]; then
+  echo "==> Detected $DATASET_TAR, staging to local SSD: $SLURM_TMPDIR..."
+  LOCAL_DATA_DIR="${SLURM_TMPDIR}/datasets/coco"
+  mkdir -p "${LOCAL_DATA_DIR}"
+  tar -xf "${DATASET_TAR}" -C "${LOCAL_DATA_DIR}"
+
+  ORIGINAL_YAML="ultralytics/cfg/datasets/${DATA}"
+  if [ ! -f "${ORIGINAL_YAML}" ]; then
+    ORIGINAL_YAML="${DATA}"
+  fi
+
+  if [ -f "${ORIGINAL_YAML}" ]; then
+    TMP_DATA_YAML="${SLURM_TMPDIR}/local_${CLEAN_DATA}.yaml"
+    sed "s|^path:.*|path: ${LOCAL_DATA_DIR}|g" "${ORIGINAL_YAML}" > "${TMP_DATA_YAML}"
+    DATA_ARG="${TMP_DATA_YAML}"
+    echo "==> Using local dataset YAML: ${DATA_ARG}"
+  fi
+else
+  echo "==> No local tarball detected. Using default dataset path from ${DATA}"
+fi
+
 python train_adv_test_run.py \
   --model=yolo12l.pt \
   --attack_weights="${ATTACK_WEIGHTS}" \
-  --data="${DATA}" \
+  --data="${DATA_ARG}" \
   --classes 0 1 2 3 5 6 7 9 11 12 \
   --imgsz=640 \
   --epochs="${EPOCHS}" \
   --batch=${GLOBAL_BATCH} \
   --device=0 \
   --workers=${NUM_WORKERS} \
+  --cache=True \
   --attack_num="${ATTACK_NUM}" \
   --attack_name="${ATTACK_NAME}" \
   --attack_ratio="${ATTACK_RATIO}" \

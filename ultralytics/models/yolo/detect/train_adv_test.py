@@ -414,25 +414,22 @@ class DetectionTrainer(BaseTrainer):
         validator.attack_ratios = self.attack_ratios
         return validator
 
-    def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
-        """Return a loss dict with labeled training loss items tensor."""
-        keys = [f"{prefix}/{x}" for x in self.loss_names]
-        if loss_items is not None:
-            loss_items = [round(float(x), 5) for x in loss_items]
-            loss_dict = dict(zip(keys, loss_items))
-            if prefix == "train" and hasattr(self, "group_tloss"):
-                for t, g_tloss in self.group_tloss.items():
-                    if g_tloss is not None:
-                        g_keys = [f"{prefix}/{x}_{t}" for x in self.loss_names]
-                        g_vals = [round(float(x), 5) for x in g_tloss]
-                        loss_dict.update(dict(zip(g_keys, g_vals)))
-            return loss_dict
-        else:
-            all_keys = list(keys)
+    def label_loss_items(self, loss_items: dict[str, Any] | None = None, prefix: str = "train"):
+        """Return a loss dict with labeled training loss items."""
+        if loss_items is None:
+            all_keys = [f"{prefix}/{x}" for x in self.loss_names]
             if prefix == "train" and hasattr(self, "attack_names"):
                 for t in ["raw"] + self.attack_names:
                     all_keys.extend([f"{prefix}/{x}_{t}" for x in self.loss_names])
             return all_keys
+
+        loss_dict = {f"{prefix}/{k}": round(float(v), 5) for k, v in loss_items.items()}
+        if prefix == "train" and hasattr(self, "group_tloss"):
+            for t, g_tloss in self.group_tloss.items():
+                if g_tloss is not None:
+                    for k, v in g_tloss.items():
+                        loss_dict[f"{prefix}/{k}_{t}"] = round(float(v), 5)
+        return loss_dict
 
     def progress_string(self):
         """Return formatted progress bar headers."""
@@ -638,7 +635,7 @@ class DetectionTrainer(BaseTrainer):
                         normalized_weights = {g: 1.0 / len(present_groups) for g in present_groups}
 
                     total_loss = 0.0
-                    total_loss_items = torch.zeros(3, device=self.device)
+                    total_loss_items = None
 
                     for g in present_groups:
                         sub_batch = sub_batches[g]
@@ -653,20 +650,36 @@ class DetectionTrainer(BaseTrainer):
 
                         w = normalized_weights[g]
                         total_loss = total_loss + w * loss.sum()
-                        total_loss_items += w * loss_items
+
+                        if total_loss_items is None:
+                            total_loss_items = {k: w * v.detach() for k, v in loss_items.items()}
+                        else:
+                            for k, v in loss_items.items():
+                                total_loss_items[k] += w * v.detach()
 
                         if self.group_tloss.get(g) is None:
-                            self.group_tloss[g] = loss_items.clone().detach()
+                            self.group_tloss[g] = {k: v.detach().clone() for k, v in loss_items.items()}
                             self.group_batch_count[g] = 1
                         else:
-                            self.group_tloss[g] = (self.group_tloss[g] * self.group_batch_count[g] + loss_items.detach()) / (self.group_batch_count[g] + 1)
+                            cnt = self.group_batch_count[g]
+                            self.group_tloss[g] = {
+                                k: (self.group_tloss[g][k] * cnt + v.detach()) / (cnt + 1)
+                                for k, v in loss_items.items()
+                            }
                             self.group_batch_count[g] += 1
 
                     self.loss = total_loss
                     if RANK != -1:
                         self.loss *= self.world_size
                     self.loss_items = total_loss_items
-                    self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                    if not self.loss_names:
+                        self.loss_names = tuple(self.loss_items)
+
+                    self.tloss = (
+                        self.loss_items
+                        if self.tloss is None
+                        else {k: (self.tloss[k] * i + v) / (i + 1) for k, v in self.loss_items.items()}
+                    )
 
                 self.scaler.scale(self.loss).backward()
 
@@ -687,14 +700,14 @@ class DetectionTrainer(BaseTrainer):
                             break
 
                 if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                    loss_length = len(self.tloss)
                     pbar.set_description(
                         ("%11s" * 2 + "%11.4g" * (2 + loss_length))
                         % (
                             f"{epoch + 1}/{self.epochs}",
                             f"{self._get_memory():.3g}G",
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),
-                            batch["cls"].shape[0],
+                            *self.tloss.values(),
+                            batch.get("cls", batch["img"]).shape[0],
                             batch["img"].shape[-1],
                         )
                     )

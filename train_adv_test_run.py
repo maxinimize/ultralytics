@@ -20,7 +20,15 @@ def main():
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='Resume training from last checkpoint')
     # parser.add_argument('--no_train_aug', action='store_true', help='Disable YOLO training augmentations for adversarial training.')
     parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices, e.g. --classes 1 2 3 5 7')
+    parser.add_argument('--cache', nargs='?', const=True, default=True, help='Cache dataset images in RAM (True/ram, disk, False)')
     args = parser.parse_args()
+
+    cache_val = args.cache
+    if isinstance(cache_val, str):
+        if cache_val.lower() in ("true", "1", "ram"):
+            cache_val = "ram"
+        elif cache_val.lower() in ("false", "0", "none"):
+            cache_val = False
 
     overrides = dict(
         model=args.model,
@@ -34,6 +42,7 @@ def main():
         name=args.name,
         resume=args.resume,
         classes=args.classes,
+        cache=cache_val,
     )
     if args.attack_weights is not None:
         overrides["attack_weights"] = args.attack_weights

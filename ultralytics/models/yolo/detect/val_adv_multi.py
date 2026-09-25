@@ -138,7 +138,7 @@ class DetectionValidator(BaseValidator):
             if trainer.args.compile and hasattr(model, "_orig_mod"):
                 model = model._orig_mod  # validate non-compiled original model to avoid issues
             model = model.half() if self.args.half else model.float()
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
@@ -252,7 +252,7 @@ class DetectionValidator(BaseValidator):
 
             # Reset validation stats and metrics
             if self.training:
-                self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+                self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.init_metrics(unwrap_model(model))
 
             dt = (
@@ -277,7 +277,8 @@ class DetectionValidator(BaseValidator):
                 # Loss
                 with dt[2]:
                     if self.training:
-                        self.loss += model.loss(batch, preds)[1]
+                        for k, v in model.loss(batch, preds)[1].items():
+                            self.loss[k] += v
 
                 # Postprocess
                 with dt[3]:
@@ -311,10 +312,11 @@ class DetectionValidator(BaseValidator):
                 }
 
                 if self.training:
-                    loss = self.loss.clone().detach()
+                    loss = {k: v.clone().detach() for k, v in self.loss.items()}
                     if trainer.world_size > 1:
-                        dist.reduce(loss, dst=0, op=dist.ReduceOp.AVG)
-                    all_losses[run] = loss.cpu() / len(self.dataloader)
+                        for v in loss.values():
+                            dist.reduce(v, dst=0, op=dist.ReduceOp.AVG)
+                    all_losses[run] = {k: v.cpu() / len(self.dataloader) for k, v in loss.items()}
 
         if RANK > 0:
             return
@@ -363,9 +365,11 @@ class DetectionValidator(BaseValidator):
                 model.float()
 
                 # Compute weighted loss
-                weighted_loss = torch.zeros_like(all_losses[unique_runs[0]])
+                weighted_loss = {k: torch.zeros_like(v) for k, v in all_losses[unique_runs[0]].items()}
                 for run in unique_runs:
-                    weighted_loss += weights.get(run, 0.0) * all_losses[run]
+                    w = weights.get(run, 0.0)
+                    for k, v in all_losses[run].items():
+                        weighted_loss[k] += w * v
 
                 # Combine stats and labeled weighted loss
                 results = {**stats, **trainer.label_loss_items(weighted_loss, prefix="val")}
@@ -530,6 +534,7 @@ class DetectionValidator(BaseValidator):
                     "target_img": np.unique(cls),
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                    "im_name": Path(pbatch["im_file"]).name,
                 }
             )
             # Evaluate
