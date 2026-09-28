@@ -9,7 +9,6 @@ def main():
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch', type=int, default=24)
     parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
-    parser.add_argument('--attack_num', type=int, default=None, help='Number of attack types')
     parser.add_argument('--attack_name', nargs='+', default=None, help='Attack name or list of attack names')
     parser.add_argument('--attack_ratio', nargs='+', default=None, help='Attack ratio or list of attack ratios')
     parser.add_argument('--device', default='0,1')
@@ -48,8 +47,6 @@ def main():
         overrides["attack_weights"] = args.attack_weights
     if args.attack_name is not None:
         overrides["attack_name"] = args.attack_name
-    if args.attack_num is not None:
-        overrides["attack_num"] = args.attack_num
     if args.attack_ratio is not None:
         overrides["attack_ratio"] = args.attack_ratio
 

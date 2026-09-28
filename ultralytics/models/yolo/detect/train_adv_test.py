@@ -265,9 +265,7 @@ class DetectionTrainer(BaseTrainer):
         self._attack_ratio_arg = overrides.pop(
             "attack_ratio", saved_args.get("attack_ratio", 0.5)
         )
-        attack_num_arg = overrides.pop(
-            "attack_num", saved_args.get("attack_num", None)
-        )
+        overrides.pop("attack_num", None)
 
         super().__init__(cfg, overrides, _callbacks)
 
@@ -280,10 +278,7 @@ class DetectionTrainer(BaseTrainer):
 
         self.attack_names = parse_list_arg(self.args.attack_name, str)
         self.attack_ratios = parse_list_arg(self.args.attack_ratio, float)
-        self.attack_num = int(attack_num_arg) if attack_num_arg is not None else (
-            int(self.args.attack_num) if hasattr(self.args, "attack_num") and self.args.attack_num is not None else len(self.attack_names)
-        )
-        self.args.attack_num = self.attack_num
+        self.attack_num = len(self.attack_names)
         
         # Align lengths of ratios with attack_names
         if len(self.attack_ratios) < len(self.attack_names):
@@ -401,7 +396,7 @@ class DetectionTrainer(BaseTrainer):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
 
         validator_args = copy(self.args)
-        for arg in ['attack_weights', 'attack_name', 'attack_ratio', 'attack_num']:
+        for arg in ['attack_weights', 'attack_name', 'attack_ratio']:
             if hasattr(validator_args, arg):
                 delattr(validator_args, arg)
 

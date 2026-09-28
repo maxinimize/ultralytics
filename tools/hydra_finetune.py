@@ -54,12 +54,6 @@ def parse_args():
         default="",
         help="Optional surrogate model path for attacks. Default '' attacks the live model.",
     )
-    parser.add_argument(
-        "--attack_num",
-        type=int,
-        default=None,
-        help="Number of attack types. Automatically derived if omitted.",
-    )
     return parser.parse_args()
 
 
@@ -98,9 +92,6 @@ def main():
             overrides["attack_ratio"] = [float(r) for r in args.attack_ratio]
         else:
             overrides["attack_ratio"] = [0.5] * len(args.attack_name)
-
-        attack_num = args.attack_num if args.attack_num is not None else len(args.attack_name)
-        overrides["attack_num"] = attack_num
 
         LOGGER.info(
             f"Starting ROBUST fixed-mask fine-tuning with attacks: {overrides['attack_name']} "

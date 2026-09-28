@@ -71,12 +71,8 @@ JOB_ID="${SLURM_JOB_ID:-local}"
 ATTACK_WEIGHTS="${1:-"current"}"
 DATA="${2:-"coco_train_traffic5k.yaml"}"
 EPOCHS="${3:-"100"}"
-ATTACK_NAME="${4:-"pgd bim mim"}"
-ATTACK_RATIO="${5:-"0.25 0.25 0.25"}"
-
-# Dynamically calculate attack_num from attack_name
-read -ra ATK_ARR <<< "${ATTACK_NAME}"
-ATTACK_NUM="${#ATK_ARR[@]}"
+ATTACK_NAME="${4:-"pgd"}"
+ATTACK_RATIO="${5:-"0.6"}"
 
 # Sanitize components for clean file/folder names (remove extensions, replace spaces with underscores)
 CLEAN_WEIGHTS="$(basename "${ATTACK_WEIGHTS}" .pt)"
@@ -127,7 +123,6 @@ echo "====================="
 #   --batch=${GLOBAL_BATCH} \
 #   --device=0 \
 #   --workers=${NUM_WORKERS} \
-#   --attack_num=3 \
 #   --attack_name="pgd bim mim" \
 #   --attack_ratio="0.08" \
 #   --project=runs_new \
@@ -144,7 +139,6 @@ echo "====================="
 #   --batch=${GLOBAL_BATCH} \
 #   --device=0 \
 #   --workers=${NUM_WORKERS} \
-#   --attack_num=3 \
 #   --attack_name="pgd bim mim" \
 #   --attack_ratio="0.25 0.25 0.25" \
 #   --project=runs_new \
@@ -176,27 +170,29 @@ else
   echo "==> No local tarball detected. Using default dataset path from ${DATA}"
 fi
 
+# python train_adv_test_run.py \
+#   --model=yolo12l.pt \
+#   --attack_weights="${ATTACK_WEIGHTS}" \
+#   --data="${DATA_ARG}" \
+#   --classes 0 1 2 3 5 6 7 9 11 12 \
+#   --imgsz=640 \
+#   --epochs="${EPOCHS}" \
+#   --batch=${GLOBAL_BATCH} \
+#   --device=0 \
+#   --workers=${NUM_WORKERS} \
+#   --cache=True \
+#   --attack_name="${ATTACK_NAME}" \
+#   --attack_ratio="${ATTACK_RATIO}" \
+#   --project=runs \
+#   --name="${NAME}" \
+
 python train_adv_test_run.py \
-  --model=yolo12l.pt \
-  --attack_weights="${ATTACK_WEIGHTS}" \
-  --data="${DATA_ARG}" \
-  --classes 0 1 2 3 5 6 7 9 11 12 \
-  --imgsz=640 \
-  --epochs="${EPOCHS}" \
-  --batch=${GLOBAL_BATCH} \
   --device=0 \
+  --batch=${GLOBAL_BATCH} \
   --workers=${NUM_WORKERS} \
-  --cache=True \
-  --attack_num="${ATTACK_NUM}" \
+  --attack_weights="${ATTACK_WEIGHTS}" \
   --attack_name="${ATTACK_NAME}" \
   --attack_ratio="${ATTACK_RATIO}" \
-  --project=runs \
-  --name="${NAME}" \
-
-# python train_adv_test_run.py \
-#   --device=0 \
-#   --batch=${GLOBAL_BATCH} \
-#   --workers=${NUM_WORKERS} \
-#   --resume="runs/train_current_coco_train_traffic5k_ep100_mim_worstk_0.4_0.5/weights/last.pt"
+  --resume="runs/train_current_coco_train_traffic5k_ep100_pgd_0.6/weights/last.pt"
 
 # 2>&1 | grep --line-buffered -v "expandable_segments: memory mapping failed"
