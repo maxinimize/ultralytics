@@ -48,8 +48,8 @@ The confidence score represents the model's certainty that a detected object bel
 
 Two mAP metrics are most commonly reported:
 
-- *mAP@.5:* Measures the average precision at a single IoU threshold of 0.5. This metric checks if the model can correctly find objects with a looser accuracy requirement. It focuses on whether the object is roughly in the right place, not needing perfect placement, and helps see if the model is generally good at spotting objects.
-- *mAP@.5:.95:* Averages the mAP values calculated at multiple IoU thresholds, from 0.5 to 0.95 in 0.05 increments. This metric is more detailed and strict. It gives a fuller picture of how accurately the model can find objects at different levels of strictness and is especially useful for applications that need precise object detection.
+- _mAP@.5:_ Measures the average precision at a single IoU threshold of 0.5. This metric checks if the model can correctly find objects with a looser accuracy requirement. It focuses on whether the object is roughly in the right place, not needing perfect placement, and helps see if the model is generally good at spotting objects.
+- _mAP@.5:.95:_ Averages the mAP values calculated at multiple IoU thresholds, from 0.5 to 0.95 in 0.05 increments. This metric is more detailed and strict. It gives a fuller picture of how accurately the model can find objects at different levels of strictness and is especially useful for applications that need precise object detection.
 
 Other mAP metrics include mAP@0.75, which uses a stricter IoU threshold of 0.75, and mAP@small, medium, and large, which evaluate precision across objects of different sizes.
 
@@ -63,7 +63,7 @@ You can evaluate a trained YOLO26 model with the [validation mode](../modes/val.
 
 ### Handling Variable Image Sizes
 
-Evaluating your model on images of different sizes helps you understand its performance on diverse datasets. The `rect=true` validation parameter groups images by aspect ratio and pads each batch to the smallest shape that fits, so rectangular images are evaluated without being forced into a square.
+Evaluating your model on images of different sizes helps you understand its performance on diverse datasets. Validation uses rectangular batching by default (`rect=True` in `model.val()`): it groups images by aspect ratio and pads each batch to the smallest shape that fits, so rectangular images are evaluated without being forced into a square.
 
 The `imgsz` parameter sets the image size used during validation, applied as a square. If you don't set it explicitly, YOLO26 reuses the value saved in the model's settings (640 for the official pretrained models, or whatever size a custom checkpoint was trained at). With `rect=true`, YOLO26 constrains the longer side to `imgsz` and pads the shorter side to a stride multiple, preserving the aspect ratio. Adjust `imgsz` based on your dataset's dimensions and the GPU memory available.
 
@@ -131,7 +131,7 @@ Fine-tuning a pretrained YOLO26 model involves adjusting its parameters to impro
 
 ### How can I handle variable image sizes when evaluating my YOLO26 model?
 
-To handle variable image sizes during evaluation, use the `rect=true` parameter in YOLO26, which groups images by aspect ratio and pads each batch instead of forcing every image to a square. The `imgsz` parameter sets the image size for validation; if you don't override it, YOLO26 reuses the model's saved value (640 for the official pretrained models). Adjust `imgsz` to suit your dataset and GPU memory. For more details, visit our [section on handling variable image sizes](#handling-variable-image-sizes).
+To handle variable image sizes during evaluation, rely on rectangular validation (`rect=True`, the default for `model.val()`), which groups images by aspect ratio and pads each batch instead of forcing every image to a square. The `imgsz` parameter sets the image size for validation; if you don't override it, YOLO26 reuses the model's saved value (640 for the official pretrained models). Adjust `imgsz` to suit your dataset and GPU memory. For more details, visit our [section on handling variable image sizes](#handling-variable-image-sizes).
 
 ### What practical steps can I take to improve mean average precision for my YOLO26 model?
 

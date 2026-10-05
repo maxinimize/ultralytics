@@ -11,13 +11,13 @@ keywords: Ultralytics Platform, billing, credits, pricing, subscription, payment
 [Ultralytics Platform](https://platform.ultralytics.com) uses credits for metered compute: cloud training, batch annotation, and custom-resource endpoint uptime. Add credits, track
 usage, and manage your subscription from `Settings > Billing`.
 
-![Ultralytics Platform Settings Billing Tab Credit Balance And Plan Card](https://cdn.ul.run/i/8deb4532660afd808780789930cfbeb6.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Billing Tab Credit Balance And Plan Card](https://cdn.ul.run/i/9e97863665b58a2b009f700b0df120e9.avif)<!-- screenshot -->
 
 ## Plans
 
 Choose the plan that fits your needs. Compare plans in `Settings > Plans`:
 
-![Ultralytics Platform Settings Plans Tab Free Pro Enterprise Comparison](https://cdn.ul.run/i/4687f31bbcab35be3b474784751759e5.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Plans Tab Free Pro Enterprise Comparison](https://cdn.ul.run/i/cad040a8c00329e621ab2d0c0cf53b5f.avif)<!-- screenshot -->
 
 {% include "macros/platform-plan-comparison.md" %}
 
@@ -31,7 +31,7 @@ Get started at no cost:
 - 3 concurrent cloud training jobs
 - 3 cloud deployments
 - 100 GB storage · 10 GB dataset upload limit
-- Model export to all 20 formats
+- Model export to all 22 formats
 - Manual, SAM 3.1, and YOLO Smart annotation
 - 24 cloud GPU types including 5090, H100 & H200 ($0.24–$4.39/hr)
 - Community support
@@ -85,7 +85,7 @@ Credits are the currency for Platform compute services.
 
 View your balance in `Settings > Billing`:
 
-![Ultralytics Platform Settings Billing Tab Credit Balance With Topup Button](https://cdn.ul.run/i/e7db27e18b14d2a8d2672966455c965f.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Billing Tab Credit Balance With Topup Button](https://cdn.ul.run/i/f45c7ce61c718d4a2517cbffcaece256.avif)<!-- screenshot -->
 
 | Balance Type  | Description                           |
 | ------------- | ------------------------------------- |
@@ -122,7 +122,7 @@ Top up your balance:
 
 Your balance updates automatically once the payment succeeds — you don't need to reload the page.
 
-![Ultralytics Platform Settings Billing Tab Topup Amount Selection Dialog](https://cdn.ul.run/i/41dea87cf64f1a2c6366f0707b7ab3fa.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Billing Tab Topup Amount Selection Dialog](https://cdn.ul.run/i/a7203389c72014b326fdb168de898c5d.avif)<!-- screenshot -->
 
 ### Top-Up Presets
 
@@ -156,6 +156,18 @@ default payment method. Top-ups are briefly rate-limited to prevent duplicate ch
 
     Auto top-up can reduce the chance that a paid cloud training job is stopped for insufficient credits. It requires
     a valid default payment method.
+
+### Redeem a Promo Code
+
+If you did not apply a promo code during signup, redeem one later:
+
+1. Switch to your personal workspace and go to **Settings > Billing**
+2. Enter the code under **Promo Code**
+3. Click **Redeem**
+
+The credits are added to your balance immediately and appear as a **Promo Bonus** transaction. Each account redeems
+one promo code in total, so a code applied during signup counts. Referral codes (`REF-` followed by eight characters)
+work only during signup.
 
 ### Payment Methods
 
@@ -237,7 +249,7 @@ Upgrade for more features and monthly credits:
 4. Choose billing cycle (Monthly or Yearly)
 5. Complete checkout
 
-![Ultralytics Platform Settings Plans Tab Upgrade to Pro Dialog](https://cdn.ul.run/i/c5c4e48ad1cb59d059bc5112c1c6ed2f.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Plans Tab Upgrade to Pro Dialog](https://cdn.ul.run/i/7c830c485f58d8d3ec9243c15f0340f6.avif)<!-- screenshot -->
 
 ### Pro Benefits
 
@@ -301,7 +313,7 @@ When your Pro subscription ends (cancelled or expired), your account reverts to 
 View all transactions in `Settings > Billing`. The table covers the selected date range (last 30 days by default),
 supports free-text search across every field, and exports to CSV or JSON from the menu in the card header.
 
-![Ultralytics Platform Settings Billing Tab Transaction History Table](https://cdn.ul.run/i/ecd72fd02c557801a298593d0f8ad2bb.avif)<!-- screenshot -->
+![Ultralytics Platform Settings Billing Tab Transaction History Table](https://cdn.ul.run/i/706d984e623d641af877e83e1d08997c.avif)<!-- screenshot -->
 
 | Column          | Description                                                                           |
 | --------------- | ------------------------------------------------------------------------------------- |

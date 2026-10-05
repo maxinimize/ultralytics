@@ -11,7 +11,7 @@ keywords: Ultralytics Platform, inference, API, YOLO, object detection, predicti
 [Ultralytics Platform](https://platform.ultralytics.com) provides browser-based inference for testing trained models
 and dedicated endpoints for programmatic access.
 
-![Ultralytics Platform Model Predict Tab With Detections Overlay](https://cdn.ul.run/i/0c19d802fbe4e81b32f34b9826ba2ee4.avif)<!-- screenshot -->
+![Ultralytics Platform Model Predict Tab With Detections Overlay](https://cdn.ul.run/i/26f355aa5ed21d09b66d86fcf7fd1642.avif)<!-- screenshot -->
 
 ## Predict Tab
 
@@ -24,7 +24,7 @@ Every model with weights includes a `Predict` tab for browser-based inference:
 
 Models without weights show an empty state instead — train the model or upload weights first.
 
-![Ultralytics Platform Predict Tab Image Upload Dropzone](https://cdn.ul.run/i/116d77e49c6fd00d9eb49a26217e3cc5.avif)<!-- screenshot -->
+![Ultralytics Platform Predict Tab Image Upload Dropzone](https://cdn.ul.run/i/2b0e88766b66799a0e0f11f6cf83e1ec.avif)<!-- screenshot -->
 
 ### Input Methods
 
@@ -95,7 +95,7 @@ Inference results display the output appropriate to the model task: boxes, masks
 classification scores, semantic coverage, or a depth map. Object results use the dataset class colors when available.
 The panel also shows preprocess, inference, postprocess, and network timing.
 
-![Ultralytics Platform Predict Tab Results With Detections And Speed Stats](https://cdn.ul.run/i/d220b0d1e04768b6417ae09cf07bfefa.avif)<!-- screenshot -->
+![Ultralytics Platform Predict Tab Results With Detections And Speed Stats](https://cdn.ul.run/i/d404d43d1aec0a3b4e4536283b2312cc.avif)<!-- screenshot -->
 
 The results panel shows:
 
@@ -111,9 +111,9 @@ download button to save an annotated JPEG of the current result.
 
 ## Inference Parameters
 
-Adjust inference behavior with the three sliders below the image:
+Adjust inference behavior with the three sliders below the image (depth models show only **Image Size**):
 
-![Ultralytics Platform Predict Tab Parameters Sliders](https://cdn.ul.run/i/1ca455d168dce72b251904b1f5ffff69.avif)<!-- screenshot -->
+![Ultralytics Platform Predict Tab Parameters Sliders](https://cdn.ul.run/i/03d15a005d5010026a35c8011406d520.avif)<!-- screenshot -->
 
 | Parameter      | Range                     | Default | Description                  |
 | -------------- | ------------------------- | ------- | ---------------------------- |
@@ -183,7 +183,9 @@ POST https://platform.ultralytics.com/api/models/{owner}/{project}/{model}/predi
 
 Both accept the same `multipart/form-data` body and return the same response shape. With the
 [Python SDK](../api/index.md#python-sdk), use `client.models.predict(owner, project, model, body=...)` for shared
-inference or `client.deployments.predict(owner, deployment, body=...)` for a dedicated deployment:
+inference or `client.deployments.predict(owner, deployment, body=...)` for a dedicated deployment. Both SDK methods call
+the Platform API, so its [rate limits](#rate-limits) and request size limit apply. To avoid them, post directly to a
+dedicated endpoint URL as shown under [Request](#request). Shared inference example:
 
 ```python
 from ultralytics_platform import Platform
@@ -243,7 +245,7 @@ with open("image.jpg", "rb") as f:
     console.log(result);
     ```
 
-![Ultralytics Platform Predict Tab Code Examples Python Tab](https://cdn.ul.run/i/42273bfce7b498f3ed996ef73a219140.avif)<!-- screenshot -->
+![Ultralytics Platform Predict Tab Code Examples Python Tab](https://cdn.ul.run/i/80c9a77ce7d40e67c8ccfc7871addb85.avif)<!-- screenshot -->
 
 ### Request Parameters
 
@@ -279,6 +281,7 @@ with open("image.jpg", "rb") as f:
     ],
     "metadata": {
         "imageCount": 1,
+        "classNames": ["person", "bicycle", "car", "..."],
         "functionTimeAlive": 1284.51,
         "functionTimeCall": 0.018,
         "task": "detect",
@@ -292,23 +295,23 @@ with open("image.jpg", "rb") as f:
 }
 ```
 
-![Ultralytics Platform Predict Tab Json Response View](https://cdn.ul.run/i/51b46ea38818156171938e1dae77f32e.avif)<!-- screenshot -->
+![Ultralytics Platform Predict Tab Json Response View](https://cdn.ul.run/i/23001d947c672836bf74347a0fadc8c1.avif)<!-- screenshot -->
 
 ### Response Fields
 
-| Field                           | Type   | Description                                                          |
-| ------------------------------- | ------ | -------------------------------------------------------------------- |
-| `images`                        | array  | List of processed images, one entry per video frame for videos       |
-| `images[].shape`                | array  | Image dimensions [height, width]                                     |
-| `images[].results`              | array  | List of detections                                                   |
-| `images[].results[].class`      | int    | Class index (integer ID)                                             |
-| `images[].results[].name`       | string | Class name                                                           |
-| `images[].results[].confidence` | float  | Detection confidence (0-1)                                           |
-| `images[].results[].box`        | object | Bounding box coordinates                                             |
-| `images[].semantic_mask`        | object | Per-pixel class map (semantic models only)                           |
-| `images[].depth`                | object | Per-pixel depth map (depth models only)                              |
-| `images[].speed`                | object | Processing times in milliseconds                                     |
-| `metadata`                      | object | Image count, service timings, task, and Ultralytics/PyTorch versions |
+| Field                           | Type   | Description                                                         |
+| ------------------------------- | ------ | ------------------------------------------------------------------- |
+| `images`                        | array  | List of processed images, one entry per processed video frame       |
+| `images[].shape`                | array  | Image dimensions [height, width]                                    |
+| `images[].results`              | array  | List of detections                                                  |
+| `images[].results[].class`      | int    | Class index (integer ID)                                            |
+| `images[].results[].name`       | string | Class name                                                          |
+| `images[].results[].confidence` | float  | Detection confidence (0-1)                                          |
+| `images[].results[].box`        | object | Bounding box coordinates                                            |
+| `images[].semantic_mask`        | object | Per-pixel class map (semantic models only)                          |
+| `images[].depth`                | object | Per-pixel depth map (depth models only)                             |
+| `images[].speed`                | object | Processing times in milliseconds                                    |
+| `metadata`                      | object | Image count, model class names, service timings, task, and versions |
 
 ### Task-Specific Responses
 
@@ -438,7 +441,8 @@ Response format varies by task:
 
 ## Rate Limits
 
-The shared model API is limited to **20 requests/minute** for each API key, signed-in caller, or anonymous IP. When
+The shared model API is limited to **20 requests/minute** for each API key, signed-in caller, or anonymous IP. The
+Platform deployment predict route (`POST /api/deployments/{owner}/{deployment}/predict`) has the same limit. When
 throttled, the API returns `429` with a `Retry-After` header. See the full
 [rate-limit reference](../api/index.md#rate-limits) for all endpoint categories.
 
@@ -466,10 +470,13 @@ Common error responses:
 
 Both inference methods accept video files:
 
-- **Dedicated endpoints** accept video files directly. Supported formats (up to 100 MB): ASF, AVI, GIF, M4V, MKV, MOV, MP4, MPEG, MPG, TS, WEBM, WMV. Each frame is processed individually and results are returned per frame. See [dedicated endpoints](endpoints.md#request-parameters) for details.
+- **Dedicated endpoints** accept video files directly. Supported formats (up to 32 MB per request): ASF, AVI, GIF, M4V, MKV, MOV, MP4, MPEG, MPG, TS, WEBM, WMV. Results are returned per processed frame, and a request may run for up to 1 hour. See [dedicated endpoints](endpoints.md#request-parameters) for details.
 - **Shared inference** (`POST /api/models/{owner}/{project}/{model}/predict`) uses the same predict service and accepts
-  the same video formats. The browser **Predict** tab only selects images, so use the API or a
-  [dedicated endpoint](endpoints.md) for video.
+  the same video formats, but requests are limited to about 4.5 MB and time out after about 30 seconds, which suits
+  only short clips. The browser **Predict** tab only selects images, so use a [dedicated endpoint](endpoints.md) for
+  video.
+
+Depth models accept images only.
 
 ### How do I get the annotated image?
 
@@ -477,7 +484,7 @@ In the **Predict** tab, the download button over the preview saves the current r
 itself returns JSON predictions. To visualize those:
 
 1. Use predictions to draw boxes locally
-2. Use Ultralytics `plot()` method:
+2. Run the model locally with Ultralytics and save the annotated result with `save()` (or get an array with `plot()`):
 
 ```python
 from ultralytics import YOLO
@@ -492,11 +499,12 @@ See the [Predict mode documentation](../../modes/predict.md) for the full result
 ### What's the maximum image size?
 
 - **Predict tab limit**: 10 MB
-- **API limit**: 100 MB for both shared inference and dedicated endpoints
+- **Shared inference API limit**: about 4.5 MB per request, including through the Python SDK
+- **Dedicated endpoint limit**: 32 MB per request sent directly to the endpoint URL
 - **Auto-resize in the Predict tab**: Images are resized to the selected `Image Size` before upload
 
 Large images are automatically resized in the browser while preserving aspect ratio. Requests you send yourself are not
-resized, so images above the limit are rejected with `413`.
+resized, so requests above the limit are rejected with `413`.
 
 ### Can I run batch inference?
 
