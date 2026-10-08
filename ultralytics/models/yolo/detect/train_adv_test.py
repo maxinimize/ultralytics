@@ -2,24 +2,35 @@
 
 from __future__ import annotations
 
+import io
 import math
 import random
 import time
-from copy import copy
+from copy import copy, deepcopy
+from datetime import datetime
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 
+from ultralytics import __version__
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, colorstr, TQDM
+from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, colorstr, TQDM
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
-from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model, unset_deterministic, autocast
+from ultralytics.utils.torch_utils import (
+    autocast,
+    convert_optimizer_state_dict_to_fp16,
+    qat_state,
+    strip_qat,
+    torch_distributed_zero_first,
+    unset_deterministic,
+    unwrap_model,
+)
 import warnings
 from torch import distributed as dist
 from pathlib import Path
@@ -242,6 +253,9 @@ class DetectionTrainer(BaseTrainer):
         if overrides is None:
             overrides = {}
 
+        # Default to BF16 precision for accelerated adversarial training on supported hardware (e.g. H100)
+        overrides.setdefault("amp", "bf16")
+
         # If resuming, attempt to recover original adversarial training arguments from saved args.yaml
         saved_args = {}
         resume = overrides.get("resume", False)
@@ -268,6 +282,8 @@ class DetectionTrainer(BaseTrainer):
         overrides.pop("attack_num", None)
 
         super().__init__(cfg, overrides, _callbacks)
+        if hasattr(self.args, "attack_num"):
+            delattr(self.args, "attack_num")
 
         if not hasattr(self.args, "attack_weights"):
             self.args.attack_weights = self._attack_weights_arg
@@ -371,18 +387,29 @@ class DetectionTrainer(BaseTrainer):
 
             self.attackers = {}
             for att in self.attack_names:
-                self.attackers[att] = build_attacker(att, model=target_attack_model, img_size=imgsz)
-                LOGGER.info(f"attacker initialized: {att}")
+                if att.lower().strip() not in {"raw", "none", "clean"}:
+                    self.attackers[att] = self.build_attacker(att, target_attack_model, imgsz)
+                    LOGGER.info(f"attacker initialized: {att}")
 
             # Keep self.attacker for validation (which uses the first attack)
-            self.attacker = self.attackers[self.attack_names[0]]
+            self.attacker = self.attackers.get(self.attack_names[0], None) if self.attackers else None
         except Exception as e:
+            if getattr(self, "strict_attacks", False):
+                raise
             LOGGER.warning(f"Failed to load attack model or attacker: {e}")
             import traceback
             LOGGER.warning(traceback.format_exc())
             self.attack_model = None
             self.attacker = None
             self.attackers = {}
+
+    def build_attacker(self, name, model, imgsz):
+        """Build the existing online attack; subclasses may extend its model input path."""
+        return build_attacker(name, model=model, img_size=imgsz)
+
+    def preprocess_for_detector(self, images):
+        """Return detector inputs after attack generation and batch recombination."""
+        return images
 
     def get_model(self, cfg: str | None = None, weights: str | None = None, verbose: bool = True):
         """Return a YOLO detection model."""
@@ -391,12 +418,106 @@ class DetectionTrainer(BaseTrainer):
             model.load(weights)
         return model
 
+    def setup_model(self):
+        """Load, create, or download model, supporting live model resumption for adversarial training."""
+        ckpt = super().setup_model()
+        if self.resume and ckpt and ckpt.get("model") is not None:
+            live_model = ckpt["model"]
+            try:
+                if isinstance(live_model, torch.nn.Module):
+                    unwrap_model(self.model).load_state_dict(live_model.float().state_dict())
+                elif isinstance(live_model, dict):
+                    unwrap_model(self.model).load_state_dict(live_model)
+                LOGGER.info("Resumed live training model weights from checkpoint 'model' field.")
+            except Exception as e:
+                LOGGER.warning(f"Failed to restore live model from checkpoint in setup_model: {e}")
+        return ckpt
+
+    def _load_checkpoint_state(self, ckpt):
+        """Load optimizer, scaler, EMA, best_fitness, and live training model from checkpoint."""
+        super()._load_checkpoint_state(ckpt)
+        if self.resume and ckpt and ckpt.get("model") is not None:
+            live_model = ckpt["model"]
+            try:
+                if isinstance(live_model, torch.nn.Module):
+                    unwrap_model(self.model).load_state_dict(live_model.float().state_dict())
+                elif isinstance(live_model, dict):
+                    unwrap_model(self.model).load_state_dict(live_model)
+                LOGGER.info("Verified/Restored live training model weights in _load_checkpoint_state.")
+            except Exception as e:
+                LOGGER.warning(f"Failed to restore live model in _load_checkpoint_state: {e}")
+
+    def save_model(self):
+        """Save model training checkpoints with live model weights preserved."""
+        ema = self.ema.ema
+        if not all(torch.isfinite(v).all() for v in ema.state_dict().values() if isinstance(v, torch.Tensor)):
+            model_sd = unwrap_model(self.model).state_dict()
+            for k, v in ema.state_dict().items():
+                if isinstance(v, torch.Tensor) and not torch.isfinite(v).all() and torch.isfinite(model_sd[k]).all():
+                    v.copy_(model_sd[k])
+
+        modelopt = qat_state(ema)
+        ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
+        if hasattr(ema, "criterion"):
+            ema.criterion = None
+        for v in ema.state_dict().values():
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                torch.nan_to_num_(v)
+        strip_qat(ema)
+
+        # Preserve live model for zero-disruption adversarial resume training
+        live_model = deepcopy(unwrap_model(self.model)).half().to(memory_format=torch.contiguous_format)
+        if hasattr(live_model, "criterion"):
+            live_model.criterion = None
+        for v in live_model.state_dict().values():
+            if isinstance(v, torch.Tensor) and v.is_floating_point():
+                torch.nan_to_num_(v)
+        strip_qat(live_model)
+
+        buffer = io.BytesIO()
+        torch.save(
+            {
+                "epoch": self.epoch,
+                "best_fitness": self.best_fitness,
+                "model": live_model,
+                "ema": ema,
+                "updates": self.ema.updates,
+                "modelopt": modelopt,
+                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+                "scaler": self.scaler.state_dict(),
+                "train_args": vars(self.args),
+                "train_metrics": {**self.metrics, "fitness": self.fitness},
+                "train_results": self.read_results_csv(),
+                "date": datetime.now().astimezone().isoformat(),
+                "version": __version__,
+                "git": {
+                    "root": str(GIT.root),
+                    "branch": GIT.branch,
+                    "commit": GIT.commit,
+                    "message": GIT.message,
+                    "origin": GIT.origin,
+                },
+                "license": "AGPL-3.0 (https://ultralytics.com/license)",
+                "docs": "https://docs.ultralytics.com",
+            },
+            buffer,
+        )
+        serialized_ckpt = buffer.getvalue()
+
+        self.wdir.mkdir(parents=True, exist_ok=True)
+        self.last.write_bytes(serialized_ckpt)
+        if self.best_fitness == self.fitness:
+            self.best.write_bytes(serialized_ckpt)
+        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
+            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
+        return True
+
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
 
         validator_args = copy(self.args)
-        for arg in ['attack_weights', 'attack_name', 'attack_ratio']:
+        for arg in ['attack_weights', 'attack_name', 'attack_ratio', 'attack_num']:
             if hasattr(validator_args, arg):
                 delattr(validator_args, arg)
 
@@ -567,7 +688,8 @@ class DetectionTrainer(BaseTrainer):
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
                 # Forward
-                with autocast(self.amp):
+                amp_dtype = torch.bfloat16 if getattr(self.args, "amp", None) == "bf16" else self.amp
+                with autocast(amp_dtype, device=self.device.type):
                     batch = self.preprocess_batch(batch)
 
                     for st in batch.get("sample_type", []):
@@ -597,14 +719,20 @@ class DetectionTrainer(BaseTrainer):
                                         if self.attack_model is not None and hasattr(self.attack_model, "current_paths"):
                                             self.attack_model.current_paths = sub_batch.get("im_file", [])
 
-                                        with torch.amp.autocast(device_type="cuda", enabled=False):
-                                            imgs_adv = run_attack_on_batch(attacker, sub_batch, label_policy="largest_box")
+                                        if getattr(self.args, "amp", None) == "bf16":
+                                            with autocast(torch.bfloat16, device=self.device.type):
+                                                imgs_adv = run_attack_on_batch(attacker, sub_batch, label_policy="largest_box")
+                                        else:
+                                            with torch.amp.autocast(device_type="cuda", enabled=False):
+                                                imgs_adv = run_attack_on_batch(attacker, sub_batch, label_policy="largest_box")
 
                                         if imgs_adv is not None:
                                             sub_batch["img"] = imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)
                                             has_generated_adv = True
                                             del imgs_adv
                                     except Exception as e:
+                                        if getattr(self, "strict_attacks", False):
+                                            raise
                                         LOGGER.warning(f"Adversarial generation failed for {att}: {e}. Keeping raw images.")
                                         import traceback
                                         LOGGER.warning(traceback.format_exc())
@@ -614,59 +742,77 @@ class DetectionTrainer(BaseTrainer):
                                     p.requires_grad = state
 
                         if has_generated_adv:
-                            torch.cuda.empty_cache()
+                            # torch.cuda.empty_cache()  # Commented out to eliminate per-batch synchronization overhead
+                            pass
 
-                    raw_ratio = max(0.0, 1.0 - sum(self.attack_ratios))
-                    group_weights = {"raw": raw_ratio}
-                    for att, r in zip(self.attack_names, self.attack_ratios):
-                        group_weights[att] = r
+                    # Recombine sub-batches into a unified batch for single-pass forward and loss
+                    has_spatial_attack = any(
+                        getattr(attacker, "transforms_targets", False)
+                        for attacker in getattr(self, "attackers", {}).values()
+                    )
 
-                    present_groups = list(sub_batches.keys())
-                    present_weights = {g: group_weights.get(g, 0.0) for g in present_groups}
-                    total_weight = sum(present_weights.values())
-                    if total_weight > 0:
-                        normalized_weights = {g: w / total_weight for g, w in present_weights.items()}
+                    if not has_spatial_attack:
+                        # Additive pixel perturbations (PGD, BIM, MIM, FGSM, etc.):
+                        # Targets (bboxes, cls, batch_idx) are strictly unchanged; update images in-place.
+                        for att, sub_batch in sub_batches.items():
+                            if att != "raw" and "img" in sub_batch:
+                                indices = [idx for idx, st in enumerate(batch["sample_type"]) if st == att]
+                                if indices:
+                                    batch["img"][indices] = sub_batch["img"]
                     else:
-                        normalized_weights = {g: 1.0 / len(present_groups) for g in present_groups}
+                        # Spatial attacks (Spatial Worst-of-k, etc.):
+                        # Targets are rotated/translated and may be dropped. Update images and map local batch_idx back to global.
+                        new_batch_idx = []
+                        new_cls = []
+                        new_bboxes = []
+                        orig_bi_dim = batch["batch_idx"].dim() if "batch_idx" in batch and batch["batch_idx"] is not None else 1
+                        orig_cls_dim = batch["cls"].dim() if "cls" in batch and batch["cls"] is not None else 1
 
-                    total_loss = 0.0
-                    total_loss_items = None
+                        for t, sub_batch in sub_batches.items():
+                            indices = [idx for idx, st in enumerate(batch["sample_type"]) if st == t]
+                            if not indices:
+                                continue
+                            batch["img"][indices] = sub_batch["img"]
 
-                    for g in present_groups:
-                        sub_batch = sub_batches[g]
-                        if sub_batch["img"].shape[0] == 0:
-                            continue
+                            sub_bi = sub_batch.get("batch_idx")
+                            if sub_bi is not None and sub_bi.numel() > 0:
+                                sub_bi = sub_bi.view(-1).long()
+                                indices_tensor = torch.tensor(indices, device=sub_bi.device, dtype=torch.long)
+                                global_bi = indices_tensor[sub_bi]
+                                new_batch_idx.append(global_bi)
+                                new_cls.append(sub_batch["cls"].view(-1, 1) if sub_batch["cls"].ndim == 1 else sub_batch["cls"])
+                                new_bboxes.append(sub_batch["bboxes"].view(-1, 4) if sub_batch["bboxes"].ndim != 2 else sub_batch["bboxes"])
 
-                        if self.args.compile:
-                            preds = self.model(sub_batch["img"])
-                            loss, loss_items = unwrap_model(self.model).loss(sub_batch, preds)
+                        if new_batch_idx:
+                            cat_bi = torch.cat(new_batch_idx, dim=0)
+                            if orig_bi_dim > 1 and cat_bi.dim() == 1:
+                                cat_bi = cat_bi.unsqueeze(-1)
+                            batch["batch_idx"] = cat_bi
+
+                            cat_cls = torch.cat(new_cls, dim=0)
+                            if orig_cls_dim == 1 and cat_cls.dim() > 1:
+                                cat_cls = cat_cls.squeeze(-1)
+                            elif orig_cls_dim > 1 and cat_cls.dim() == 1:
+                                cat_cls = cat_cls.unsqueeze(-1)
+                            batch["cls"] = cat_cls
+
+                            batch["bboxes"] = torch.cat(new_bboxes, dim=0)
                         else:
-                            loss, loss_items = self.model(sub_batch)
+                            dev = batch["img"].device
+                            batch["batch_idx"] = torch.zeros(0, dtype=torch.long, device=dev)
+                            batch["cls"] = torch.zeros((0, 1), dtype=torch.float32, device=dev)
+                            batch["bboxes"] = torch.zeros((0, 4), dtype=torch.float32, device=dev)
 
-                        w = normalized_weights[g]
-                        total_loss = total_loss + w * loss.sum()
+                    batch["img"] = self.preprocess_for_detector(batch["img"])
+                    if self.args.compile:
+                        preds = self.model(batch["img"])
+                        loss, self.loss_items = unwrap_model(self.model).loss(batch, preds)
+                    else:
+                        loss, self.loss_items = self.model(batch)
 
-                        if total_loss_items is None:
-                            total_loss_items = {k: w * v.detach() for k, v in loss_items.items()}
-                        else:
-                            for k, v in loss_items.items():
-                                total_loss_items[k] += w * v.detach()
-
-                        if self.group_tloss.get(g) is None:
-                            self.group_tloss[g] = {k: v.detach().clone() for k, v in loss_items.items()}
-                            self.group_batch_count[g] = 1
-                        else:
-                            cnt = self.group_batch_count[g]
-                            self.group_tloss[g] = {
-                                k: (self.group_tloss[g][k] * cnt + v.detach()) / (cnt + 1)
-                                for k, v in loss_items.items()
-                            }
-                            self.group_batch_count[g] += 1
-
-                    self.loss = total_loss
+                    self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= self.world_size
-                    self.loss_items = total_loss_items
                     if not self.loss_names:
                         self.loss_names = tuple(self.loss_items)
 

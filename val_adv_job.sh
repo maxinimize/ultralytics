@@ -8,7 +8,8 @@
 # #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:1
 # #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_2g.20gb:1
 # #SBATCH --partition=gpubase_bygpu_b1
-#SBATCH --output=logs/%x-%j.out  
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --exclude=fc10512  
 # #SBATCH --qos=devel
 
 set -euo pipefail
@@ -77,11 +78,18 @@ source .yolo_env/bin/activate
 #   --name=val_yolo12l_coco_train_traffic5k_raw
 
 
+# python val_adv_run.py \
+#   --weights=yolo12l.pt \
+#   --data=coco_train_traffic5k_test.yaml \
+#   --classes 0 1 2 3 5 6 7 9 11 12 \
+#   --project=runs \
+#   --name=val_current_coco_train_traffic5k_ep100_pgd_0.6_pgd_bb
+
 python val_adv_run.py \
-  --weights=yolo12l.pt \
-  --data=coco_train_traffic5k_test.yaml \
+  --weights=runs/train_current_coco_train_traffic5k_ep100_pgd_0.6/weights/best.pt \
+  --data=coco_train_traffic5k.yaml \
   --classes 0 1 2 3 5 6 7 9 11 12 \
+  --attack_weights=current \
+  --attack_name=pgd \
   --project=runs \
-  --name=val_current_coco_train_traffic5k_ep100_pgd_0.6_pgd_bb
-
-
+  --name=val_current_coco_train_traffic5k_ep100_pgd_0.6_pgd_wb

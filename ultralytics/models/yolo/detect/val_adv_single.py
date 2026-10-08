@@ -20,7 +20,7 @@ from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, colorstr, nms, ops
 from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
-from ultralytics.utils.torch_utils import attempt_compile, select_device, unwrap_model
+from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
 
 
@@ -85,11 +85,12 @@ class DetectionValidator(BaseValidator):
             self.device = trainer.device
             self.data = trainer.data
             # Force FP16 val during training
-            self.args.half = self.device.type != "cpu" and trainer.amp
+            self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
             model = trainer.ema.ema or trainer.model
             if trainer.args.compile and hasattr(model, "_orig_mod"):
                 model = model._orig_mod  # validate non-compiled original model to avoid issues
-            model = model.half() if self.args.half else model.float()
+            # Keep training validation read-only: inputs may be fp16, but EMA/model weights stay fp32 under autocast.
+            model = model.float()
             self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
@@ -102,13 +103,14 @@ class DetectionValidator(BaseValidator):
                 device=select_device(self.args.device) if RANK == -1 else torch.device("cuda", RANK),
                 dnn=self.args.dnn,
                 data=self.args.data,
-                fp16=self.args.half,
+                fp16=self.args.quantize == 16,
             )
             self.device = model.device  # update device
-            self.args.half = model.fp16  # update half
-            stride, pt, jit = model.stride, model.pt, model.jit
+            self.args.quantize = 16 if model.fp16 else None  # record actual inference precision
+            stride, fmt = model.stride, model.format
+            pt = fmt == "pt"
             imgsz = check_imgsz(self.args.imgsz, stride=stride)
-            if not (pt or jit or getattr(model, "dynamic", False)):
+            if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
                 self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
                 LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
 
@@ -121,7 +123,7 @@ class DetectionValidator(BaseValidator):
 
             if self.device.type in {"cpu", "mps"}:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
-            if not (pt or (getattr(model, "dynamic", False) and not model.imx)):
+            if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
@@ -159,17 +161,18 @@ class DetectionValidator(BaseValidator):
             with dt[0]:
                 batch = self.preprocess(batch)
 
-            # Inference
-            with dt[1]:
-                # Explicitly use no_grad here, but allow gradients in preprocess before this
-                with torch.no_grad():
-                    preds = model(batch["img"], augment=augment)
+            with autocast(self.training and self.args.quantize == 16, device=self.device.type):
+                # Inference
+                with dt[1]:
+                    # Explicitly use no_grad here, but allow gradients in preprocess before this
+                    with torch.no_grad():
+                        preds = model(batch["img"], augment=augment)
 
-            # Loss
-            with dt[2]:
-                if self.training:
-                    for k, v in model.loss(batch, preds)[1].items():
-                        self.loss[k] += v
+                # Loss
+                with dt[2]:
+                    if self.training:
+                        for k, v in model.loss(batch, preds)[1].items():
+                            self.loss[k] += v
 
             # Postprocess
             with dt[3]:
@@ -192,7 +195,6 @@ class DetectionValidator(BaseValidator):
             self.run_callbacks("on_val_end")
 
         if self.training:
-            model.float()
             # Reduce loss across all GPUs
             loss = {k: v.clone().detach() for k, v in self.loss.items()}
             if trainer.world_size > 1:
@@ -225,7 +227,7 @@ class DetectionValidator(BaseValidator):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
-        batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
+        batch["img"] = (batch["img"].half() if self.args.quantize == 16 else batch["img"].float()) / 255
 
         attacker = getattr(self, "attacker", None)
         if attacker:

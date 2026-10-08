@@ -2,7 +2,7 @@
 #SBATCH --job-name=train
 # #SBATCH --account=def-rsolisob
 #SBATCH --time=0-23:59        
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:h100:1
 # #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_3g.40gb:1
@@ -11,6 +11,7 @@
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 # #SBATCH --qos=devel
+#SBATCH --exclude=fc10512
 
 set -euo pipefail
 
@@ -61,7 +62,7 @@ NUM_WORKERS=$(( THREADS_PER_PROC - 1 ))
 if [ "$NUM_WORKERS" -lt 1 ]; then NUM_WORKERS=1; fi
 
 # Global batch size
-GLOBAL_BATCH=16
+GLOBAL_BATCH=32
 
 # === Experiment & Log configuration ===
 JOB_NAME="${SLURM_JOB_NAME:-train}"
@@ -71,7 +72,7 @@ JOB_ID="${SLURM_JOB_ID:-local}"
 ATTACK_WEIGHTS="${1:-"current"}"
 DATA="${2:-"coco_train_traffic5k.yaml"}"
 EPOCHS="${3:-"100"}"
-ATTACK_NAME="${4:-"pgd"}"
+ATTACK_NAME="${4:-"mim"}"
 ATTACK_RATIO="${5:-"0.6"}"
 
 # Sanitize components for clean file/folder names (remove extensions, replace spaces with underscores)
@@ -170,29 +171,30 @@ else
   echo "==> No local tarball detected. Using default dataset path from ${DATA}"
 fi
 
-# python train_adv_test_run.py \
-#   --model=yolo12l.pt \
-#   --attack_weights="${ATTACK_WEIGHTS}" \
-#   --data="${DATA_ARG}" \
-#   --classes 0 1 2 3 5 6 7 9 11 12 \
-#   --imgsz=640 \
-#   --epochs="${EPOCHS}" \
-#   --batch=${GLOBAL_BATCH} \
-#   --device=0 \
-#   --workers=${NUM_WORKERS} \
-#   --cache=True \
-#   --attack_name="${ATTACK_NAME}" \
-#   --attack_ratio="${ATTACK_RATIO}" \
-#   --project=runs \
-#   --name="${NAME}" \
-
 python train_adv_test_run.py \
-  --device=0 \
-  --batch=${GLOBAL_BATCH} \
-  --workers=${NUM_WORKERS} \
+  --model=yolo12l.pt \
   --attack_weights="${ATTACK_WEIGHTS}" \
+  --data="${DATA_ARG}" \
+  --classes 0 1 2 3 5 6 7 9 11 12 \
+  --imgsz=640 \
+  --epochs="${EPOCHS}" \
+  --batch=${GLOBAL_BATCH} \
+  --device=0 \
+  --workers=${NUM_WORKERS} \
+  --cache=True \
   --attack_name="${ATTACK_NAME}" \
   --attack_ratio="${ATTACK_RATIO}" \
-  --resume="runs/train_current_coco_train_traffic5k_ep100_pgd_0.6/weights/last.pt"
+  --project=runs \
+  --name="${NAME}" \
+
+# python train_adv_test_run.py \
+#   --device=0 \
+#   --data="${DATA_ARG}" \
+#   --batch=${GLOBAL_BATCH} \
+#   --workers=${NUM_WORKERS} \
+#   --attack_weights="${ATTACK_WEIGHTS}" \
+#   --attack_name="${ATTACK_NAME}" \
+#   --attack_ratio="${ATTACK_RATIO}" \
+#   --resume="runs/train_current_coco_train_traffic5k_ep100_pgd_bim_mim_0.25_0.25_0.25/weights/last.pt"
 
 # 2>&1 | grep --line-buffered -v "expandable_segments: memory mapping failed"

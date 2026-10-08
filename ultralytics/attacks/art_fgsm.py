@@ -62,6 +62,15 @@ class ARTFGSM(Attacker):
         y_art = self._to_art_labels(targets, h, w, n)
 
         x_np = x.detach().cpu().numpy()
+        if hasattr(self.attack, "set_params"):
+            try:
+                self.attack.set_params(batch_size=n)
+            except Exception:
+                pass
+        if hasattr(self.attack, "_attack") and hasattr(self.attack._attack, "batch_size"):
+            self.attack._attack.batch_size = n
+        if hasattr(self.attack, "batch_size"):
+            self.attack.batch_size = n
         x_adv_np = self.attack.generate(x=x_np, y=y_art)
         x_adv = torch.from_numpy(x_adv_np).to(self.device).type_as(x)
         return x_adv

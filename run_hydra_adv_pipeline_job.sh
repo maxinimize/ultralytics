@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=hydra_adv_pipe
 # #SBATCH --account=def-rsolisob
-#SBATCH --time=0-11:59
+#SBATCH --time=0-23:59
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:h100:1
@@ -54,7 +54,7 @@ FINETUNE_EPOCHS="${7:-"30"}"               # Stage 2 fixed-mask fine-tuning epoc
 BATCH="${8:-"16"}"                         # Batch size
 IMGSZ="${9:-"640"}"                        # Image size
 DEVICE="${10:-"0"}"                        # GPU device ID
-WORKERS="${WORKERS:-4}"                    # DataLoader worker count
+WORKERS="${WORKERS:-3}"                    # DataLoader worker count
 CLASSES="${CLASSES:-"0 1 2 3 5 6 7 9 11 12"}"  # Target class indices (e.g., 10 traffic categories)
 
 # Stage execution switches (1: run, 0: skip)

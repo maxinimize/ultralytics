@@ -27,6 +27,7 @@ from ultralytics.attacks.attack_bridge import build_attacker
 from ultralytics.attacks.attack_utils import setup_attack_model
 from ultralytics.models.yolo.detect.val_adv_multi import DetectionValidator as DetectionValidatorAdv
 from ultralytics.nn.pruning.hydra_convert import iter_hydra_layers
+from ultralytics.cfg import DEFAULT_CFG_DICT
 from ultralytics.utils import LOGGER, IterableSimpleNamespace
 from ultralytics.utils.torch_utils import select_device, unwrap_model
 
@@ -87,11 +88,22 @@ def get_model_sparsity_info(model: torch.nn.Module) -> dict[str, Any]:
 
 
 def _ensure_namespace_compatibility(model: torch.nn.Module) -> None:
-    """Ensure model.args and criterion.hyp are IterableSimpleNamespace."""
-    if hasattr(model, "args") and isinstance(model.args, dict):
-        model.args = IterableSimpleNamespace(**model.args)
-    if hasattr(model, "criterion") and hasattr(model.criterion, "hyp") and isinstance(model.criterion.hyp, dict):
-        model.criterion.hyp = IterableSimpleNamespace(**model.criterion.hyp)
+    """Ensure model.args and criterion.hyp are IterableSimpleNamespace with complete hyperparameters."""
+    base_args = copy.deepcopy(DEFAULT_CFG_DICT)
+    if hasattr(model, "args") and model.args is not None:
+        if isinstance(model.args, IterableSimpleNamespace):
+            base_args.update(vars(model.args))
+        elif isinstance(model.args, dict):
+            base_args.update(model.args)
+    model.args = IterableSimpleNamespace(**base_args)
+
+    if hasattr(model, "criterion") and hasattr(model.criterion, "hyp"):
+        base_hyp = copy.deepcopy(DEFAULT_CFG_DICT)
+        if isinstance(model.criterion.hyp, IterableSimpleNamespace):
+            base_hyp.update(vars(model.criterion.hyp))
+        elif isinstance(model.criterion.hyp, dict):
+            base_hyp.update(model.criterion.hyp)
+        model.criterion.hyp = IterableSimpleNamespace(**base_hyp)
 
 
 def evaluate_clean_and_adversarial(

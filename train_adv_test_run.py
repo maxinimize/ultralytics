@@ -5,7 +5,7 @@ from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='yolov8x.pt')
-    parser.add_argument('--data', default='coco128.yaml')
+    parser.add_argument('--data', default=None)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--batch', type=int, default=24)
     parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
@@ -31,7 +31,6 @@ def main():
 
     overrides = dict(
         model=args.model,
-        data=args.data,
         epochs=args.epochs,
         batch=args.batch,
         device=args.device,
@@ -43,6 +42,10 @@ def main():
         classes=args.classes,
         cache=cache_val,
     )
+    if args.data is not None:
+        overrides["data"] = args.data
+    elif not args.resume:
+        overrides["data"] = "coco128.yaml"
     if args.attack_weights is not None:
         overrides["attack_weights"] = args.attack_weights
     if args.attack_name is not None:

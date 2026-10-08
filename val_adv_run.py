@@ -1,7 +1,9 @@
 import argparse
+import copy
 from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
 from ultralytics.attacks.attack_utils import setup_attack_model
 from ultralytics.attacks.attack_bridge import build_attacker
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 def main():
@@ -35,12 +37,18 @@ def main():
     trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
     trainer._setup_train()
 
-    # Fallback to build attacker only if setup_train did not create one
-    if getattr(trainer, "attacker", None) is None:
+    eval_model = trainer.model.eval()
+    for p in eval_model.parameters():
+        p.requires_grad = False
+
+    is_raw = str(args.attack_name).strip().lower() in {"raw", "none", "clean"}
+    if not is_raw:
         attack_weights = args.attack_weights
         use_current_model = (attack_weights is None) or (str(attack_weights).strip().lower() in {"", "none", "current"})
         if use_current_model:
-            attack_model = trainer.model
+            attack_model = copy.deepcopy(unwrap_model(eval_model)).eval()
+            for p in attack_model.parameters():
+                p.requires_grad_(True)
         elif attack_weights:
             attack_model = setup_attack_model(
                 attack_weights,
@@ -49,23 +57,24 @@ def main():
                 training=False,
                 imgsz=args.imgsz,
             )
+            attack_model.eval()
+            for p in attack_model.parameters():
+                p.requires_grad_(True)
         else:
             attack_model = None
 
         if attack_model is not None:
-            attack_model.eval()
-            for p in attack_model.parameters():
-                p.requires_grad = True
             attacker_kwargs = {}
             if args.worstk_k is not None and args.attack_name.lower().strip() == "worstk":
                 attacker_kwargs["k"] = args.worstk_k
-            trainer.attacker = build_attacker(args.attack_name, model=attack_model, img_size=args.imgsz, **attacker_kwargs)
-    elif args.worstk_k is not None and hasattr(trainer.attacker, "k"):
-        trainer.attacker.k = args.worstk_k
+            attacker = build_attacker(args.attack_name, model=attack_model, img_size=args.imgsz, **attacker_kwargs)
+            trainer.attacker = attacker
+            trainer.attackers = {args.attack_name: attacker}
 
     validator = trainer.get_validator()
-    validator.model = trainer.model
-    validator.attacker = trainer.attacker
+    validator.model = eval_model
+    validator.attacker = getattr(trainer, "attacker", None)
+    validator.attackers = getattr(trainer, "attackers", {})
     validator.attack_name = args.attack_name
     validator.feature_distillation = args.feature_distillation
 
