@@ -11,7 +11,6 @@
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 # #SBATCH --qos=devel
-#SBATCH --exclude=fc10512
 
 set -euo pipefail
 
@@ -89,7 +88,7 @@ FRACTION="${FRACTION:-1.0}"
 AMP="${AMP:-bf16}"
 DEVICE="${DEVICE:-0}"
 CACHE="${CACHE:-True}"
-PROJECT="${PROJECT:-runs}"
+PROJECT="${PROJECT:-${PWD}/runs}"
 
 # Sanitize components for clean file/folder names (remove extensions, replace spaces with underscores)
 CLEAN_WEIGHTS="$(basename "${ATTACK_WEIGHTS}" .pt)"

@@ -300,7 +300,62 @@ def build_single_labels_from_batch(batch: dict, policy: str = "largest_box") -> 
     return torch.stack(labels).to(device), torch.stack(attacked_idx).long().to(device)
 
 
-def run_attack_on_batch(attacker, batch: dict, *, label_policy: str = "largest_box") -> Optional[torch.Tensor]:
+def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
+    """Slice a batch dictionary for the specified sample indices."""
+    sub_batch = {}
+
+    for k, v in batch.items():
+        if k == "img":
+            sub_batch["img"] = v[indices]
+        elif k in {"im_file", "ori_shape", "ratio_pad", "sample_type", "attack_name"}:
+            if isinstance(v, (list, tuple)):
+                sub_batch[k] = [v[i] for i in indices]
+            elif isinstance(v, torch.Tensor):
+                sub_batch[k] = v[indices]
+            else:
+                sub_batch[k] = v
+        elif k in {"visuals", "sem_masks", "text_feats", "depth", "semantic_mask"}:
+            if isinstance(v, torch.Tensor):
+                sub_batch[k] = v[indices]
+        elif k not in {"batch_idx", "cls", "bboxes", "masks", "keypoints", "segments", "obb"}:
+            sub_batch[k] = v
+
+    if "batch_idx" in batch and batch["batch_idx"] is not None:
+        batch_idx = batch["batch_idx"]
+        b_idx_1d = batch_idx.squeeze(-1) if batch_idx.dim() > 1 else batch_idx
+        start_idx = indices[0]
+        end_idx = indices[-1] + 1
+        if indices == list(range(start_idx, end_idx)):
+            mask = (b_idx_1d >= start_idx) & (b_idx_1d < end_idx)
+            new_b_idx = (b_idx_1d[mask] - start_idx).to(batch_idx.dtype)
+        else:
+            mask = torch.zeros(b_idx_1d.shape, dtype=torch.bool, device=batch_idx.device)
+            for idx in indices:
+                mask |= (b_idx_1d == idx)
+            idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
+            new_b_idx = torch.tensor(
+                [idx_map[int(x)] for x in b_idx_1d[mask].tolist()],
+                dtype=batch_idx.dtype,
+                device=batch_idx.device,
+            )
+        if batch_idx.dim() > 1:
+            new_b_idx = new_b_idx.unsqueeze(-1)
+        sub_batch["batch_idx"] = new_b_idx
+
+        for box_k in ["cls", "bboxes", "masks", "keypoints", "segments", "obb"]:
+            if box_k in batch and batch[box_k] is not None:
+                sub_batch[box_k] = batch[box_k][mask]
+
+    return sub_batch
+
+
+def run_attack_on_batch(
+    attacker,
+    batch: dict,
+    *,
+    label_policy: str = "largest_box",
+    max_batch_size: Optional[int] = None,
+) -> Optional[torch.Tensor]:
     """
     Apply an attacker to a training/validation batch.
 
@@ -309,6 +364,27 @@ def run_attack_on_batch(attacker, batch: dict, *, label_policy: str = "largest_b
     original image-only return path unchanged.
     """
     imgs = batch["img"]
+    bs = imgs.shape[0]
+
+    limit = max_batch_size if max_batch_size is not None else getattr(attacker, "max_batch_size", None)
+    if limit is not None and limit > 0 and bs > limit:
+        adv_imgs = imgs.clone()
+        for start_idx in range(0, bs, limit):
+            end_idx = min(start_idx + limit, bs)
+            indices = list(range(start_idx, end_idx))
+            sub_batch = slice_batch_indices(batch, indices)
+            im_files = sub_batch.get("im_file", [])
+            if hasattr(attacker, "proxy_model"):
+                attacker.proxy_model.current_paths = im_files
+            if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                attacker.estimator.model.current_paths = im_files
+            adv_sub = run_attack_on_batch(attacker, sub_batch, label_policy=label_policy, max_batch_size=None)
+            if adv_sub is not None:
+                adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
+            del sub_batch, adv_sub
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return adv_imgs
 
     # Spatial attacks such as Worst-of-k must transform GT boxes together with
     # the image. forward_batch() updates batch_idx/cls/bboxes in-place and still

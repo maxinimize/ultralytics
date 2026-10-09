@@ -246,7 +246,8 @@ class DetectionValidator(BaseValidator):
             if isinstance(eval_surrogate.args, dict):
                 eval_surrogate.args = IterableSimpleNamespace(**eval_surrogate.args)
             for p in eval_surrogate.parameters():
-                p.requires_grad_(True)
+                p.requires_grad_(False)
+            eval_surrogate.eval()
             val_attackers = {}
             for att in unique_runs:
                 if att.lower().strip() not in {"raw", "none", "clean"}:
@@ -434,8 +435,22 @@ class DetectionValidator(BaseValidator):
                     if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
                         attacker.estimator.model.current_paths = im_files
 
-                    with torch.amp.autocast(device_type="cuda", enabled=False):
-                        imgs_adv = run_attack_on_batch(attacker, batch, label_policy="largest_box")
+                    if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
+                        amp_ctx = autocast(torch.bfloat16, device=self.device.type)
+                    elif self.device.type == "cuda" and (
+                        getattr(self.args, "amp", False)
+                        or getattr(self.args, "half", False)
+                        or getattr(self.args, "quantize", None) == 16
+                    ):
+                        amp_ctx = autocast(True, device=self.device.type)
+                    else:
+                        amp_ctx = autocast(False, device=self.device.type)
+
+                    adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
+                    with amp_ctx:
+                        imgs_adv = run_attack_on_batch(
+                            attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
+                        )
                     if imgs_adv is not None:
                         imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
                         batch["img"] = imgs_adv_cast

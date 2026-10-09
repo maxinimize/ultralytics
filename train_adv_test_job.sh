@@ -11,7 +11,6 @@
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 # #SBATCH --qos=devel
-#SBATCH --exclude=fc10512
 
 set -euo pipefail
 
@@ -184,7 +183,7 @@ python train_adv_test_run.py \
   --cache=True \
   --attack_name="${ATTACK_NAME}" \
   --attack_ratio="${ATTACK_RATIO}" \
-  --project=runs \
+  --project="${PWD}/runs" \
   --name="${NAME}" \
 
 # python train_adv_test_run.py \
