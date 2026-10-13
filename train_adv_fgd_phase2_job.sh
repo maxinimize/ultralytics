@@ -26,7 +26,7 @@ module load opencv/4.11.0
 # OpenCV for cv2
 export PYTHONPATH=/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v4/CUDA/gcc12/cuda12.2/opencv/4.11.0/lib/python3.11/site-packages:${PYTHONPATH:-}
 
-source "${YOLO_VENV:-/project/6000635/czhan295/ultralytics/.yolo_env}/bin/activate"          
+source .yolo_env/bin/activate  
 
 # BLAS threading guard
 export OPENBLAS_NUM_THREADS=1
@@ -71,8 +71,8 @@ JOB_NAME="${SLURM_JOB_NAME:-train}"
 JOB_ID="${SLURM_JOB_ID:-local}"
 
 # Phase 2 settings; arguments/environment can override them without editing original scripts.
-FGD_WEIGHTS="${FGD_WEIGHTS:-${1:-/project/6000635/czhan295/ultralytics/runs/detect/runs/fgd_train_yolo12l_coco_train_traffic5k_ep50_b4_pgd_bim_mim_cls0_1_2_3_5_6_7_9_11_12/weights/last.pt}}"
-YOLO_WEIGHTS="${YOLO_WEIGHTS:-/project/6000635/czhan295/ultralytics/yolo12l.pt}"
+FGD_WEIGHTS="${FGD_WEIGHTS:-${1:-${PWD}/fgd_yolo12l.pt}}"
+YOLO_WEIGHTS="${YOLO_WEIGHTS:-${PWD}/yolo12l.pt}"
 ATTACK_WEIGHTS="${ATTACK_WEIGHTS:-current}"
 DATA="${DATA:-${2:-coco_train_traffic5k.yaml}}"
 EPOCHS="${EPOCHS:-${3:-100}}"
@@ -89,6 +89,9 @@ AMP="${AMP:-bf16}"
 DEVICE="${DEVICE:-0}"
 CACHE="${CACHE:-True}"
 PROJECT="${PROJECT:-${PWD}/runs}"
+# RESUME="${RESUME:-}"
+RESUME="${RESUME:-runs/train_fgd_phase2_fgdphase2_current_coco_train_traffic5k_ep100_mim_0.6/weights/last.pt}"
+
 
 # Sanitize components for clean file/folder names (remove extensions, replace spaces with underscores)
 CLEAN_WEIGHTS="$(basename "${ATTACK_WEIGHTS}" .pt)"
@@ -111,6 +114,7 @@ echo "NPROC_PER_NODE: $NPROC_PER_NODE"
 echo "OMP_NUM_THREADS (per-proc): $OMP_NUM_THREADS"
 echo "DataLoader workers (per-proc): $NUM_WORKERS"
 echo "Experiment Name: ${NAME}"
+echo "Resume Checkpoint: ${RESUME:-<none>}"
 echo "Log File: ${LOG_FILE}"
 echo "====================="
 
@@ -139,26 +143,38 @@ else
   echo "==> No local tarball detected. Using default dataset path from ${DATA}"
 fi
 
-python -u train_adv_fgd_phase2_run.py \
-  --model="${YOLO_WEIGHTS}" \
-  --fgd_weights="${FGD_WEIGHTS}" \
-  --use_fgd="${USE_FGD}" \
-  --attack_through_fgd="${ATTACK_THROUGH_FGD}" \
-  --attack_epsilon="${EPSILON}" \
-  --attack_steps="${STEPS}" \
-  --attack_step_size="${STEP_SIZE}" \
-  --attack_weights="${ATTACK_WEIGHTS}" \
-  --data="${DATA_ARG}" \
-  --classes 0 1 2 3 5 6 7 9 11 12 \
-  --imgsz="${IMGSZ}" \
-  --epochs="${EPOCHS}" \
-  --batch="${GLOBAL_BATCH}" \
-  --device="${DEVICE}" \
-  --workers="${NUM_WORKERS}" \
-  --cache="${CACHE}" \
-  --amp="${AMP}" \
-  --fraction="${FRACTION}" \
-  --attack_name="${ATTACK_NAME}" \
-  --attack_ratio="${ATTACK_RATIO}" \
-  --project="${PROJECT}" \
+TRAIN_ARGS=(
+  --model="${YOLO_WEIGHTS}"
+  --fgd_weights="${FGD_WEIGHTS}"
+  --use_fgd="${USE_FGD}"
+  --attack_through_fgd="${ATTACK_THROUGH_FGD}"
+  --attack_epsilon="${EPSILON}"
+  --attack_steps="${STEPS}"
+  --attack_step_size="${STEP_SIZE}"
+  --attack_weights="${ATTACK_WEIGHTS}"
+  --data="${DATA_ARG}"
+  --classes 0 1 2 3 5 6 7 9 11 12
+  --imgsz="${IMGSZ}"
+  --epochs="${EPOCHS}"
+  --batch="${GLOBAL_BATCH}"
+  --device="${DEVICE}"
+  --workers="${NUM_WORKERS}"
+  --cache="${CACHE}"
+  --amp="${AMP}"
+  --fraction="${FRACTION}"
+  --attack_name="${ATTACK_NAME}"
+  --attack_ratio="${ATTACK_RATIO}"
+  --project="${PROJECT}"
   --name="${NAME}"
+)
+
+if [ -n "${RESUME}" ]; then
+  if [ ! -f "${RESUME}" ]; then
+    echo "ERROR: Resume checkpoint not found: ${RESUME}"
+    exit 1
+  fi
+  echo "==> Resuming training from checkpoint: ${RESUME}"
+  TRAIN_ARGS+=(--resume="${RESUME}")
+fi
+
+python -u train_adv_fgd_phase2_run.py "${TRAIN_ARGS[@]}"
