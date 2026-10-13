@@ -7,7 +7,6 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
-#SBATCH --exclude=fc10512
 
 set -euo pipefail
 
@@ -37,11 +36,11 @@ set -euo pipefail
 #      sbatch val_fgd_job.sh none yolo12l.pt pgd
 # ==============================================================================
 
-FGD_WEIGHTS="${1:-"runs/detect/runs/fgd_train_best_coco_train_traffic5k_ep50_b4_pgd_bim_mim_cls0_1_2_3_5_6_7_9_11_12/weights/last.pt"}"
-MODEL="${2:-"runs/train_current_coco_train_traffic5k_ep100_pgd_0.6/weights/best.pt"}"
-ATTACK_NAME="${3:-"pgd"}"
+FGD_WEIGHTS="${1:-"fgd_yolo12l.pt"}"
+MODEL="${2:-"runs/train_fgd_phase2_fgdphase2_current_coco_train_traffic5k_ep100_mim_0.6/weights/best.pt"}"
+ATTACK_NAME="${3:-"raw"}"
 DATA="${4:-"coco_train_traffic5k_test.yaml"}"
-ATTACK_WEIGHTS="${5:-"yolo12l.pt"}"
+ATTACK_WEIGHTS="${5:-"current"}"
 
 CLASSES=(0 1 2 3 5 6 7 9 11 12)
 BATCH=16

@@ -222,7 +222,8 @@ class DetectionValidator(BaseValidator):
                     weights[att] = 1.0 / len(attack_names)
             unique_runs = []
             for att in attack_names:
-                if att not in unique_runs and att != "raw":
+                # if att not in unique_runs and att != "raw":
+                if att not in unique_runs:
                     unique_runs.append(att)
             has_multiple_attacks = True
         else:

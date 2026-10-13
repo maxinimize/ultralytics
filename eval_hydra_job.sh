@@ -39,8 +39,8 @@ export PYTHONUNBUFFERED=1
 # ==============================================================================
 DEFAULT_MODEL="/project/6000635/czhan295/ultralytics/runs/hydra_adv_pipe_train_current_coco_train_traffic5k_ep100_pgd_0.6_best_coco_train_traffic5k_k0.5_ep20_30_pgd_0.6-62352076/pruned_materialized.pt"
 
-MODEL="${1:-"runs/train_current_coco_train_traffic5k_ep100_pgd_0.6/weights/best.pt"}"
-DATA="${2:-"coco_train_traffic5k.yaml"}"
+MODEL="${1:-"runs/train_current_coco_train_traffic5k_ep100_mim_0.6-2/weights/best.pt"}"
+DATA="${2:-"coco_train_traffic5k_test.yaml"}"
 ATTACKS="${3:-"clean pgd bim mim"}"
 BATCH="${4:-"16"}"
 IMGSZ="${5:-"640"}"
