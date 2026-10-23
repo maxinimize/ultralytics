@@ -39,7 +39,8 @@ DATA_TAG="${DATA_TAG%.yaml}"
 NAME="${SLURM_JOB_NAME:-stn_train}_${MODEL_TAG}_${DATA_TAG}_ep${EPOCHS}_b${BATCH}_k${WORSTK_K}_deg${DEGREES}_tr${TRANSLATE}"
 
 mkdir -p logs
-LOG_FILE="logs/${NAME}-${SLURM_JOB_ID:-local}.log"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="logs/${NAME}-${SLURM_JOB_ID:-local}_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== STN Training Experiment: $NAME ==="
 echo "Log file: $LOG_FILE"

@@ -3,31 +3,25 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
+import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
-from ultralytics.data import build_dataloader, build_yolo_dataset
-from ultralytics.data.utils import check_det_dataset
 from ultralytics.defenses.spatial_transformer import (
     SpatialTransformer,
     compute_control_points_loss,
     compute_masked_recon_loss,
     compute_validity_mask,
-    load_stn_checkpoint,
     transform_boxes,
 )
 from ultralytics.engine.validator import BaseValidator
-from ultralytics.nn.tasks import load_checkpoint
-from ultralytics.utils import LOGGER, RANK, TQDM, colorstr, ops
-from ultralytics.utils.checks import check_imgsz
+from ultralytics.utils import LOGGER, TQDM, ops
 from ultralytics.utils.metrics import DetMetrics, ap_per_class, box_iou
 from ultralytics.utils.nms import non_max_suppression
-from ultralytics.utils.torch_utils import select_device, unwrap_model
 
 
 class STNDetectionValidator(BaseValidator):
@@ -43,9 +37,9 @@ class STNDetectionValidator(BaseValidator):
     def __init__(
         self,
         dataloader=None,
-        save_dir: Optional[Path] = None,
-        args: Optional[dict] = None,
-        _callbacks: Optional[dict] = None,
+        save_dir: Path | None = None,
+        args: dict | None = None,
+        _callbacks: dict | None = None,
     ) -> None:
         """Initialize STNDetectionValidator."""
         super().__init__(dataloader, save_dir, args, _callbacks)
@@ -54,11 +48,11 @@ class STNDetectionValidator(BaseValidator):
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
 
-        self.stn: Optional[SpatialTransformer] = None
-        self.guidance_model: Optional[nn.Module] = None
-        self.attacker: Optional[SpatialWorstOfKWithMetadata] = None
+        self.stn: SpatialTransformer | None = None
+        self.guidance_model: nn.Module | None = None
+        self.attacker: SpatialWorstOfKWithMetadata | None = None
 
-    def postprocess(self, preds: Any) -> List[torch.Tensor]:
+    def postprocess(self, preds: Any) -> list[torch.Tensor]:
         """Perform Non-Maximum Suppression (NMS) on detector predictions."""
         conf_thres = getattr(self.args, "conf", 0.001)
         iou_thres = getattr(self.args, "iou", 0.6)
@@ -72,27 +66,36 @@ class STNDetectionValidator(BaseValidator):
             max_det=300,
         )
 
-    def update_metrics(self, preds: List[torch.Tensor], batch: dict) -> None:
+    def update_metrics(self, preds: list[torch.Tensor], batch: dict) -> None:
         """Process predicted boxes and ground-truth targets to update evaluation metrics."""
         for si, pred in enumerate(preds):
             self.seen += 1
             npr = len(pred)
-            stat = dict(
-                conf=torch.zeros(0, device=self.device),
-                pred_cls=torch.zeros(0, device=self.device),
-                tp=torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
-            )
+            stat = {
+                "conf": torch.zeros(0, device=self.device),
+                "pred_cls": torch.zeros(0, device=self.device),
+                "tp": torch.zeros(npr, self.niou, dtype=torch.bool, device=self.device),
+            }
 
             # Ground truth targets for this image
-            idx = batch["batch_idx"] == si
-            cls = batch["cls"][idx]
-            bbox = batch["bboxes"][idx]
+            if (
+                "cls" in batch
+                and batch["cls"].shape[0] > 0
+                and "batch_idx" in batch
+                and batch["cls"].shape[0] == batch["batch_idx"].shape[0]
+            ):
+                idx = batch["batch_idx"] == si
+                cls = batch["cls"][idx]
+                bbox = batch["bboxes"][idx]
+            else:
+                cls = torch.zeros(0, device=self.device)
+                bbox = torch.zeros((0, 4), device=self.device)
             nl = len(cls)
             stat["target_cls"] = cls.squeeze(-1) if cls.ndim > 1 else cls
 
             if npr == 0:
                 if nl:
-                    for k in self.stats.keys():
+                    for k in self.stats:
                         self.stats[k].append(stat[k])
                 continue
 
@@ -113,29 +116,21 @@ class STNDetectionValidator(BaseValidator):
             if nl:
                 stat["tp"] = self._process_batch(predn, tbox, stat["target_cls"])
 
-            for k in self.stats.keys():
+            for k in self.stats:
                 self.stats[k].append(stat[k])
 
     def _process_batch(self, detections: torch.Tensor, gt_bboxes: torch.Tensor, gt_cls: torch.Tensor) -> torch.Tensor:
         """Compute match matrix of detections against ground-truth boxes across IoU thresholds."""
-        correct = torch.zeros(detections.shape[0], self.niou, dtype=torch.bool, device=self.device)
+        if detections.shape[0] == 0 or gt_bboxes.shape[0] == 0:
+            return torch.zeros(detections.shape[0], self.niou, dtype=torch.bool, device=self.device)
         iou = box_iou(gt_bboxes, detections[:, :4])
-        correct_class = gt_cls[:, None] == detections[:, 5]
-        for i, threshold in enumerate(self.iouv.to(self.device)):
-            matches = torch.nonzero((iou >= threshold) & correct_class)
-            if matches.shape[0]:
-                if matches.shape[0] > 1:
-                    matches = matches[iou[matches[:, 0], matches[:, 1]].argsort(descending=True)]
-                    matches = matches[torch.unique(matches[:, 1], return_inverse=True)[1]]
-                    matches = matches[torch.unique(matches[:, 0], return_inverse=True)[1]]
-                correct[matches[:, 1].long(), i] = True
-        return correct
+        return self.match_predictions(detections[:, 5], gt_cls, iou).to(self.device)
 
     def run_single_eval(
         self,
         mode: str,
         seed: int = 0,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """Execute one complete validation pass for the given mode.
 
         Args:
@@ -150,7 +145,7 @@ class STNDetectionValidator(BaseValidator):
 
         # Reset statistics
         self.seen = 0
-        self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[])
+        self.stats = {"tp": [], "conf": [], "pred_cls": [], "target_cls": []}
         self.metrics = DetMetrics()
         geom_errors = []
         recon_losses = []
@@ -237,7 +232,11 @@ class STNDetectionValidator(BaseValidator):
             k: (torch.cat(v, 0).cpu().numpy() if len(v) else (np.zeros((0, self.niou)) if k == "tp" else np.zeros(0)))
             for k, v in self.stats.items()
         }
-        names = getattr(self.guidance_model, "names", getattr(self, "names", dict()))
+        names = getattr(self.guidance_model, "names", None)
+        if not names and isinstance(getattr(self, "data", None), dict):
+            names = self.data.get("names")
+        if not names:
+            names = getattr(self, "names", {})
         if isinstance(names, (list, tuple)):
             names = dict(enumerate(names))
 
@@ -271,9 +270,9 @@ class STNDetectionValidator(BaseValidator):
     def __call__(
         self,
         trainer=None,
-        modes: Optional[List[str]] = None,
+        modes: list[str] | None = None,
         seed: int = 0,
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         """Execute evaluation across selected modes and return consolidated results."""
         if trainer is not None:
             self.device = trainer.device
@@ -281,6 +280,8 @@ class STNDetectionValidator(BaseValidator):
             self.guidance_model = trainer.guidance_model
             self.attacker = trainer.attacker
             self.dataloader = trainer.test_loader
+            if hasattr(trainer, "data") and trainer.data:
+                self.data = trainer.data
             if modes is None:
                 # Fast epoch validation during training
                 modes = ["clean_stn", "worstk_stn"]
@@ -298,8 +299,7 @@ class STNDetectionValidator(BaseValidator):
             res = self.run_single_eval(m, seed=seed)
             all_results.update(res)
             LOGGER.info(
-                f"{m} -> mAP50: {res.get(f'{m}/mAP50', 0.0):.4f}, "
-                f"mAP50-95: {res.get(f'{m}/mAP50-95', 0.0):.4f}"
+                f"{m} -> mAP50: {res.get(f'{m}/mAP50', 0.0):.4f}, mAP50-95: {res.get(f'{m}/mAP50-95', 0.0):.4f}"
             )
 
         # Standardize main summary metrics

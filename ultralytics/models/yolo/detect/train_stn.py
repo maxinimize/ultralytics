@@ -3,33 +3,31 @@
 
 from __future__ import annotations
 
-import math
-from copy import copy, deepcopy
+from copy import copy
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ultralytics.attacks.attack_utils import BatchContainer
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.cfg import get_cfg
+from ultralytics.data import build_yolo_dataset
 from ultralytics.defenses.spatial_transformer import (
     SpatialTransformer,
     compute_control_points_loss,
     compute_masked_recon_loss,
     compute_validity_mask,
-    transform_boxes,
 )
-from ultralytics.data import build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.nn.tasks import load_checkpoint
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, YAML, IterableSimpleNamespace, colorstr
+from ultralytics.utils import DEFAULT_CFG, LOGGER, YAML, IterableSimpleNamespace
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.patches import torch_load
-from ultralytics.utils.torch_utils import EarlyStopping, ModelEMA, TORCH_2_4, select_device, unwrap_model
+from ultralytics.utils.torch_utils import TORCH_2_4, EarlyStopping, ModelEMA, unwrap_model
 
 
 class STNTrainer(DetectionTrainer):
@@ -83,6 +81,11 @@ class STNTrainer(DetectionTrainer):
         self.stn_cfg["loss_recon_weight"] = float(self.stn_cfg["loss_recon_weight"])
         self.stn_cfg["loss_det_weight"] = float(self.stn_cfg["loss_det_weight"])
         self.stn_cfg["val_interval"] = int(self.stn_cfg["val_interval"])
+        self.stn_cfg["stn_max_degrees"] = float(self.stn_cfg.get("stn_max_degrees", self.stn_cfg["degrees"] * 1.5))
+        self.stn_cfg["stn_max_translate"] = float(
+            self.stn_cfg.get("stn_max_translate", self.stn_cfg["translate"] * 1.5)
+        )
+        self.stn_cfg["stn_fill"] = float(self.stn_cfg.get("stn_fill", 114.0 / 255.0))
 
         self.save_dir = Path(self.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -100,6 +103,11 @@ class STNTrainer(DetectionTrainer):
                 raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
             self.stn_checkpoint = torch_load(resume_path, map_location="cpu")
             self.stn_cfg = self.stn_checkpoint.get("stn_config", self.stn_cfg)
+            if "stn_architecture" in self.stn_checkpoint:
+                arch = self.stn_checkpoint["stn_architecture"]
+                self.stn_cfg["stn_max_degrees"] = float(arch["max_degrees"])
+                self.stn_cfg["stn_max_translate"] = float(arch["max_translate"])
+                self.stn_cfg["stn_fill"] = float(arch.get("fill", 114.0 / 255.0))
             saved = self.stn_checkpoint.get("train_args", {}).copy()
             saved.update({k: overrides[k] for k in ("device", "workers", "epochs", "batch") if k in overrides})
             saved.update(resume=str(resume_path), exist_ok=True)
@@ -123,9 +131,9 @@ class STNTrainer(DetectionTrainer):
 
         # 2. Instantiate STN defense model
         self.stn = SpatialTransformer(
-            max_degrees=self.stn_cfg["degrees"] * 1.5,
-            max_translate=self.stn_cfg["translate"] * 1.5,
-            fill=114.0 / 255.0,
+            max_degrees=self.stn_cfg.get("stn_max_degrees", self.stn_cfg["degrees"] * 1.5),
+            max_translate=self.stn_cfg.get("stn_max_translate", self.stn_cfg["translate"] * 1.5),
+            fill=self.stn_cfg.get("stn_fill", 114.0 / 255.0),
         ).to(self.device)
         self.stn.stride = self.guidance_model.stride
         self.stn.names = self.guidance_model.names
@@ -228,7 +236,6 @@ class STNTrainer(DetectionTrainer):
 
     def set_class_weights(self):
         """No class weights needed for STN localization training."""
-        pass
 
     def build_optimizer(self, model: nn.Module, **kwargs):
         """Build optimizer updating only STN localization network parameters."""
@@ -320,6 +327,7 @@ class STNTrainer(DetectionTrainer):
             args=copy(self.args),
             _callbacks=self.callbacks,
         )
+        validator.data = self.data
         validator.stn = self.stn
         validator.guidance_model = self.guidance_model
         validator.attacker = self.attacker
@@ -331,6 +339,7 @@ class STNTrainer(DetectionTrainer):
             return {}, 0.0
 
         self.stn.eval()
+        self.validator.data = self.data
         self.validator.stn = self.stn
         self.validator.guidance_model = self.guidance_model
         self.validator.attacker = self.attacker
@@ -349,6 +358,11 @@ class STNTrainer(DetectionTrainer):
             "best_fitness": self.best_fitness,
             "train_args": vars(self.args),
             "stn_config": self.stn_cfg,
+            "stn_architecture": {
+                "max_degrees": getattr(self.stn, "max_degrees", self.stn.localization.max_degrees),
+                "max_translate": getattr(self.stn, "max_translate", self.stn.localization.max_translate),
+                "fill": getattr(self.stn, "fill", 114.0 / 255.0),
+            },
             "guidance_model": str(self.args.model),
             "metrics": getattr(self, "metrics", {}),
         }

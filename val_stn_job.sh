@@ -14,7 +14,7 @@ cd "$ROOT"
 
 # Validation configuration
 # Allows overriding via CLI arguments: sbatch val_stn_job.sh [STN_WEIGHTS] [MODEL] [DATA]
-STN_WEIGHTS="${1:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_yolo12l_coco_train_traffic5k_ep50_b8_k10_deg30.0_tr0.10-8/weights/best.pt}"}"
+STN_WEIGHTS="${1:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_yolo12l_coco_train_traffic5k_ep50_b8_k10_deg30.0_tr0.10/weights/best.pt}"}" 
 MODEL="${2:-"${MODEL:-yolo12l.pt}"}"
 DATA="${3:-"${DATA:-coco_train_traffic5k_test.yaml}"}"
 SPLIT="${SPLIT:-val}"
@@ -47,7 +47,8 @@ DATA_TAG="${DATA_TAG%.yaml}"
 NAME="${SLURM_JOB_NAME:-val_stn}_${MODEL_TAG}_${DATA_TAG}_k${WORSTK_K}_deg${DEGREES}_tr${TRANSLATE}"
 
 mkdir -p logs
-LOG_FILE="logs/${NAME}-${SLURM_JOB_ID:-local}.log"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="logs/${NAME}-${SLURM_JOB_ID:-local}_${TIMESTAMP}.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== STN Validation Experiment: $NAME ==="
 echo "STN weights: $STN_WEIGHTS"
