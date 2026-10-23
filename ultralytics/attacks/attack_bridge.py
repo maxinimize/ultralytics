@@ -369,6 +369,14 @@ def run_attack_on_batch(
     limit = max_batch_size if max_batch_size is not None else getattr(attacker, "max_batch_size", None)
     if limit is not None and limit > 0 and bs > limit:
         adv_imgs = imgs.clone()
+        is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(getattr(attacker, "batch_aware", False))
+        target_keys = (
+            [k for k in ["batch_idx", "cls", "bboxes", "masks", "keypoints", "segments", "obb"] if k in batch and batch[k] is not None]
+            if is_batch_aware
+            else []
+        )
+        collected_targets = {k: [] for k in target_keys}
+
         for start_idx in range(0, bs, limit):
             end_idx = min(start_idx + limit, bs)
             indices = list(range(start_idx, end_idx))
@@ -381,9 +389,26 @@ def run_attack_on_batch(
             adv_sub = run_attack_on_batch(attacker, sub_batch, label_policy=label_policy, max_batch_size=None)
             if adv_sub is not None:
                 adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
+
+            if is_batch_aware and "batch_idx" in sub_batch and sub_batch["batch_idx"] is not None:
+                sub_bi = sub_batch["batch_idx"]
+                if sub_bi.numel() > 0:
+                    collected_targets["batch_idx"].append(sub_bi + start_idx)
+                    for k in target_keys:
+                        if k != "batch_idx" and k in sub_batch and sub_batch[k] is not None:
+                            collected_targets[k].append(sub_batch[k])
+
             del sub_batch, adv_sub
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        if is_batch_aware:
+            for k in target_keys:
+                if collected_targets[k]:
+                    batch[k] = torch.cat(collected_targets[k], dim=0)
+                else:
+                    batch[k] = batch[k][:0]
+
         return adv_imgs
 
     # Spatial attacks such as Worst-of-k must transform GT boxes together with

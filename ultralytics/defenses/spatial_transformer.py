@@ -6,11 +6,11 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ultralytics.utils import LOGGER
 from ultralytics.utils.patches import torch_load
@@ -128,13 +128,16 @@ def rectify_images(
     grid = matrix_to_grid(forward_matrices, h, w)
 
     centered = images - fill
-    rectified = F.grid_sample(
-        centered,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=False,
-    ) + fill
+    rectified = (
+        F.grid_sample(
+            centered,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        + fill
+    )
     return rectified.clamp(0.0, 1.0)
 
 
@@ -291,12 +294,7 @@ def compute_validity_mask(
     p_adv = torch.einsum("bij,pj->bpi", pred_matrices, p_rect)
     adv_x = p_adv[..., 0]
     adv_y = p_adv[..., 1]
-    adv_valid = (
-        (adv_x >= 0.0)
-        & (adv_x <= float(width - 1.0))
-        & (adv_y >= 0.0)
-        & (adv_y <= float(height - 1.0))
-    )
+    adv_valid = (adv_x >= 0.0) & (adv_x <= float(width - 1.0)) & (adv_y >= 0.0) & (adv_y <= float(height - 1.0))
 
     # p_clean = gt_M_inv @ p_adv: [B, HW, 3]
     gt_inv = torch.linalg.inv(gt_matrices)
@@ -304,10 +302,7 @@ def compute_validity_mask(
     clean_x = p_clean[..., 0]
     clean_y = p_clean[..., 1]
     clean_valid = (
-        (clean_x >= 0.0)
-        & (clean_x <= float(width - 1.0))
-        & (clean_y >= 0.0)
-        & (clean_y <= float(height - 1.0))
+        (clean_x >= 0.0) & (clean_x <= float(width - 1.0)) & (clean_y >= 0.0) & (clean_y <= float(height - 1.0))
     )
 
     mask = (adv_valid & clean_valid).float().reshape(batch_size, 1, height, width)
@@ -430,13 +425,24 @@ class SpatialTransformer(nn.Module):
             fill (float): Border padding fill value in [0, 1].
         """
         super().__init__()
-        self.localization = SpatialLocalizationNet(
-            max_degrees=max_degrees,
-            max_translate=max_translate,
-        )
+        self.max_degrees = float(max_degrees)
+        self.max_translate = float(max_translate)
         self.fill = float(fill)
+        self.localization = SpatialLocalizationNet(
+            max_degrees=self.max_degrees,
+            max_translate=self.max_translate,
+        )
         self.stride = torch.tensor([32.0])
         self.criterion = None
+
+    @property
+    def stn_architecture(self) -> Dict[str, Any]:
+        """Return architectural configuration dictionary of STN."""
+        return {
+            "max_degrees": self.max_degrees,
+            "max_translate": self.max_translate,
+            "fill": self.fill,
+        }
 
     def __deepcopy__(self, memo):
         """Deepcopy STN module while ignoring transient attached loss callbacks."""
@@ -547,10 +553,42 @@ def load_stn_checkpoint(
 
     ckpt = torch_load(path, map_location=device)
     stn_cfg = ckpt.get("stn_config", {})
-    max_deg = float(stn_cfg.get("degrees", 45.0))
-    max_trans = float(stn_cfg.get("translate", 0.25))
 
-    stn = SpatialTransformer(max_degrees=max_deg, max_translate=max_trans).to(device)
+    # Determine STN architectural parameters in priority order
+    if "stn_architecture" in ckpt:
+        arch = ckpt["stn_architecture"]
+        max_deg = float(arch["max_degrees"])
+        max_trans = float(arch["max_translate"])
+        fill = float(arch.get("fill", 114.0 / 255.0))
+    elif "max_degrees" in stn_cfg and "max_translate" in stn_cfg:
+        max_deg = float(stn_cfg["max_degrees"])
+        max_trans = float(stn_cfg["max_translate"])
+        fill = float(stn_cfg.get("fill", 114.0 / 255.0))
+    elif "stn_max_degrees" in stn_cfg and "stn_max_translate" in stn_cfg:
+        max_deg = float(stn_cfg["stn_max_degrees"])
+        max_trans = float(stn_cfg["stn_max_translate"])
+        fill = float(stn_cfg.get("stn_fill", stn_cfg.get("fill", 114.0 / 255.0)))
+    elif "degrees" in stn_cfg and "translate" in stn_cfg:
+        # Legacy STNTrainer checkpoint: STN was instantiated with degrees * 1.5, translate * 1.5
+        deg = float(stn_cfg["degrees"])
+        trans = float(stn_cfg["translate"])
+        max_deg = deg * 1.5
+        max_trans = trans * 1.5
+        fill = float(stn_cfg.get("fill", 114.0 / 255.0))
+        LOGGER.warning(
+            f"STN checkpoint at {path} lacks explicit 'stn_architecture'. Applying legacy STNTrainer formula: "
+            f"max_degrees = degrees ({deg}) * 1.5 = {max_deg}, max_translate = translate ({trans}) * 1.5 = {max_trans}."
+        )
+    else:
+        max_deg = 45.0
+        max_trans = 0.15
+        fill = 114.0 / 255.0
+        LOGGER.warning(
+            f"STN checkpoint at {path} lacks architectural metadata and STN config. "
+            f"Defaulting to max_degrees={max_deg}, max_translate={max_trans}, fill={fill}."
+        )
+
+    stn = SpatialTransformer(max_degrees=max_deg, max_translate=max_trans, fill=fill).to(device)
     if "stn" in ckpt:
         stn.load_state_dict(ckpt["stn"])
     elif "model" in ckpt:
@@ -559,5 +597,7 @@ def load_stn_checkpoint(
         stn.load_state_dict(ckpt)
 
     stn.eval()
-    LOGGER.info(f"Loaded STN defense from {path} onto {device}")
+    LOGGER.info(
+        f"Loaded STN defense from {path} onto {device} (max_degrees={max_deg}, max_translate={max_trans}, fill={fill})"
+    )
     return stn, ckpt
