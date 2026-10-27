@@ -785,18 +785,27 @@ class DetectionTrainer(BaseTrainer):
 
                         if new_batch_idx:
                             cat_bi = torch.cat(new_batch_idx, dim=0)
+                            cat_cls = torch.cat(new_cls, dim=0)
+                            cat_box = torch.cat(new_bboxes, dim=0)
+
+                            # Sort targets by batch_idx to maintain strictly non-decreasing order required by Ultralytics loss
+                            bi_flat = cat_bi.view(-1)
+                            sort_idx = torch.argsort(bi_flat)
+                            cat_bi = cat_bi[sort_idx]
+                            cat_cls = cat_cls[sort_idx]
+                            cat_box = cat_box[sort_idx]
+
                             if orig_bi_dim > 1 and cat_bi.dim() == 1:
                                 cat_bi = cat_bi.unsqueeze(-1)
                             batch["batch_idx"] = cat_bi
 
-                            cat_cls = torch.cat(new_cls, dim=0)
                             if orig_cls_dim == 1 and cat_cls.dim() > 1:
                                 cat_cls = cat_cls.squeeze(-1)
                             elif orig_cls_dim > 1 and cat_cls.dim() == 1:
                                 cat_cls = cat_cls.unsqueeze(-1)
                             batch["cls"] = cat_cls
 
-                            batch["bboxes"] = torch.cat(new_bboxes, dim=0)
+                            batch["bboxes"] = cat_box
                         else:
                             dev = batch["img"].device
                             batch["batch_idx"] = torch.zeros(0, dtype=torch.long, device=dev)

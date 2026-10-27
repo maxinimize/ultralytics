@@ -16,7 +16,8 @@ Expected workflow:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import os
+
 from ultralytics.utils import LOGGER
 
 
@@ -26,6 +27,12 @@ def parse_args():
     parser.add_argument("--model", required=True, help="HYDRA score checkpoint (.pt) from score search.")
     parser.add_argument("--data", required=True, help="Ultralytics dataset YAML file.")
     parser.add_argument("--keep-ratio", type=float, required=True, help="Fraction of retained connections (must match score search).")
+    parser.add_argument(
+        "--pruning-mode",
+        default=os.environ.get("PRUNING_MODE", "unstructured"),
+        choices=["unstructured", "kernel"],
+        help="Pruning mode: 'unstructured' (default) or 'kernel' (Plan A).",
+    )
     parser.add_argument("--epochs", type=int, default=30, help="Number of fine-tuning epochs.")
     parser.add_argument("--device", default="0", help="Target device (e.g. '0', '0,1', or 'cpu').")
     parser.add_argument("--batch", type=int, default=16, help="Batch size.")
@@ -71,6 +78,7 @@ def main():
         "project": args.project,
         "hydra_stage": "finetune",
         "hydra_keep_ratio": args.keep_ratio,
+        "hydra_pruning_mode": args.pruning_mode,
     }
     if args.name is not None:
         overrides["name"] = args.name

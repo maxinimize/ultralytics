@@ -15,7 +15,7 @@ cd "$ROOT"
 # Validation configuration
 # Allows overriding via CLI arguments: sbatch val_stn_job.sh [STN_WEIGHTS] [MODEL] [DATA]
 STN_WEIGHTS="${1:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_yolo12l_coco_train_traffic5k_ep50_b8_k10_deg30.0_tr0.10/weights/best.pt}"}" 
-MODEL="${2:-"${MODEL:-yolo12l.pt}"}"
+MODEL="${2:-"${MODEL:-runs/local_adv_adaptive_current_coco_train_traffic5k_ep100_pgd_bim_mim_worstk_0.10_0.10_0.40_0.15/weights/best.pt}"}"
 DATA="${3:-"${DATA:-coco_train_traffic5k_test.yaml}"}"
 SPLIT="${SPLIT:-val}"
 CLASSES=(0 1 2 3 5 6 7 9 11 12)

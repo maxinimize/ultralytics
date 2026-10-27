@@ -15,7 +15,7 @@ Materialization order:
 from __future__ import annotations
 
 import copy
-import torch
+
 from torch import nn
 
 from .hydra_layer import HydraConv2d

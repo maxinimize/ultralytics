@@ -34,9 +34,8 @@ def default_conv_selector(name: str, module: nn.Conv2d) -> bool:
 
     # Exclude final output projection heads in Detect module (e.g. cv2.0.2, cv3.0.2)
     parts = name.split(".")
-    if len(parts) >= 3 and parts[-3] in {"cv2", "cv3", "one2one_cv2", "one2one_cv3"}:
-        if parts[-1] == "2":
-            return False
+    if len(parts) >= 3 and parts[-3] in {"cv2", "cv3", "one2one_cv2", "one2one_cv3"} and parts[-1] == "2":
+        return False
 
     return True
 
@@ -52,6 +51,7 @@ def convert_to_hydra(
     model: nn.Module,
     *,
     keep_ratio: float = 1.0,
+    pruning_mode: str = "unstructured",
     selector: ModuleSelector | None = None,
 ) -> nn.Module:
     """Recursively replace selected `nn.Conv2d` leaves with `HydraConv2d`."""
@@ -59,7 +59,7 @@ def convert_to_hydra(
 
     if isinstance(model, nn.Conv2d) and not isinstance(model, HydraConv2d):
         if selector("", model):
-            return HydraConv2d.from_conv(model, keep_ratio=keep_ratio)
+            return HydraConv2d.from_conv(model, keep_ratio=keep_ratio, pruning_mode=pruning_mode)
         return model
 
     def _convert_rec(module: nn.Module, prefix: str = "") -> None:
@@ -67,7 +67,7 @@ def convert_to_hydra(
             full_name = f"{prefix}.{child_name}" if prefix else child_name
             if isinstance(child, nn.Conv2d) and not isinstance(child, HydraConv2d):
                 if selector(full_name, child):
-                    hydra_layer = HydraConv2d.from_conv(child, keep_ratio=keep_ratio)
+                    hydra_layer = HydraConv2d.from_conv(child, keep_ratio=keep_ratio, pruning_mode=pruning_mode)
                     setattr(module, child_name, hydra_layer)
             else:
                 _convert_rec(child, full_name)

@@ -54,6 +54,7 @@ FINETUNE_EPOCHS="${7:-"30"}"               # Stage 2 fixed-mask fine-tuning epoc
 BATCH="${8:-"16"}"                         # Batch size
 IMGSZ="${9:-"640"}"                        # Image size
 DEVICE="${10:-"0"}"                        # GPU device ID
+PRUNING_MODE="${PRUNING_MODE:-"${11:-"unstructured"}"}" # Pruning mode: unstructured or kernel
 WORKERS="${WORKERS:-3}"                    # DataLoader worker count
 CLASSES="${CLASSES:-"0 1 2 3 5 6 7 9 11 12"}"  # Target class indices (e.g., 10 traffic categories)
 
@@ -79,8 +80,8 @@ CLEAN_DATA="$(basename "${DATA}" .yaml)"
 CLEAN_ATK="${ATTACK_NAME// /_}"
 CLEAN_ATK_RATIO="${ATTACK_RATIO// /_}"
 
-# Construct experiment name
-NAME="${JOB_NAME}_${CLEAN_MODEL}_${CLEAN_DATA}_k${KEEP_RATIO}_ep${SCORE_EPOCHS}_${FINETUNE_EPOCHS}_${CLEAN_ATK}_${CLEAN_ATK_RATIO}"
+# Construct experiment name (incorporating pruning mode to avoid collisions)
+NAME="${JOB_NAME}_${CLEAN_MODEL}_${CLEAN_DATA}_mode${PRUNING_MODE}_k${KEEP_RATIO}_ep${SCORE_EPOCHS}_${FINETUNE_EPOCHS}_${CLEAN_ATK}_${CLEAN_ATK_RATIO}"
 
 # Unified output redirection (stdout and stderr written to single .out file)
 mkdir -p logs
@@ -97,6 +98,7 @@ echo "Host:           $(hostname)"
 echo "Experiment:     ${NAME}"
 echo "Log File:       ${LOG_FILE}"
 echo "Pipeline Dir:   ${PIPELINE_DIR}"
+echo "Pruning Mode:   ${PRUNING_MODE}"
 echo "Input Model:    ${INPUT_MODEL}"
 echo "Dataset YAML:   ${DATA}"
 echo "Eval Test YAML: ${EVAL_DATA}"
@@ -122,11 +124,12 @@ MATERIALIZED_MODEL="${PIPELINE_DIR}/pruned_materialized.pt"
 # Stage 1: Robust Score Search
 # ==============================================================================
 if [ "${RUN_STAGE1}" -eq 1 ]; then
-    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 1: Robust Score Search <<<<<"
+    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 1: Robust Score Search (${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_prune.py \
         --model "${INPUT_MODEL}" \
         --data "${DATA}" \
         --keep-ratio "${KEEP_RATIO}" \
+        --pruning-mode "${PRUNING_MODE}" \
         --epochs "${SCORE_EPOCHS}" \
         --batch "${BATCH}" \
         --imgsz "${IMGSZ}" \
@@ -151,11 +154,12 @@ fi
 # Stage 2: Robust Fixed-Mask Fine-tuning
 # ==============================================================================
 if [ "${RUN_STAGE2}" -eq 1 ]; then
-    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 2: Fixed-Mask Fine-tuning <<<<<"
+    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 2: Fixed-Mask Fine-tuning (${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_finetune.py \
         --model "${STAGE1_BEST}" \
         --data "${DATA}" \
         --keep-ratio "${KEEP_RATIO}" \
+        --pruning-mode "${PRUNING_MODE}" \
         --epochs "${FINETUNE_EPOCHS}" \
         --batch "${BATCH}" \
         --imgsz "${IMGSZ}" \
@@ -180,10 +184,11 @@ fi
 # Stage 3: Materialization to Standard YOLO
 # ==============================================================================
 if [ "${RUN_STAGE3}" -eq 1 ]; then
-    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 3: Model Materialization (HydraConv2d -> nn.Conv2d) <<<<<"
+    echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 3: Model Materialization (HydraConv2d -> nn.Conv2d, ${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_export.py \
         --model "${STAGE2_BEST}" \
         --output "${MATERIALIZED_MODEL}" \
+        --pruning-mode "${PRUNING_MODE}" \
         --imgsz "${IMGSZ}" \
         --device "${DEVICE}" \
         --verify

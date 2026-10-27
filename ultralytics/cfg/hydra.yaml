@@ -6,6 +6,9 @@ hydra: true
 # Milestone 2 stage: "score" or "finetune".
 hydra_stage: score
 
+# HYDRA pruning mode: "unstructured" (default) or "kernel" (Plan A).
+hydra_pruning_mode: unstructured
+
 # Fraction of connections retained in each selected layer.
 # Example: keep_ratio=0.50 means 50% pruning.
 hydra_keep_ratio: 0.50

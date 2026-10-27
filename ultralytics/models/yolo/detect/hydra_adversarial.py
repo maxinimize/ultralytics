@@ -33,13 +33,13 @@ import torch
 
 from ultralytics.models.yolo.detect.hydra_train import (
     HYDRA_CONFIG_KEYS,
-    HYDRA_DEFAULTS,
     HydraTrainerMixin,
     prepare_hydra_cfg,
 )
 from ultralytics.models.yolo.detect.train_adv_test import (
     DetectionTrainer as AdversarialDetectionTrainer,
 )
+from ultralytics.nn.pruning.hydra_mask import calculate_model_sparsity
 from ultralytics.utils import __version__
 from ultralytics.utils.torch_utils import (
     convert_optimizer_state_dict_to_fp16,
@@ -120,6 +120,20 @@ class HydraAdversarialDetectionTrainer(HydraTrainerMixin, AdversarialDetectionTr
 
     def save_model(self):
         """Save model checkpoint preserving HYDRA state, attack metadata, and results."""
+        sparsity_report = calculate_model_sparsity(self.model)
+        common_metadata = {
+            "hydra_pruning_mode": self.hydra_pruning_mode,
+            "hydra_stage": self.hydra_stage,
+            "hydra_keep_ratio": self.hydra_keep_ratio,
+            "hydra_score_init": self.hydra_score_init,
+            "hydra_sparsity": sparsity_report.sparsity,
+            "hydra_kernel_sparsity": sparsity_report.kernel_sparsity,
+            "hydra_element_sparsity": sparsity_report.element_sparsity,
+            "attack_name": getattr(self.args, "attack_name", None),
+            "attack_ratio": getattr(self.args, "attack_ratio", None),
+            "attack_weights": getattr(self.args, "attack_weights", None),
+        }
+
         if self.hydra_stage == "score":
             buffer = io.BytesIO()
             torch.save(
@@ -132,18 +146,13 @@ class HydraAdversarialDetectionTrainer(HydraTrainerMixin, AdversarialDetectionTr
                     "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                     "scaler": self.scaler.state_dict(),
                     "train_args": vars(self.args),
-                    "train_metrics": {**self.metrics, **{"fitness": self.fitness}} if self.metrics else {},
+                    "train_metrics": {**self.metrics, "fitness": self.fitness} if self.metrics else {},
                     "train_results": self.read_results_csv(),
                     "date": datetime.now().isoformat(),
                     "version": __version__,
                     "license": "AGPL-3.0 (https://ultralytics.com/license)",
                     "docs": "https://docs.ultralytics.com",
-                    "hydra_stage": self.hydra_stage,
-                    "hydra_keep_ratio": self.hydra_keep_ratio,
-                    "hydra_score_init": self.hydra_score_init,
-                    "attack_name": getattr(self.args, "attack_name", None),
-                    "attack_ratio": getattr(self.args, "attack_ratio", None),
-                    "attack_weights": getattr(self.args, "attack_weights", None),
+                    **common_metadata,
                 },
                 buffer,
             )
@@ -155,4 +164,37 @@ class HydraAdversarialDetectionTrainer(HydraTrainerMixin, AdversarialDetectionTr
             if (self.save_period > 0) and (self.epoch % self.save_period == 0):
                 (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
         else:
-            super().save_model()
+            ema = self.ema.ema if hasattr(self, "ema") and self.ema is not None else None
+            if ema is not None:
+                ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
+                if hasattr(ema, "criterion"):
+                    ema.criterion = None
+
+            buffer = io.BytesIO()
+            torch.save(
+                {
+                    "epoch": self.epoch,
+                    "best_fitness": self.best_fitness,
+                    "model": unwrap_model(self.model),
+                    "ema": ema,
+                    "updates": self.ema.updates if hasattr(self, "ema") and self.ema is not None else 0,
+                    "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+                    "scaler": self.scaler.state_dict(),
+                    "train_args": vars(self.args),
+                    "train_metrics": {**self.metrics, "fitness": self.fitness} if self.metrics else {},
+                    "train_results": self.read_results_csv(),
+                    "date": datetime.now().isoformat(),
+                    "version": __version__,
+                    "license": "AGPL-3.0 (https://ultralytics.com/license)",
+                    "docs": "https://docs.ultralytics.com",
+                    **common_metadata,
+                },
+                buffer,
+            )
+            serialized_ckpt = buffer.getvalue()
+            self.wdir.mkdir(parents=True, exist_ok=True)
+            self.last.write_bytes(serialized_ckpt)
+            if self.best_fitness == self.fitness:
+                self.best.write_bytes(serialized_ckpt)
+            if (self.save_period > 0) and (self.epoch % self.save_period == 0):
+                (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)

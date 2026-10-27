@@ -9,6 +9,7 @@ Milestone 2:
 from __future__ import annotations
 
 import io
+import os
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -21,23 +22,27 @@ from ultralytics.cfg import DEFAULT_CFG_DICT, cfg2dict
 from ultralytics.models import yolo
 from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.nn.pruning.hydra_convert import convert_to_hydra, iter_hydra_layers
-from ultralytics.nn.pruning.hydra_layer import HydraConv2d
 from ultralytics.nn.pruning.hydra_mask import (
     HydraSparsityReport,
+    calculate_model_sparsity,
     configure_masked_finetune,
     configure_score_search,
     enforce_pruned_weights_zero,
     freeze_hydra_masks,
+    is_kernel_structured_mask,
     set_hydra_keep_ratio,
+    set_hydra_pruning_mode,
 )
 from ultralytics.nn.pruning.hydra_score import initialize_hydra_scores
-from ultralytics.utils import __version__, GIT, LOGGER
+from ultralytics.utils import LOGGER, __version__
 from ultralytics.utils.torch_utils import convert_optimizer_state_dict_to_fp16, unwrap_model
-
 
 HYDRA_DEFAULTS = {
     # Enable HYDRA-specific behavior.
     "hydra": True,
+
+    # Pruning mode: "unstructured" (default) or "kernel" (Plan A).
+    "hydra_pruning_mode": "unstructured",
 
     # Training stage:
     #   "score"    -> freeze dense weights and optimize popup_scores only
@@ -88,6 +93,16 @@ class HydraTrainerMixin:
 
     def init_hydra_attributes(self) -> None:
         """Initialize and validate trainer-level HYDRA state attributes."""
+        # Support PRUNING_MODE environment variable if not explicitly given on args
+        env_mode = os.environ.get("PRUNING_MODE", "").strip().lower()
+        arg_mode = getattr(self.args, "hydra_pruning_mode", None)
+        if arg_mode is not None:
+            self.hydra_pruning_mode = str(arg_mode).strip().lower()
+        elif env_mode in {"unstructured", "kernel"}:
+            self.hydra_pruning_mode = env_mode
+        else:
+            self.hydra_pruning_mode = "unstructured"
+
         self.hydra_stage = str(self.args.hydra_stage)
         self.hydra_keep_ratio = float(self.args.hydra_keep_ratio)
         self.hydra_score_init = str(self.args.hydra_score_init)
@@ -96,7 +111,12 @@ class HydraTrainerMixin:
         self._validate_hydra_args()
 
     def _validate_hydra_args(self) -> None:
-        """Validate Milestone-2 HYDRA configuration values early."""
+        """Validate HYDRA configuration values early."""
+        if self.hydra_pruning_mode not in {"unstructured", "kernel"}:
+            raise ValueError(
+                f"hydra_pruning_mode must be 'unstructured' or 'kernel', got {self.hydra_pruning_mode!r}"
+            )
+
         if self.hydra_stage not in {"score", "finetune"}:
             raise ValueError(
                 f"hydra_stage must be 'score' or 'finetune', got {self.hydra_stage!r}"
@@ -129,16 +149,12 @@ class HydraTrainerMixin:
         hydra_layers = list(iter_hydra_layers(self.model))
         is_already_hydra = len(hydra_layers) > 0
 
-        if not is_already_hydra:
-            convert_to_hydra(self.model, keep_ratio=self.hydra_keep_ratio)
-
-        # Restore popup_scores and fixed_mask from checkpoint if present
-        scores_restored = False
-        masks_restored = False
-
+        # Checkpoint metadata inspection
+        ckpt_meta_dict = None
         src_state = None
         if ckpt is not None:
             if isinstance(ckpt, dict):
+                ckpt_meta_dict = ckpt
                 src_model = ckpt.get("ema") or ckpt.get("model")
                 if isinstance(src_model, torch.nn.Module):
                     src_state = src_model.state_dict()
@@ -155,6 +171,7 @@ class HydraTrainerMixin:
                 try:
                     loaded_ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
                     if isinstance(loaded_ckpt, dict):
+                        ckpt_meta_dict = loaded_ckpt
                         src_model = loaded_ckpt.get("ema") or loaded_ckpt.get("model")
                         if isinstance(src_model, torch.nn.Module):
                             src_state = src_model.state_dict()
@@ -164,6 +181,44 @@ class HydraTrainerMixin:
                         src_state = loaded_ckpt.state_dict()
                 except Exception as e:
                     LOGGER.warning(f"HYDRA: Could not load fallback checkpoint from {model_path}: {e}")
+
+        # Checkpoint mode conflict detection
+        ckpt_pruning_mode = None
+        is_hydra_ckpt = False
+        if ckpt_meta_dict is not None:
+            ckpt_pruning_mode = ckpt_meta_dict.get("hydra_pruning_mode")
+            if ckpt_pruning_mode is None and "train_args" in ckpt_meta_dict and isinstance(ckpt_meta_dict["train_args"], dict):
+                ckpt_pruning_mode = ckpt_meta_dict["train_args"].get("hydra_pruning_mode")
+            if "hydra_stage" in ckpt_meta_dict or ckpt_pruning_mode is not None:
+                is_hydra_ckpt = True
+
+        if src_state is not None:
+            has_scores_in_state = any("popup_scores" in k for k in src_state)
+            has_masks_in_state = any("fixed_mask" in k for k in src_state)
+            if has_scores_in_state or has_masks_in_state:
+                is_hydra_ckpt = True
+
+        if is_hydra_ckpt:
+            detected_mode = ckpt_pruning_mode or "unstructured"
+            if detected_mode != self.hydra_pruning_mode:
+                raise ValueError(
+                    f"Checkpoint pruning mode '{detected_mode}' conflicts with requested "
+                    f"pruning mode '{self.hydra_pruning_mode}'. "
+                    f"Do not mix or reinterpret unstructured and kernel pruning checkpoints."
+                )
+
+        if not is_already_hydra:
+            convert_to_hydra(
+                self.model,
+                keep_ratio=self.hydra_keep_ratio,
+                pruning_mode=self.hydra_pruning_mode,
+            )
+        else:
+            set_hydra_pruning_mode(self.model, self.hydra_pruning_mode)
+
+        # Restore popup_scores and fixed_mask from checkpoint if present
+        scores_restored = False
+        masks_restored = False
 
         if src_state is not None:
             # Build prefix-normalized lookup dict
@@ -193,6 +248,11 @@ class HydraTrainerMixin:
                     loaded_mask = norm_src_state[mask_k].to(layer.fixed_mask.device)
                     # Check if the mask has actual non-trivial sparsity (i.e. not all 1s)
                     if (loaded_mask < 0.5).any():
+                        if self.hydra_pruning_mode == "kernel" and not is_kernel_structured_mask(loaded_mask):
+                            raise ValueError(
+                                f"Checkpoint fixed_mask for layer '{name}' is unstructured, "
+                                f"which conflicts with requested pruning mode 'kernel'!"
+                            )
                         layer.fixed_mask.data.copy_(loaded_mask)
                         num_masks += 1
 
@@ -211,15 +271,20 @@ class HydraTrainerMixin:
         elif self.hydra_stage == "finetune":
             set_hydra_keep_ratio(self.model, self.hydra_keep_ratio)
             if masks_restored:
-                total_m = sum(l.fixed_mask.numel() for _, l in iter_hydra_layers(self.model))
-                kept_m = sum(int((l.fixed_mask > 0.5).sum().item()) for _, l in iter_hydra_layers(self.model))
-                sparsity = 1.0 - (kept_m / total_m) if total_m > 0 else 0.0
-                LOGGER.info(f"HYDRA: Using restored fixed_mask from checkpoint: sparsity={sparsity:.4f} ({kept_m}/{total_m} retained)")
+                report = calculate_model_sparsity(self.model)
+                LOGGER.info(
+                    f"HYDRA: Using restored fixed_mask from checkpoint: "
+                    f"mode={self.hydra_pruning_mode}, kernel_sparsity={report.kernel_sparsity:.4f}, "
+                    f"element_sparsity={report.element_sparsity:.4f} ({report.kept_mask_elements}/{report.total_mask_elements} retained)"
+                )
             else:
                 if not scores_restored:
                     LOGGER.warning("HYDRA ⚠️ No popup_scores found in checkpoint to freeze masks from!")
                 report = freeze_hydra_masks(self.model)
-                LOGGER.info(f"HYDRA: Froze masks from popup_scores: sparsity={report.sparsity:.4f}")
+                LOGGER.info(
+                    f"HYDRA: Froze masks from popup_scores: mode={self.hydra_pruning_mode}, "
+                    f"kernel_sparsity={report.kernel_sparsity:.4f}, element_sparsity={report.element_sparsity:.4f}"
+                )
             configure_masked_finetune(self.model)
             enforce_pruned_weights_zero(self.model)
         else:
@@ -347,7 +412,18 @@ class HydraTrainerMixin:
             enforce_pruned_weights_zero(self.model)
 
     def save_model(self):
-        """Save model checkpoint preserving HYDRA state and metadata."""
+        """Save model checkpoint preserving HYDRA state, pruning mode, and metadata."""
+        sparsity_report = calculate_model_sparsity(self.model)
+        common_metadata = {
+            "hydra_pruning_mode": self.hydra_pruning_mode,
+            "hydra_stage": self.hydra_stage,
+            "hydra_keep_ratio": self.hydra_keep_ratio,
+            "hydra_score_init": self.hydra_score_init,
+            "hydra_sparsity": sparsity_report.sparsity,
+            "hydra_kernel_sparsity": sparsity_report.kernel_sparsity,
+            "hydra_element_sparsity": sparsity_report.element_sparsity,
+        }
+
         if self.hydra_stage == "score":
             buffer = io.BytesIO()
             torch.save(
@@ -360,15 +436,13 @@ class HydraTrainerMixin:
                     "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
                     "scaler": self.scaler.state_dict(),
                     "train_args": vars(self.args),
-                    "train_metrics": {**self.metrics, **{"fitness": self.fitness}} if self.metrics else {},
+                    "train_metrics": {**self.metrics, "fitness": self.fitness} if self.metrics else {},
                     "train_results": self.read_results_csv(),
                     "date": datetime.now().isoformat(),
                     "version": __version__,
                     "license": "AGPL-3.0 (https://ultralytics.com/license)",
                     "docs": "https://docs.ultralytics.com",
-                    "hydra_stage": self.hydra_stage,
-                    "hydra_keep_ratio": self.hydra_keep_ratio,
-                    "hydra_score_init": self.hydra_score_init,
+                    **common_metadata,
                 },
                 buffer,
             )
@@ -380,7 +454,40 @@ class HydraTrainerMixin:
             if (self.save_period > 0) and (self.epoch % self.save_period == 0):
                 (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
         else:
-            super().save_model()
+            ema = self.ema.ema if hasattr(self, "ema") and self.ema is not None else None
+            if ema is not None:
+                ema = deepcopy(ema).half().to(memory_format=torch.contiguous_format)
+                if hasattr(ema, "criterion"):
+                    ema.criterion = None
+
+            buffer = io.BytesIO()
+            torch.save(
+                {
+                    "epoch": self.epoch,
+                    "best_fitness": self.best_fitness,
+                    "model": unwrap_model(self.model),
+                    "ema": ema,
+                    "updates": self.ema.updates if hasattr(self, "ema") and self.ema is not None else 0,
+                    "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
+                    "scaler": self.scaler.state_dict(),
+                    "train_args": vars(self.args),
+                    "train_metrics": {**self.metrics, "fitness": self.fitness} if self.metrics else {},
+                    "train_results": self.read_results_csv(),
+                    "date": datetime.now().isoformat(),
+                    "version": __version__,
+                    "license": "AGPL-3.0 (https://ultralytics.com/license)",
+                    "docs": "https://docs.ultralytics.com",
+                    **common_metadata,
+                },
+                buffer,
+            )
+            serialized_ckpt = buffer.getvalue()
+            self.wdir.mkdir(parents=True, exist_ok=True)
+            self.last.write_bytes(serialized_ckpt)
+            if self.best_fitness == self.fitness:
+                self.best.write_bytes(serialized_ckpt)
+            if (self.save_period > 0) and (self.epoch % self.save_period == 0):
+                (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
 
     def finalize_score_search(self) -> HydraSparsityReport:
         """Freeze score rankings into permanent masks and return sparsity report."""

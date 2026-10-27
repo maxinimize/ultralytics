@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import copy
-from pathlib import Path
+import os
+
 import torch
+
 from ultralytics import YOLO
 from ultralytics.nn.pruning.hydra_convert import convert_to_hydra, iter_hydra_layers
 from ultralytics.nn.pruning.hydra_layer import HydraMode
@@ -32,6 +34,12 @@ def parse_args():
     parser.add_argument("--model", required=True, help="Input dense or adversarially-trained checkpoint (.pt).")
     parser.add_argument("--data", required=True, help="Ultralytics dataset YAML file.")
     parser.add_argument("--keep-ratio", type=float, default=0.5, help="Fraction of retained connections (e.g. 0.5 for 50% sparsity).")
+    parser.add_argument(
+        "--pruning-mode",
+        default=os.environ.get("PRUNING_MODE", "unstructured"),
+        choices=["unstructured", "kernel"],
+        help="Pruning mode: 'unstructured' (default) or 'kernel' (Plan A).",
+    )
     parser.add_argument("--epochs", type=int, default=20, help="Number of score search epochs.")
     parser.add_argument("--device", default="0", help="Target device (e.g. '0', '0,1', or 'cpu').")
     parser.add_argument("--batch", type=int, default=16, help="Batch size.")
@@ -65,13 +73,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_preflight_equivalence_check(model_path: str):
+def run_preflight_equivalence_check(model_path: str, pruning_mode: str = "unstructured"):
     """Verify that a converted model with keep_ratio=1.0 matches the original dense model."""
     yolo = YOLO(model_path)
     dense_model = copy.deepcopy(yolo.model).to("cpu").eval()
     hydra_model = copy.deepcopy(yolo.model).to("cpu").eval()
 
-    convert_to_hydra(hydra_model, keep_ratio=1.0)
+    convert_to_hydra(hydra_model, keep_ratio=1.0, pruning_mode=pruning_mode)
     initialize_hydra_scores(hydra_model)
 
     x = torch.randn(1, 3, 64, 64)
@@ -93,14 +101,14 @@ def run_preflight_equivalence_check(model_path: str):
     max_diff = diff(dense_out, hydra_out)
     if max_diff > 1e-4:
         raise ValueError(f"Preflight check failed! Max difference: {max_diff}")
-    LOGGER.info(f"Preflight k=1.0 equivalence check passed (max diff = {max_diff:.2e}).")
+    LOGGER.info(f"Preflight k=1.0 equivalence check passed for mode='{pruning_mode}' (max diff = {max_diff:.2e}).")
 
 
 def main():
     """Launch HYDRA score search."""
     args = parse_args()
     if args.preflight:
-        run_preflight_equivalence_check(args.model)
+        run_preflight_equivalence_check(args.model, pruning_mode=args.pruning_mode)
 
     overrides = {
         "model": args.model,
@@ -113,6 +121,7 @@ def main():
         "project": args.project,
         "hydra_stage": "score",
         "hydra_keep_ratio": args.keep_ratio,
+        "hydra_pruning_mode": args.pruning_mode,
     }
     if args.name is not None:
         overrides["name"] = args.name
@@ -136,26 +145,23 @@ def main():
             overrides["attack_ratio"] = [0.5] * len(args.attack_name)
 
         LOGGER.info(
-            f"Starting ROBUST score search with attacks: {overrides['attack_name']} "
+            f"Starting ROBUST score search ({args.pruning_mode}) with attacks: {overrides['attack_name']} "
             f"(ratios={overrides['attack_ratio']})"
         )
         trainer = HydraAdversarialDetectionTrainer(overrides=overrides, attack_weights=args.attack_weights or "")
     else:
         from ultralytics.models.yolo.detect.hydra_train import HydraDetectionTrainer
 
-        LOGGER.info("Starting CLEAN score search (HydraDetectionTrainer)")
+        LOGGER.info(f"Starting CLEAN score search ({args.pruning_mode}) (HydraDetectionTrainer)")
         trainer = HydraDetectionTrainer(overrides=overrides)
 
     trainer.train()
     report = trainer.finalize_score_search()
 
     LOGGER.info("\n" + "=" * 60)
-    LOGGER.info("HYDRA SCORE SEARCH COMPLETE")
+    LOGGER.info(f"HYDRA {args.pruning_mode.upper()} SCORE SEARCH COMPLETE")
     LOGGER.info(f"Target keep ratio: {args.keep_ratio:.4f}")
-    LOGGER.info(
-        f"Final mask sparsity: {report.sparsity:.4f} "
-        f"({report.kept_mask_elements}/{report.total_mask_elements} connections retained)"
-    )
+    LOGGER.info(report.summary())
     best_path = getattr(trainer, "best", None) or (trainer.wdir / "best.pt")
     last_path = getattr(trainer, "last", None) or (trainer.wdir / "last.pt")
     LOGGER.info(f"Best score checkpoint: {best_path}")

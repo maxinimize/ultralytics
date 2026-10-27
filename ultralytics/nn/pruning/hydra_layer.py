@@ -31,6 +31,13 @@ class HydraMode(str, Enum):
     FINETUNE = "finetune"
 
 
+class HydraPruningMode(str, Enum):
+    """Pruning mode for a HYDRA convolution."""
+
+    UNSTRUCTURED = "unstructured"
+    KERNEL = "kernel"
+
+
 class _GetSubnetSTE(torch.autograd.Function):
     """Build a binary layer-wise top-k mask while passing gradients to scores.
 
@@ -51,7 +58,7 @@ class _GetSubnetSTE(torch.autograd.Function):
             return torch.zeros_like(scores)
 
         numel = scores.numel()
-        k = int(round(keep_ratio * numel))
+        k = round(keep_ratio * numel)
         if k >= numel:
             return torch.ones_like(scores)
         if k <= 0:
@@ -79,20 +86,33 @@ class HydraConv2d(nn.Conv2d):
         - Score-search forward should use `self.weight.detach()` as an extra
           safeguard against external trainer code changing `requires_grad`.
         - Fine-tuning uses a fixed registered buffer mask.
+        - Supports both unstructured and kernel-level structured pruning.
     """
 
-    def __init__(self, *args, keep_ratio: float = 1.0, **kwargs):
+    def __init__(
+        self,
+        *args,
+        keep_ratio: float = 1.0,
+        pruning_mode: HydraPruningMode | str = HydraPruningMode.UNSTRUCTURED,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
         self.popup_scores = nn.Parameter(torch.ones_like(self.weight))
         self.keep_ratio = float(keep_ratio)
         self.hydra_mode = HydraMode.DENSE
+        self.pruning_mode = HydraPruningMode(pruning_mode)
 
         # Persistent buffer so masks follow `.to(device)`, DDP, and checkpoints.
         self.register_buffer("fixed_mask", torch.ones_like(self.weight))
 
     @classmethod
-    def from_conv(cls, conv: nn.Conv2d, keep_ratio: float = 1.0) -> HydraConv2d:
+    def from_conv(
+        cls,
+        conv: nn.Conv2d,
+        keep_ratio: float = 1.0,
+        pruning_mode: HydraPruningMode | str = HydraPruningMode.UNSTRUCTURED,
+    ) -> HydraConv2d:
         """Create a HYDRA layer with the same geometry and parameters as `conv`."""
         hydra_layer = cls(
             in_channels=conv.in_channels,
@@ -105,6 +125,7 @@ class HydraConv2d(nn.Conv2d):
             bias=conv.bias is not None,
             padding_mode=conv.padding_mode,
             keep_ratio=keep_ratio,
+            pruning_mode=pruning_mode,
         )
         hydra_layer.to(device=conv.weight.device, dtype=conv.weight.dtype)
         hydra_layer.weight.data.copy_(conv.weight.data)
@@ -118,6 +139,10 @@ class HydraConv2d(nn.Conv2d):
         """Switch layer execution mode without silently changing parameters."""
         self.hydra_mode = HydraMode(mode)
 
+    def set_pruning_mode(self, mode: HydraPruningMode | str) -> None:
+        """Switch layer pruning mode ('unstructured' or 'kernel')."""
+        self.pruning_mode = HydraPruningMode(mode)
+
     def set_keep_ratio(self, keep_ratio: float) -> None:
         """Set the fraction of weights retained by dynamic score masks."""
         if not 0.0 <= keep_ratio <= 1.0:
@@ -126,7 +151,15 @@ class HydraConv2d(nn.Conv2d):
 
     def dynamic_mask(self) -> torch.Tensor:
         """Return the current STE mask derived from `popup_scores`."""
-        return _GetSubnetSTE.apply(self.popup_scores.abs(), self.keep_ratio)
+        if self.pruning_mode == HydraPruningMode.UNSTRUCTURED:
+            return _GetSubnetSTE.apply(self.popup_scores.abs(), self.keep_ratio)
+        elif self.pruning_mode == HydraPruningMode.KERNEL:
+            # Each 2D kernel is weight[out_channel, in_channel, :, :]
+            # Average score over spatial dimensions (kernel_h, kernel_w)
+            kernel_scores = self.popup_scores.abs().mean(dim=(2, 3), keepdim=True)
+            k_mask = _GetSubnetSTE.apply(kernel_scores, self.keep_ratio)
+            return k_mask.expand_as(self.popup_scores).contiguous()
+        raise ValueError(f"Unsupported HYDRA pruning mode: {self.pruning_mode}")
 
     def build_fixed_mask(self) -> torch.Tensor:
         """Create a detached binary mask from current scores."""

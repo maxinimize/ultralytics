@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import nn
 
 from ultralytics import YOLO
 from ultralytics.nn.pruning.hydra_convert import iter_hydra_layers
@@ -38,6 +37,12 @@ def parse_args():
         "--output",
         default=None,
         help="Path for materialized output checkpoint (.pt). Default: <model_stem>_materialized.pt",
+    )
+    parser.add_argument(
+        "--pruning-mode",
+        default=None,
+        choices=["unstructured", "kernel"],
+        help="Pruning mode: 'unstructured' or 'kernel'. If omitted, inferred from checkpoint metadata.",
     )
     parser.add_argument("--device", default="cpu", help="Device for verification ('cpu' or CUDA index).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size for numerical equivalence check.")
@@ -70,6 +75,7 @@ def compute_tensor_diff(o1: Any, o2: Any) -> float:
 def export_and_materialize(
     model_path: str,
     output_path: str | None = None,
+    pruning_mode: str | None = None,
     device: str = "cpu",
     imgsz: int = 640,
     verify: bool = True,
@@ -89,11 +95,33 @@ def export_and_materialize(
     LOGGER.info(f"Loading checkpoint from: {in_path}")
     ckpt = torch_load(in_path, map_location="cpu")
 
-    # 1. Extract model object
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        hydra_model = ckpt["model"]
+    # Detect pruning mode from checkpoint or arguments
+    detected_mode = None
+    if isinstance(ckpt, dict):
+        detected_mode = ckpt.get("hydra_pruning_mode")
+        if detected_mode is None and "train_args" in ckpt and isinstance(ckpt["train_args"], dict):
+            detected_mode = ckpt["train_args"].get("hydra_pruning_mode")
+
+    if pruning_mode is not None:
+        if detected_mode is not None and detected_mode != pruning_mode:
+            raise ValueError(
+                f"Requested pruning mode '{pruning_mode}' conflicts with checkpoint metadata '{detected_mode}'!"
+            )
+        effective_mode = pruning_mode
     else:
-        # Checkpoint might be a raw model or YOLO-style wrapper
+        effective_mode = detected_mode or "unstructured"
+
+    LOGGER.info(f"Pruning mode for materialization: {effective_mode}")
+
+    # 1. Extract model object
+    if isinstance(ckpt, dict):
+        if ckpt.get("model") is not None:
+            hydra_model = ckpt["model"]
+        elif ckpt.get("ema") is not None:
+            hydra_model = ckpt["ema"]
+        else:
+            hydra_model = ckpt
+    else:
         hydra_model = ckpt
 
     unwrapped = unwrap_model(hydra_model)
@@ -150,7 +178,7 @@ def export_and_materialize(
     materialized_model.to("cpu")
 
     # 6. Update checkpoint structure
-    if isinstance(ckpt, dict) and "model" in ckpt:
+    if isinstance(ckpt, dict) and ("model" in ckpt or "ema" in ckpt):
         ckpt["model"] = materialized_model
         if ckpt.get("ema") is not None:
             LOGGER.info("Materializing EMA model in checkpoint...")
@@ -161,6 +189,7 @@ def export_and_materialize(
                     break
             ckpt["ema"] = materialize_hydra_model(unwrapped_ema, inplace=False)
         ckpt["hydra_materialized"] = True
+        ckpt["hydra_pruning_mode"] = effective_mode
         save_obj = ckpt
     else:
         save_obj = materialized_model
@@ -171,7 +200,7 @@ def export_and_materialize(
 
     # 8. Test standard YOLO loader compatibility
     try:
-        yolo_test = YOLO(str(out_path))
+        YOLO(str(out_path))
         LOGGER.info("Compatibility verified: checkpoint loaded successfully with Ultralytics YOLO().")
     except Exception as e:
         LOGGER.warning(f"Standard YOLO load check warning: {e}")
@@ -185,6 +214,7 @@ def main():
     out = export_and_materialize(
         model_path=args.model,
         output_path=args.output,
+        pruning_mode=args.pruning_mode,
         device=args.device,
         imgsz=args.imgsz,
         verify=args.verify,
