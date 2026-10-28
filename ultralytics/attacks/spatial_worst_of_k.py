@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ultralytics.attacks.attack_utils import BatchContainer
 from ultralytics.attacks.attacker import Attacker
@@ -95,7 +95,8 @@ class SpatialWorstOfK(Attacker):
         min_box_size: float = 2.0,
         min_area_ratio: float = 0.10,
         include_identity: bool = False,
-        seed: Optional[int] = None,
+        seed: int | None = None,
+        eval_batch_size: int = 4,
         **kwargs,
     ):
         # epsilon is kept only for compatibility with the common Attacker API.
@@ -123,6 +124,7 @@ class SpatialWorstOfK(Attacker):
         self.min_box_size = float(min_box_size)
         self.min_area_ratio = float(min_area_ratio)
         self.include_identity = bool(include_identity)
+        self.eval_batch_size = max(1, int(eval_batch_size))
 
         self._loss_fn = unwrap_model(self.model).loss
 
@@ -140,9 +142,9 @@ class SpatialWorstOfK(Attacker):
         self.model.eval()
 
         # Useful for logging/debugging after each call.
-        self.last_scores: Optional[torch.Tensor] = None  # [B, k]
-        self.last_best_indices: Optional[torch.Tensor] = None  # [B], values 0..k-1
-        self.last_params: Optional[torch.Tensor] = None  # [B, k, 3] -> angle, tx, ty
+        self.last_scores: torch.Tensor | None = None  # [B, k]
+        self.last_best_indices: torch.Tensor | None = None  # [B], values 0..k-1
+        self.last_params: torch.Tensor | None = None  # [B, k, 3] -> angle, tx, ty
 
     # ------------------------------------------------------------------
     # Public attack entry points
@@ -191,7 +193,7 @@ class SpatialWorstOfK(Attacker):
     # Core Worst-of-k logic
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _attack(self, x: torch.Tensor, targets: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _attack(self, x: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 4:
             raise ValueError(f"Expected x in NCHW format, got shape {tuple(x.shape)}")
 
@@ -206,9 +208,7 @@ class SpatialWorstOfK(Attacker):
         matrices = self._build_forward_matrices(params, height, width, dtype=x.dtype)  # [B,k,3,3]
 
         # Expand original images to [B*k,C,H,W], then warp all candidates in one GPU op.
-        expanded = x[:, None].expand(-1, self.k, -1, -1, -1).reshape(
-            batch_size * self.k, x.shape[1], height, width
-        )
+        expanded = x[:, None].expand(-1, self.k, -1, -1, -1).reshape(batch_size * self.k, x.shape[1], height, width)
         flat_matrices = matrices.reshape(batch_size * self.k, 3, 3)
         candidates = self._warp_images(expanded, flat_matrices)
 
@@ -293,9 +293,7 @@ class SpatialWorstOfK(Attacker):
         # affine_grid uses normalized output -> input coordinates. Convert the
         # inverse pixel transform to normalized coordinates for align_corners=False.
         P = torch.tensor(
-            [[w / 2.0, 0.0, (w - 1.0) / 2.0],
-             [0.0, h / 2.0, (h - 1.0) / 2.0],
-             [0.0, 0.0, 1.0]],
+            [[w / 2.0, 0.0, (w - 1.0) / 2.0], [0.0, h / 2.0, (h - 1.0) / 2.0], [0.0, 0.0, 1.0]],
             device=device,
             dtype=dtype,
         )
@@ -309,13 +307,16 @@ class SpatialWorstOfK(Attacker):
         # grid_sample only has zero padding. Subtract/add fill to obtain an
         # arbitrary constant border value while preserving bilinear interpolation.
         centered = images - self.fill
-        warped = F.grid_sample(
-            centered,
-            grid,
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=False,
-        ) + self.fill
+        warped = (
+            F.grid_sample(
+                centered,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            + self.fill
+        )
         return warped.clamp_(0.0, 1.0)
 
     def _transform_targets(
@@ -375,9 +376,7 @@ class SpatialWorstOfK(Attacker):
         old_area = (bw * bh).clamp(min=1e-6).unsqueeze(1)
 
         valid = (
-            (new_w >= self.min_box_size)
-            & (new_h >= self.min_box_size)
-            & ((new_area / old_area) >= self.min_area_ratio)
+            (new_w >= self.min_box_size) & (new_h >= self.min_box_size) & ((new_area / old_area) >= self.min_area_ratio)
         )
 
         new_xc = (new_x1 + new_x2) / 2.0 / width
@@ -404,7 +403,12 @@ class SpatialWorstOfK(Attacker):
 
         return rows[valid]
 
-    def _score_candidates(self, candidates: torch.Tensor, candidate_targets: torch.Tensor) -> torch.Tensor:
+    def _score_candidates(
+        self,
+        candidates: torch.Tensor,
+        candidate_targets: torch.Tensor,
+        eval_batch_size: int | None = None,
+    ) -> torch.Tensor:
         """Compute one scalar YOLO detection loss for every candidate image."""
         total = candidates.shape[0]
         scores = candidates.new_empty((total,), dtype=torch.float32)
@@ -418,31 +422,37 @@ class SpatialWorstOfK(Attacker):
                 if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.Dropout)):
                     module.eval()
 
-            preds = self.model(candidates, augment=False)
+            chunk_size = eval_batch_size or getattr(self, "eval_batch_size", 4)
+            for start in range(0, total, chunk_size):
+                end = min(start + chunk_size, total)
+                c_chunk = candidates[start:end]
+                preds_chunk = self.model(c_chunk, augment=False)
+                chunk_len = end - start
 
-            for idx in range(total):
-                mask = candidate_targets[:, 0].long() == idx
-                t = candidate_targets[mask]
+                for offset in range(chunk_len):
+                    idx = start + offset
+                    mask = candidate_targets[:, 0].long() == idx
+                    t = candidate_targets[mask]
 
-                # Re-index targets to zero because this is now a one-image loss batch.
-                if t.numel() == 0:
-                    single_batch_idx = torch.zeros((0,), device=candidates.device, dtype=torch.long)
-                    single_cls = torch.zeros((0, 1), device=candidates.device, dtype=torch.float32)
-                    single_boxes = torch.zeros((0, 4), device=candidates.device, dtype=torch.float32)
-                else:
-                    single_batch_idx = torch.zeros((t.shape[0],), device=candidates.device, dtype=torch.long)
-                    single_cls = t[:, 1:2]
-                    single_boxes = t[:, 2:6]
+                    # Re-index targets to zero because this is now a one-image loss batch.
+                    if t.numel() == 0:
+                        single_batch_idx = torch.zeros((0,), device=candidates.device, dtype=torch.long)
+                        single_cls = torch.zeros((0, 1), device=candidates.device, dtype=torch.float32)
+                        single_boxes = torch.zeros((0, 4), device=candidates.device, dtype=torch.float32)
+                    else:
+                        single_batch_idx = torch.zeros((t.shape[0],), device=candidates.device, dtype=torch.long)
+                        single_cls = t[:, 1:2]
+                        single_boxes = t[:, 2:6]
 
-                batch = BatchContainer(
-                    img=candidates[idx : idx + 1],
-                    batch_idx=single_batch_idx,
-                    cls=single_cls,
-                    bboxes=single_boxes,
-                )
-                pred_i = _slice_prediction_batch(preds, idx, total)
-                loss, _ = self._loss_fn(batch, pred_i)
-                scores[idx] = loss.detach().float().sum()
+                    batch = BatchContainer(
+                        img=candidates[idx : idx + 1],
+                        batch_idx=single_batch_idx,
+                        cls=single_cls,
+                        bboxes=single_boxes,
+                    )
+                    pred_i = _slice_prediction_batch(preds_chunk, offset, chunk_len)
+                    loss, _ = self._loss_fn(batch, pred_i)
+                    scores[idx] = loss.detach().float().sum()
 
         finally:
             self.model.train(original_training)

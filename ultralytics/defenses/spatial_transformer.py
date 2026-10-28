@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +20,7 @@ def build_forward_matrix(
     params: torch.Tensor,
     height: int,
     width: int,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Build pixel-space forward affine transformation matrices input -> output.
 
@@ -98,12 +98,12 @@ def matrix_to_grid(
             [0.0, 0.0, 1.0],
         ],
         device=device,
-        dtype=dtype,
+        dtype=torch.float32,
     )
     p_inv = torch.linalg.inv(p)
 
-    theta_h = p_inv.unsqueeze(0) @ forward_matrices @ p.unsqueeze(0)
-    theta = theta_h[:, :2, :]
+    theta_h = p_inv.unsqueeze(0) @ forward_matrices.float() @ p.unsqueeze(0)
+    theta = theta_h[:, :2, :].to(dtype=dtype)
 
     grid = F.affine_grid(theta, size=(batch_size, 3, height, width), align_corners=False)
     return grid
@@ -126,6 +126,8 @@ def rectify_images(
     """
     _, _, h, w = images.shape
     grid = matrix_to_grid(forward_matrices, h, w)
+    if grid.dtype != images.dtype:
+        grid = grid.to(dtype=images.dtype)
 
     centered = images - fill
     rectified = (
@@ -167,6 +169,8 @@ def transform_boxes(
         matrices = matrices.unsqueeze(0).expand(boxes.shape[0], 3, 3)
     elif matrices.ndim == 3 and matrices.shape[0] == 1 and boxes.shape[0] > 1:
         matrices = matrices.expand(boxes.shape[0], 3, 3)
+
+    matrices = matrices.to(device=boxes.device, dtype=boxes.dtype)
 
     x1 = boxes[:, 0]
     y1 = boxes[:, 1]
@@ -436,7 +440,7 @@ class SpatialTransformer(nn.Module):
         self.criterion = None
 
     @property
-    def stn_architecture(self) -> Dict[str, Any]:
+    def stn_architecture(self) -> dict[str, Any]:
         """Return architectural configuration dictionary of STN."""
         return {
             "max_degrees": self.max_degrees,
@@ -455,7 +459,7 @@ class SpatialTransformer(nn.Module):
             result.__dict__[k] = deepcopy(v, memo)
         return result
 
-    def forward(self, images: Union[torch.Tensor, dict], *args, **kwargs) -> Any:
+    def forward(self, images: torch.Tensor | dict, *args, **kwargs) -> Any:
         """Perform autonomous rectification on input images or evaluate batch loss.
 
         Args:
@@ -474,7 +478,8 @@ class SpatialTransformer(nn.Module):
             raise ValueError("SpatialTransformer received a batch dictionary, but no loss method is attached.")
 
         _, _, h, w = images.shape
-        params = self.localization(images)
+        loc_dtype = next(self.localization.parameters()).dtype
+        params = self.localization(images.to(dtype=loc_dtype))
         matrices = build_forward_matrix(params, height=h, width=w, dtype=images.dtype)
         rectified = rectify_images(images, matrices, fill=self.fill)
         return rectified, matrices
@@ -482,12 +487,14 @@ class SpatialTransformer(nn.Module):
     def predict_matrix(self, images: torch.Tensor) -> torch.Tensor:
         """Estimate forward transformation matrix without warping images."""
         _, _, h, w = images.shape
-        params = self.localization(images)
+        loc_dtype = next(self.localization.parameters()).dtype
+        params = self.localization(images.to(dtype=loc_dtype))
         return build_forward_matrix(params, height=h, width=w, dtype=images.dtype)
 
     def predict_params(self, images: torch.Tensor) -> torch.Tensor:
         """Estimate transformation parameters [angle_deg, tx_px, ty_px]."""
-        return self.localization(images)
+        loc_dtype = next(self.localization.parameters()).dtype
+        return self.localization(images.to(dtype=loc_dtype))
 
 
 class STNDetectorWrapper(nn.Module):
@@ -535,9 +542,9 @@ class STNDetectorWrapper(nn.Module):
 
 
 def load_stn_checkpoint(
-    weights_path: Union[str, Path],
+    weights_path: str | Path,
     device: torch.device,
-) -> Tuple[SpatialTransformer, Dict[str, Any]]:
+) -> tuple[SpatialTransformer, dict[str, Any]]:
     """Load trained STN model from checkpoint.
 
     Args:
