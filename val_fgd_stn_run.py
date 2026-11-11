@@ -140,22 +140,22 @@ def parse_args():
     parser.add_argument(
         "--pgd_iters",
         type=int,
-        default=10,
-        help="PGD attack iteration count (default: 10).",
+        default=5,
+        help="PGD attack iteration count (default: 5).",
     )
 
     # BIM Attack Parameters
     parser.add_argument(
         "--bim_eps",
         type=float,
-        default=0.05,
-        help="BIM attack epsilon bound (default: 0.05).",
+        default=8.0 / 255.0,
+        help="BIM attack epsilon bound (default: 8/255).",
     )
     parser.add_argument(
         "--bim_lr",
         type=float,
-        default=0.02,
-        help="BIM attack step size (default: 0.02).",
+        default=2.0 / 255.0,
+        help="BIM attack step size (default: 2/255).",
     )
     parser.add_argument(
         "--bim_iters",

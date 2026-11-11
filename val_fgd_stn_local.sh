@@ -7,19 +7,34 @@ cd "$ROOT"
 # Default paths and parameters
 FGD_WEIGHTS="${1:-"${FGD_WEIGHTS:-fgd_yolo12l.pt}"}"
 STN_WEIGHTS="${2:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_yolo12l_coco_train_traffic5k_ep50_b8_k10_deg30.0_tr0.10/weights/best.pt}"}"
+# FGD_WEIGHTS="${1:-"${FGD_WEIGHTS:-runs/train_fgd_stn_joint/local_fgd_stn_joint_stn_fgd_pretrained_yolo12l_coco_train_traffic5k_ep20_b4/weights/best_fgd.pt}"}"
+# STN_WEIGHTS="${2:-"${STN_WEIGHTS:-runs/train_fgd_stn_joint/local_fgd_stn_joint_stn_fgd_pretrained_yolo12l_coco_train_traffic5k_ep20_b4/weights/best_stn.pt}"}"d
+#STN_WEIGHTS="${2:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_best_coco_train_traffic5k_ep50_b8_k10_deg30.0_tr0.10/weights/best.pt}"}"
+# MODEL="${3:-"${MODEL:-runs/local_adv_adaptive_current_coco_train_traffic5k_ep100_pgd_bim_mim_worstk_0.10_0.10_0.40_0.15/weights/best.pt}"}"
 MODEL="${3:-"${MODEL:-yolo12l.pt}"}"
+# MODEL="${3:-"${MODEL:-runs/train_adv_fgd_stn_adaptive/local_adv_fgd_stn_adaptive_stn_fgd_adapttrue_current_coco_train_traffic5k_ep100-2/weights/best.pt}"}"
 DATA="${4:-"${DATA:-coco_train_traffic5k_test.yaml}"}"
 ATTACK_WEIGHTS="${ATTACK_WEIGHTS:-"current"}"
 MODES="${MODES:-all}"
 ATTACKS="${ATTACKS:-all}"
 SPLIT="${SPLIT:-val}"
 CLASSES=(0 1 2 3 5 6 7 9 11 12)
-BATCH="${BATCH:-8}"
+BATCH="${BATCH:-4}"
 IMGSZ="${IMGSZ:-640}"
 DEVICE="${DEVICE:-0}"
 WORKERS="${WORKERS:-4}"
 PROJECT="${PROJECT:-runs/val_fgd_stn}"
-NAME="${NAME:-"exp"}"
+BASE_NAME="${NAME:-"exp"}"
+
+# Automatically increment NAME if directory already exists to avoid overwriting
+NAME="$BASE_NAME"
+if [[ -d "$PROJECT/$NAME" ]]; then
+  i=2
+  while [[ -d "$PROJECT/${BASE_NAME}${i}" ]]; do
+    ((i++))
+  done
+  NAME="${BASE_NAME}${i}"
+fi
 SEED="${SEED:-0}"
 
 # Setup logging to logs/ directory

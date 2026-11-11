@@ -85,22 +85,26 @@ class FGDSTNPipeline(nn.Module):
         self,
         denoiser: Optional[ResidualDenoiser] = None,
         stn: Optional[SpatialTransformer] = None,
+        freeze_modules: bool = True,
     ) -> None:
-        """Initialize pipeline with optional pretrained FGD and STN modules.
-
-        Args:
-            denoiser (ResidualDenoiser, optional): Trained FGD denoiser module.
-            stn (SpatialTransformer, optional): Trained or identity STN module.
-        """
+        """Initialize defense pipeline."""
         super().__init__()
         self.denoiser = denoiser
         self.stn = stn
 
-        # Ensure defenses are permanently frozen in evaluation mode
+        # Freeze defense modules only when freeze_modules is True
+        if freeze_modules:
+            if self.denoiser is not None:
+                self.denoiser.eval().requires_grad_(False)
+            if self.stn is not None:
+                self.stn.eval().requires_grad_(False)
+
+    def set_trainable(self, mode: bool = True) -> None:
+        """Set training state and gradient computation for defense modules."""
         if self.denoiser is not None:
-            self.denoiser.eval().requires_grad_(False)
+            self.denoiser.train(mode).requires_grad_(mode)
         if self.stn is not None:
-            self.stn.eval().requires_grad_(False)
+            self.stn.train(mode).requires_grad_(mode)
 
     @property
     def has_denoiser(self) -> bool:
@@ -218,21 +222,9 @@ def build_fgd_stn_pipeline(
     allow_identity_fallback: bool = True,
     max_degrees: float = 45.0,
     max_translate: float = 0.15,
+    freeze_modules: bool = True,
 ) -> Tuple[FGDSTNPipeline, Dict[str, Any]]:
-    """Build and initialize an FGDSTNPipeline loading checkpoints from disk.
-
-    Args:
-        fgd_weights (str | Path, optional): Path to trained FGD checkpoint.
-        stn_weights (str | Path, optional): Path to trained STN checkpoint.
-        device (torch.device, optional): Target device for defense modules.
-        allow_identity_fallback (bool): If True, instantiates identity-initialized modules
-            when weight paths are not provided.
-        max_degrees (float): Max rotation degrees for fallback STN module.
-        max_translate (float): Max translation ratio for fallback STN module.
-
-    Returns:
-        Tuple[FGDSTNPipeline, Dict[str, Any]]: Initialized pipeline and loaded metadata dictionary.
-    """
+    """Build and initialize defense pipeline."""
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -246,7 +238,8 @@ def build_fgd_stn_pipeline(
     elif allow_identity_fallback:
         LOGGER.info("No fgd_weights provided; initializing identity ResidualDenoiser.")
         denoiser = ResidualDenoiser().to(device)
-        denoiser.eval().requires_grad_(False)
+        if freeze_modules:
+            denoiser.eval().requires_grad_(False)
         metadata["fgd_meta"] = {"identity_fallback": True}
 
     # 2. Load or instantiate STN module
@@ -257,10 +250,11 @@ def build_fgd_stn_pipeline(
     elif allow_identity_fallback:
         LOGGER.info("No stn_weights provided; initializing identity SpatialTransformer.")
         stn = SpatialTransformer(max_degrees=max_degrees, max_translate=max_translate).to(device)
-        stn.eval().requires_grad_(False)
+        if freeze_modules:
+            stn.eval().requires_grad_(False)
         metadata["stn_meta"] = {"identity_fallback": True}
 
-    pipeline = FGDSTNPipeline(denoiser=denoiser, stn=stn)
+    pipeline = FGDSTNPipeline(denoiser=denoiser, stn=stn, freeze_modules=freeze_modules)
     return pipeline, metadata
 
 
@@ -399,6 +393,7 @@ class PreprocessDetectorWrapper(nn.Module):
         pipeline: FGDSTNPipeline,
         detector: nn.Module,
         mode: str = "none",
+        freeze_pipeline: bool = False,
     ) -> None:
         """Initialize wrapper with defense pipeline and detector.
 
@@ -406,6 +401,7 @@ class PreprocessDetectorWrapper(nn.Module):
             pipeline (FGDSTNPipeline): Defense pipeline.
             detector (nn.Module): Detection model (trainable or frozen).
             mode (str): Preprocessing mode ('none', 'fgd', 'stn', 'fgd_stn', 'stn_fgd').
+            freeze_pipeline (bool): Whether to permanently freeze pipeline parameters (default: False).
         """
         super().__init__()
         self.pipeline = pipeline
@@ -416,8 +412,10 @@ class PreprocessDetectorWrapper(nn.Module):
         self._score_idx: int = 0
         self.current_paths: list = []
 
-        # Keep pipeline permanently frozen and in eval mode
-        self.pipeline.eval().requires_grad_(False)
+        # Ensure pipeline is in eval mode for attack generation without freezing training parameters
+        self.pipeline.eval()
+        if freeze_pipeline:
+            self.pipeline.requires_grad_(False)
 
         # Delegate common attributes for compatibility with attackers and validators
         for attr in ("names", "nc", "stride", "pt_path", "yaml", "args"):

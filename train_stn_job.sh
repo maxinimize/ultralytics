@@ -13,7 +13,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 # Training configuration
-MODEL="${MODEL:-yolo12l.pt}"
+MODEL="${MODEL:-runs/local_adv_adaptive_current_coco_train_traffic5k_ep100_pgd_bim_mim_worstk_0.10_0.10_0.40_0.15/weights/best.pt}"
 DATA="${DATA:-coco_train_traffic5k.yaml}"
 CLASSES=(0 1 2 3 5 6 7 9 11 12)
 EPOCHS="${EPOCHS:-50}"
