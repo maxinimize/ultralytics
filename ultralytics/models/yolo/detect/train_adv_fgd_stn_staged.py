@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import csv
 import io
+import json
 import math
 import time
 import warnings
@@ -20,6 +22,8 @@ from torch import nn
 from ultralytics import __version__
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.attacks.attack_utils import setup_attack_model
+from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
+from ultralytics.data.dataset import YOLODataset
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
     FGDSTNPipeline,
@@ -36,6 +40,7 @@ from ultralytics.models.yolo.detect.val_adv_fgd_stn_staged import (
 )
 from ultralytics.nn.modules.head import OBB, Detect, Pose, Segment
 from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, YAML, colorstr
+from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import (
     autocast,
     convert_optimizer_state_dict_to_fp16,
@@ -46,6 +51,91 @@ from ultralytics.utils.torch_utils import (
 )
 
 HEAD_CLASSES = (Detect, Segment, Pose, OBB)
+
+
+class YOLODatasetStage1Clean(YOLODataset):
+    """Stage 1 Dataset: strictly 100% clean raw samples with no adversarial attacks."""
+
+    def __init__(self, cfg, img_path, batch, data, mode="train", rect=False, stride=32, **kwargs):
+        super().__init__(
+            img_path=img_path,
+            imgsz=cfg.imgsz,
+            batch_size=batch,
+            augment=mode == "train",
+            hyp=cfg,
+            rect=cfg.rect or rect,
+            cache=cfg.cache or None,
+            single_cls=cfg.single_cls or False,
+            stride=stride,
+            pad=0.0 if mode == "train" else 0.5,
+            prefix=colorstr(f"{mode}: "),
+            task=cfg.task,
+            classes=cfg.classes,
+            data=data,
+            fraction=cfg.fraction if mode == "train" else 1.0,
+            **kwargs,
+        )
+        self.attack_names = []
+        self.attack_ratios = []
+        self.p_clean = 1.0
+        self.update_virtual_samples()
+        self.transforms_raw = self.build_transforms(self.cfg)
+
+    def update_virtual_samples(self, attack_ratios=None, seed=None):
+        """Construct virtual samples allocating exactly 100% raw samples."""
+        self.attack_names = []
+        self.attack_ratios = []
+        self.p_clean = 1.0
+        n_raw = len(self.im_files)
+        self.virtual_samples = [(i, "raw") for i in range(n_raw)]
+        LOGGER.info(f"Stage 1 sample allocation:\nraw: {n_raw}/{n_raw} (1.000)")
+
+    def build_transforms(self, hyp: dict | None = None) -> Compose:
+        """Build data augmentation transforms using configured hyp parameters."""
+        if hyp is None:
+            hyp = self.cfg
+        if self.augment:
+            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+            transforms = v8_transforms(self, self.imgsz, hyp)
+        else:
+            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                return_mask=self.use_segments,
+                return_keypoint=self.use_keypoints,
+                return_obb=self.use_obb,
+                batch_idx=True,
+                mask_ratio=getattr(hyp, "mask_ratio", 4),
+                mask_overlap=getattr(hyp, "overlap_mask", True),
+                bgr=getattr(hyp, "bgr", 0.0) if self.augment else 0.0,
+            )
+        )
+        return transforms
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """Fetch image, label, and annotations, marking sample strictly as raw."""
+        orig_idx, sample_type = self.virtual_samples[index]
+        assert sample_type == "raw", f"Stage 1 sample must be 'raw', got {sample_type}"
+        label = self.get_image_and_label(orig_idx)
+        label = self.transforms_raw(label)
+        label["sample_type"] = "raw"
+        label["attack_name"] = None
+        return label
+
+    def __len__(self) -> int:
+        return len(self.virtual_samples)
+
+    def close_mosaic(self, hyp: dict) -> None:
+        """Disable mosaic and other multi-image augmentations."""
+        hyp.mosaic = 0.0
+        hyp.copy_paste = 0.0
+        hyp.mixup = 0.0
+        hyp.cutmix = 0.0
+        self.transforms_raw = self.build_transforms(hyp)
 
 
 def find_detection_head(model: nn.Module) -> tuple[nn.Module | None, int | None]:
@@ -160,6 +250,28 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             raw_freeze_bn if isinstance(raw_freeze_bn, bool) else str(raw_freeze_bn).lower() in ("true", "1", "yes")
         )
 
+        raw_freeze_all_bn = overrides.pop("freeze_all_bn", saved_args.get("freeze_all_bn", None))
+        if raw_freeze_all_bn is not None:
+            self.freeze_all_bn = (
+                raw_freeze_all_bn
+                if isinstance(raw_freeze_all_bn, bool)
+                else str(raw_freeze_all_bn).lower() in ("true", "1", "yes")
+            )
+        else:
+            self.freeze_all_bn = self.stage == 1
+
+        raw_eval_only = overrides.pop("eval_only", saved_args.get("eval_only", False))
+        self.eval_only_mode = (
+            raw_eval_only if isinstance(raw_eval_only, bool) else str(raw_eval_only).lower() in ("true", "1", "yes")
+        )
+
+        raw_eval_epoch0 = overrides.pop("eval_epoch0", saved_args.get("eval_epoch0", False))
+        self.eval_epoch0 = (
+            raw_eval_epoch0
+            if isinstance(raw_eval_epoch0, bool)
+            else str(raw_eval_epoch0).lower() in ("true", "1", "yes")
+        )
+
         raw_strict = overrides.pop("strict_attacks", saved_args.get("strict_attacks", True))
         self.strict_attacks = (
             raw_strict if isinstance(raw_strict, bool) else str(raw_strict).lower() in ("true", "1", "yes")
@@ -172,7 +284,27 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             stage_att_ratios: list[float] = []
             stage_adaptive = False
             stage_eval_w = [1.0]
-            stage_epochs = 5
+            stage_epochs = 3
+            stage_lr0 = 1e-6
+            stage_lrf = 1.0
+            stage_save_period = 1
+
+            overrides.setdefault("mosaic", saved_args.get("mosaic", 0.0))
+            overrides.setdefault("scale", saved_args.get("scale", 0.0))
+            overrides.setdefault("translate", saved_args.get("translate", 0.0))
+            overrides.setdefault("fliplr", saved_args.get("fliplr", 0.0))
+            overrides.setdefault("flipud", saved_args.get("flipud", 0.0))
+            overrides.setdefault("hsv_h", saved_args.get("hsv_h", 0.0))
+            overrides.setdefault("hsv_s", saved_args.get("hsv_s", 0.0))
+            overrides.setdefault("hsv_v", saved_args.get("hsv_v", 0.0))
+            overrides.setdefault("mixup", saved_args.get("mixup", 0.0))
+            overrides.setdefault("cutmix", saved_args.get("cutmix", 0.0))
+            overrides.setdefault("copy_paste", saved_args.get("copy_paste", 0.0))
+            overrides.setdefault("close_mosaic", saved_args.get("close_mosaic", 0))
+            overrides.setdefault("lrf", saved_args.get("lrf", stage_lrf))
+            overrides.setdefault("warmup_epochs", saved_args.get("warmup_epochs", 0.0))
+            overrides.setdefault("warmup_bias_lr", saved_args.get("warmup_bias_lr", 0.0))
+            overrides.setdefault("save_period", saved_args.get("save_period", stage_save_period))
         else:
             stage_p_clean = 0.65
             stage_att_names = ["pgd", "bim", "mim", "worstk"]
@@ -180,6 +312,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             stage_adaptive = True
             stage_eval_w = [0.20, 0.20, 0.15, 0.15, 0.30]
             stage_epochs = 20
+            stage_lr0 = 1e-5
+            stage_lrf = 0.01
+            stage_save_period = -1
 
             # If stage1_weights is provided and resume is not set, use stage1_weights as base model
             if self.stage1_weights and not overrides.get("resume"):
@@ -197,9 +332,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         overrides.setdefault("attack_name", saved_args.get("attack_name", stage_att_names))
         overrides.setdefault("attack_ratio", saved_args.get("attack_ratio", stage_att_ratios))
         overrides.setdefault("epochs", saved_args.get("epochs", stage_epochs))
-        overrides.setdefault("lr0", saved_args.get("lr0", 1e-5))
+        overrides.setdefault("lr0", saved_args.get("lr0", stage_lr0))
         overrides.setdefault("optimizer", saved_args.get("optimizer", "AdamW"))
         overrides.setdefault("warmup_bias_lr", saved_args.get("warmup_bias_lr", 0.0))
+        overrides.setdefault("save_period", saved_args.get("save_period", stage_save_period))
 
         # Attack source
         raw_att_w = overrides.get("attack_weights", attack_weights)
@@ -216,7 +352,14 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         self.args.stage1_weights = self.stage1_weights
         self.args.train_head_only = self.train_head_only
         self.args.freeze_bn = self.freeze_bn
+        self.args.freeze_all_bn = self.freeze_all_bn
+        self.args.eval_only = self.eval_only_mode
+        self.args.eval_epoch0 = self.eval_epoch0
         self.args.strict_attacks = self.strict_attacks
+        self.save_period = int(overrides.get("save_period", getattr(self.args, "save_period", stage_save_period)))
+        self.args.save_period = self.save_period
+        self._frozen_param_snapshots: dict[str, torch.Tensor] = {}
+        self._bn_stat_snapshots: dict[str, dict[str, torch.Tensor | None]] = {}
 
         # Re-ensure stage-specific controller configuration
         if self.stage == 1:
@@ -359,25 +502,52 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         """Freeze non-head parameters and verify parameter isolation before training."""
         super()._setup_train()
 
+        unwrapped = unwrap_model(self.model)
+        head_module, _ = find_detection_head(unwrapped)
+        head_param_ids = {id(p) for p in head_module.parameters()} if head_module is not None else set()
+
+        bn_modules = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.BatchNorm3d, nn.SyncBatchNorm))
+        ]
+        bn_param_ids = {id(p) for m in bn_modules for p in m.parameters()}
+
+        # Freeze all BatchNorm layers if requested
+        if getattr(self, "freeze_all_bn", False):
+            for m in bn_modules:
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad = False
+                m.train = lambda mode=True, mod=m: mod
+
         # Re-verify parameter freezing after _setup_train
         if self.train_head_only:
-            unwrapped = unwrap_model(self.model)
-            head_module, _ = find_detection_head(unwrapped)
-            head_param_ids = {id(p) for p in head_module.parameters()} if head_module is not None else set()
             for k, v in self.model.named_parameters():
-                if id(v) not in head_param_ids or ".dfl." in k:
-                    v.requires_grad = False
-                else:
+                in_head = id(v) in head_param_ids
+                in_bn = id(v) in bn_param_ids
+                if in_head and ".dfl." not in k and not (getattr(self, "freeze_all_bn", False) and in_bn):
                     v.requires_grad = True
+                else:
+                    v.requires_grad = False
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             assert len(trainable_params) > 0, "Detection Head has no trainable parameters! Check layer identification."
             assert all(id(p) in head_param_ids for p in trainable_params), (
                 "Trainable parameters leak outside Detection Head!"
             )
+            if getattr(self, "freeze_all_bn", False):
+                assert not any(id(p) in bn_param_ids for p in trainable_params), (
+                    "BatchNorm parameters must NOT be trainable when freeze_all_bn is enabled!"
+                )
+                assert all(not m.training for m in bn_modules), "All BatchNorm modules must be in eval mode!"
+                assert all(not p.requires_grad for m in bn_modules for p in m.parameters()), (
+                    "All BatchNorm parameters must have requires_grad=False!"
+                )
 
             LOGGER.info(
-                f"Model parameter freezing verified: Train Head Only = {self.train_head_only}. "
+                f"Model parameter freezing verified: Train Head Only = {self.train_head_only}, "
+                f"Freeze All BN = {getattr(self, 'freeze_all_bn', False)}. "
                 f"Frozen params: {len(list(self.model.parameters())) - len(trainable_params)}, "
                 f"Trainable head params: {len(trainable_params)}."
             )
@@ -403,12 +573,19 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 assert all(id(p) in head_param_ids for p in group["params"]), (
                     "Optimizer contains parameters outside Detection Head!"
                 )
+            if getattr(self, "freeze_all_bn", False):
+                assert not any(id(p) in bn_param_ids for p in group["params"]), (
+                    "Optimizer contains BatchNorm parameters while freeze_all_bn is enabled!"
+                )
+
+        self._take_frozen_snapshots()
 
         config_record = {
             "stage": self.stage,
             "stage1_weights": str(self.stage1_weights) if self.stage1_weights else None,
             "train_head_only": self.train_head_only,
             "freeze_bn": self.freeze_bn,
+            "freeze_all_bn": getattr(self, "freeze_all_bn", False),
             "preprocess_mode": self.preprocess_mode,
             "preprocess_mode_description": MODE_DESCRIPTIONS.get(self.preprocess_mode, self.preprocess_mode),
             "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
@@ -437,6 +614,86 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             for k, v in config_record.items():
                 LOGGER.info(f"  {k}: {v}")
 
+    def _take_frozen_snapshots(self):
+        """Take snapshots of all frozen parameters and BatchNorm running statistics for runtime verification."""
+        self._frozen_param_snapshots = {
+            k: v.detach().clone().cpu() for k, v in self.model.named_parameters() if not v.requires_grad
+        }
+        self._bn_stat_snapshots = {}
+        for name, m in self.model.named_modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.BatchNorm3d, nn.SyncBatchNorm)) and (
+                getattr(self, "freeze_all_bn", False) or not m.training
+            ):
+                self._bn_stat_snapshots[name] = {
+                    "running_mean": m.running_mean.detach().clone().cpu() if m.running_mean is not None else None,
+                    "running_var": m.running_var.detach().clone().cpu() if m.running_var is not None else None,
+                    "num_batches_tracked": m.num_batches_tracked.detach().clone().cpu()
+                    if m.num_batches_tracked is not None
+                    else None,
+                }
+
+    def check_frozen_invariants(self, step_name: str = "epoch"):
+        """Verify that frozen model parameters and BN running statistics remain unchanged at runtime."""
+        for name, param in self.model.named_parameters():
+            if name in self._frozen_param_snapshots:
+                orig = self._frozen_param_snapshots[name]
+                curr = param.detach().cpu()
+                if not torch.equal(curr, orig):
+                    raise RuntimeError(f"Runtime check failed: frozen parameter '{name}' mutated at {step_name}!")
+
+        for name, m in self.model.named_modules():
+            if name in self._bn_stat_snapshots:
+                snap = self._bn_stat_snapshots[name]
+                if getattr(self, "freeze_all_bn", False) and m.training:
+                    raise RuntimeError(
+                        f"Runtime check failed: BatchNorm '{name}' was accidentally switched to training mode at {step_name}!"
+                    )
+                if snap["running_mean"] is not None and not torch.equal(
+                    m.running_mean.detach().cpu(), snap["running_mean"]
+                ):
+                    raise RuntimeError(
+                        f"Runtime check failed: BatchNorm running_mean for '{name}' changed at {step_name}!"
+                    )
+                if snap["running_var"] is not None and not torch.equal(
+                    m.running_var.detach().cpu(), snap["running_var"]
+                ):
+                    raise RuntimeError(
+                        f"Runtime check failed: BatchNorm running_var for '{name}' changed at {step_name}!"
+                    )
+                if snap["num_batches_tracked"] is not None and not torch.equal(
+                    m.num_batches_tracked.detach().cpu(), snap["num_batches_tracked"]
+                ):
+                    raise RuntimeError(
+                        f"Runtime check failed: BatchNorm num_batches_tracked for '{name}' changed at {step_name}!"
+                    )
+
+    def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
+        """Build YOLO Dataset for training or validation."""
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)
+        if mode == "train":
+            if self.stage == 1:
+                dataset = YOLODatasetStage1Clean(
+                    self.args,
+                    img_path,
+                    batch,
+                    self.data,
+                    mode=mode,
+                    rect=False,
+                    stride=gs,
+                )
+                assert len(dataset) == len(dataset.im_files), (
+                    f"Stage 1 dataset length ({len(dataset)}) must match number of images ({len(dataset.im_files)})!"
+                )
+                assert all(st == "raw" for _, st in dataset.virtual_samples), (
+                    "Stage 1 virtual samples must all be 'raw'!"
+                )
+                assert len({idx for idx, _ in dataset.virtual_samples}) == len(dataset.im_files), (
+                    "Stage 1 must include all images exactly once per epoch!"
+                )
+                return dataset
+            return super().build_dataset(img_path, mode, batch)
+        return super().build_dataset(img_path, mode, batch)
+
     def build_optimizer(self, model, **kwargs):
         """Ensure optimizer groups only contain trainable YOLO parameters, excluding frozen defenses."""
         optimizer = super().build_optimizer(model, **kwargs)
@@ -445,6 +702,13 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         unwrapped = unwrap_model(model)
         head_module, _ = find_detection_head(unwrapped)
         head_param_ids = {id(p) for p in head_module.parameters()} if head_module is not None else set()
+
+        bn_param_ids = set()
+        if getattr(self, "freeze_all_bn", False):
+            for m in model.modules():
+                if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+                    for p in m.parameters():
+                        bn_param_ids.add(id(p))
 
         for group in optimizer.param_groups:
             filtered = []
@@ -455,6 +719,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                     continue
                 if self.train_head_only and id(p) not in head_param_ids:
                     continue
+                if getattr(self, "freeze_all_bn", False) and id(p) in bn_param_ids:
+                    continue
                 filtered.append(p)
             group["params"] = filtered
 
@@ -463,7 +729,11 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
     def _model_train(self):
         """Set model in training mode while keeping frozen layers and frozen BN in eval mode."""
         self.model.train()
-        if getattr(self, "freeze_bn", True):
+        if getattr(self, "freeze_all_bn", False):
+            for m in self.model.modules():
+                if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+                    m.eval()
+        elif getattr(self, "freeze_bn", True):
             for name, module in self.model.named_modules():
                 if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d, nn.SyncBatchNorm)):
                     mod_params = list(module.parameters())
@@ -501,7 +771,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             "strict_attacks",
         ]:
             if hasattr(validator_args, arg):
-                delattr(validator_args, arg)
+                try:
+                    delattr(validator_args, arg)
+                except AttributeError:
+                    pass
 
         validator = DetectionValidatorAdvFGDSTNStaged(
             getattr(self, "test_loader", None),
@@ -512,16 +785,16 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             preprocess_mode=self.preprocess_mode,
             fgd_weights=self.fgd_weights,
             stn_weights=self.stn_weights,
-            attack_through_preprocess=self.attack_through_preprocess,
+            attack_through_preprocess=getattr(self, "attack_through_preprocess", True),
             stage=self.stage,
             eval_weights=self.eval_weights,
             strict_attacks=self.strict_attacks,
         )
         validator.attacker = getattr(self, "attacker", None)
         validator.attackers = getattr(self, "attackers", {})
-        validator.attack_names = self.attack_names
-        validator.attack_ratios = self.attack_ratios
-        validator.eval_weights = self.eval_weights
+        validator.attack_names = getattr(self, "attack_names", [])
+        validator.attack_ratios = getattr(self, "attack_ratios", [])
+        validator.eval_weights = getattr(self, "eval_weights", None)
         return validator
 
     def _load_checkpoint_state(self, ckpt: dict[str, Any]):
@@ -540,6 +813,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             if "freeze_bn" in ckpt:
                 self.freeze_bn = bool(ckpt["freeze_bn"])
                 self.args.freeze_bn = self.freeze_bn
+            if "freeze_all_bn" in ckpt:
+                self.freeze_all_bn = bool(ckpt["freeze_all_bn"])
+                self.args.freeze_all_bn = self.freeze_all_bn
             if "eval_weights" in ckpt:
                 self.eval_weights = ckpt["eval_weights"]
                 self.args.eval_weights = self.eval_weights
@@ -586,6 +862,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             "stage1_weights": str(self.stage1_weights) if self.stage1_weights else None,
             "train_head_only": self.train_head_only,
             "freeze_bn": self.freeze_bn,
+            "freeze_all_bn": getattr(self, "freeze_all_bn", False),
             "preprocess_mode": self.preprocess_mode,
             "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
             "stn_weights": str(self.stn_weights) if self.stn_weights else None,
@@ -616,9 +893,100 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         self.last.write_bytes(serialized_ckpt)
         if self.best_fitness == self.fitness:
             self.best.write_bytes(serialized_ckpt)
-        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
+        if self.stage == 1:
+            if (self.save_period > 0) and ((self.epoch + 1) % self.save_period == 0):
+                (self.wdir / f"epoch{self.epoch + 1}.pt").write_bytes(serialized_ckpt)
+        else:
+            if (self.save_period > 0) and (self.epoch % self.save_period == 0):
+                (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
         return True
+
+    def run_epoch0_eval(self, save_results: bool = True) -> dict[str, Any]:
+        """Execute Epoch 0 baseline evaluation using the exact Stage 1 validation pipeline.
+
+        Evaluates the base detector with frozen STN->FGD defense on the validation set without
+        initializing the optimizer, scheduler, or adversarial attackers.
+        """
+        if not isinstance(self.model, nn.Module):
+            self.setup_model()
+            self.model = self.model.to(self.device)
+            gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)
+            self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+            self.stride = gs
+            self.set_model_attributes()
+
+        if getattr(self, "test_loader", None) is None:
+            self.test_loader = self.get_dataloader(
+                self.data[self.args.split],
+                batch_size=self.batch_size if self.args.task in {"obb", "semantic", "depth"} else self.batch_size * 2,
+                rank=-1,
+                mode="val",
+            )
+
+        validator = self.get_validator()
+        validator.dataloader = self.test_loader
+
+        if not hasattr(self, "loss_items") or self.loss_items is None:
+            self.loss_items = {
+                "box_loss": torch.tensor(0.0, device=self.device),
+                "cls_loss": torch.tensor(0.0, device=self.device),
+                "dfl_loss": torch.tensor(0.0, device=self.device),
+            }
+
+        prev_epoch = getattr(self, "epoch", 0)
+        self.epoch = 0
+
+        LOGGER.info("\n" + "=" * 60)
+        LOGGER.info(f"Starting Epoch 0 Baseline Validation (Stage {self.stage}, Mode: '{self.preprocess_mode}')...")
+        LOGGER.info("=" * 60)
+
+        stats = validator(self)
+
+        clean_map50 = float(stats.get("metrics/mAP50(B)", 0.0))
+        clean_map50_95 = float(stats.get("metrics/mAP50-95(B)", 0.0))
+        fitness = float(stats.get("fitness", clean_map50_95))
+
+        results_record = {
+            "epoch": 0,
+            "stage": self.stage,
+            "model": str(self.args.model),
+            "preprocess_mode": self.preprocess_mode,
+            "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
+            "stn_weights": str(self.stn_weights) if self.stn_weights else None,
+            "metrics/mAP50(B)": clean_map50,
+            "metrics/mAP50-95(B)": clean_map50_95,
+            "fitness": fitness,
+        }
+
+        if save_results and RANK in {-1, 0}:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            json_file = self.save_dir / "epoch0_results.json"
+            csv_file = self.save_dir / "epoch0_results.csv"
+
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(results_record, f, indent=2)
+
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(results_record.keys()))
+                writer.writeheader()
+                writer.writerow(results_record)
+
+            LOGGER.info(f"Epoch 0 Baseline Results: Clean mAP50={clean_map50:.5f}, Clean mAP50-95={clean_map50_95:.5f}")
+            LOGGER.info(f"Saved Epoch 0 results to:\n  JSON: {json_file}\n  CSV:  {csv_file}\n")
+
+        self.epoch = prev_epoch
+        return results_record
+
+    def eval_only(self) -> dict[str, Any]:
+        """Run standalone evaluation without training."""
+        LOGGER.info("Running in --eval_only mode (no optimizer, scheduler, or adversarial attackers).")
+        return self.run_epoch0_eval(save_results=True)
+
+    def train(self):
+        """Execute training or eval-only depending on configured flags."""
+        if getattr(self.args, "eval_only", False) or getattr(self, "eval_only_mode", False):
+            return self.eval_only()
+        return super().train()
 
     def _do_train(self):
         """Train the model with defense preprocessing, supporting Stage 1 and Stage 2."""
@@ -645,6 +1013,11 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
         self.optimizer.zero_grad()
+
+        if self.stage == 1 and getattr(self, "eval_epoch0", False):
+            LOGGER.info("Evaluating Epoch 0 baseline before commencing Stage 1 training...")
+            self.run_epoch0_eval(save_results=True)
+            self.best_fitness = None
 
         while True:
             self.epoch = epoch
@@ -697,6 +1070,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
 
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
+                if self.stage == 1:
+                    assert all(st == "raw" for st in batch.get("sample_type", [])), (
+                        f"Stage 1 must process only 'raw' clean samples, found {batch.get('sample_type')}"
+                    )
                 # Warmup
                 ni = i + nb * epoch
                 if ni <= nw:
@@ -907,6 +1284,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                     self.optimizer_step()
                     last_opt_step = ni
 
+                    if i == 0:
+                        self.check_frozen_invariants(f"epoch {epoch + 1} batch 0")
+
                     if i % 20 == 0:
                         torch.cuda.empty_cache()
 
@@ -937,7 +1317,15 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
 
                 self.run_callbacks("on_train_batch_end")
 
+            self.check_frozen_invariants(f"epoch {epoch + 1}")
+            if RANK in {-1, 0}:
+                LOGGER.info(f"Epoch {epoch + 1}: Frozen parameters and BatchNorm statistics verified unchanged.")
+
             total_epoch_samples = sum(self.epoch_counts.values())
+            if self.stage == 1:
+                assert self.epoch_counts.get("raw", 0) == total_epoch_samples, (
+                    f"Stage 1 must contain exactly 100% raw samples! Counts: {self.epoch_counts}"
+                )
             if total_epoch_samples > 0 and RANK in {-1, 0}:
                 ratios = {t: self.epoch_counts[t] / total_epoch_samples for t in self.epoch_counts}
                 LOGGER.info(
@@ -1045,5 +1433,6 @@ DetectionTrainer = DetectionTrainerAdvFGDSTNStaged
 __all__ = [
     "DetectionTrainer",
     "DetectionTrainerAdvFGDSTNStaged",
+    "YOLODatasetStage1Clean",
     "find_detection_head",
 ]

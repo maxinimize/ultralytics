@@ -326,13 +326,25 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         if self.training:
             self.device = trainer.device
             self.data = trainer.data
-            self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
-            model = trainer.ema.ema or trainer.model
-            if trainer.args.compile and hasattr(model, "_orig_mod"):
+            self.args.quantize = 16 if (self.device.type != "cpu" and getattr(trainer, "amp", False)) else None
+            model = (getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None)) or trainer.model
+            if getattr(trainer.args, "compile", False) and hasattr(model, "_orig_mod"):
                 model = model._orig_mod
             model = model.float()
-            self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
-            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            loss_items = getattr(trainer, "loss_items", None)
+            if loss_items:
+                self.loss = {k: torch.zeros_like(v) for k, v in loss_items.items()}
+            else:
+                self.loss = {}
+            possible_stop = getattr(getattr(trainer, "stopper", None), "possible_stop", False)
+            trainer_epoch = getattr(trainer, "epoch", 0)
+            trainer_epochs = getattr(trainer, "epochs", 1)
+            self.args.plots &= possible_stop or (trainer_epoch == trainer_epochs - 1)
+            if self.dataloader is None:
+                if getattr(trainer, "test_loader", None) is not None:
+                    self.dataloader = trainer.test_loader
+                else:
+                    self.dataloader = self.get_dataloader(self.data.get(self.args.split), self.args.batch)
             model.eval()
         else:
             if str(self.args.model).endswith(".yaml") and model is None:
@@ -473,7 +485,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             self.attackers = {}
             self.attacker = None
 
-        target_model = (trainer.ema.ema or trainer.model) if trainer is not None else model
+        ema = getattr(trainer, "ema", None)
+        target_model = (getattr(ema, "ema", None) or trainer.model) if trainer is not None else model
         orig_loss = None
         if trainer is not None and target_model is not None and hasattr(target_model, "loss"):
             orig_loss = target_model.loss
@@ -548,7 +561,15 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 self.gather_stats()
                 if RANK in {-1, 0}:
                     stats = self.get_stats()
-                    run_speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1e3 for x in dt)))
+                    try:
+                        n_samples = len(self.dataloader.dataset)
+                    except (TypeError, AttributeError):
+                        try:
+                            n_samples = len(self.dataloader)
+                        except (TypeError, AttributeError):
+                            n_samples = 1
+                    n_samples = n_samples or 1
+                    run_speed = dict(zip(self.speed.keys(), (x.t / n_samples * 1e3 for x in dt)))
                     for k, v in run_speed.items():
                         all_speeds[k] = all_speeds.get(k, 0.0) + v
 
@@ -564,7 +585,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
 
                     if self.training:
                         loss = {k: v.clone().detach() for k, v in self.loss.items()}
-                        if trainer.world_size > 1:
+                        if getattr(trainer, "world_size", 1) > 1:
                             for v in loss.values():
                                 dist.reduce(v, dst=0, op=dist.ReduceOp.AVG)
                         all_losses[run] = {k: v.cpu() / len(self.dataloader) for k, v in loss.items()}

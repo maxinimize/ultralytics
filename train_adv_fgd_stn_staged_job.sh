@@ -85,13 +85,52 @@ CLASSES="${CLASSES:-0 1 2 3 5 6 7 9 11 12}"
 PROJECT="${PROJECT:-${PWD}/runs/train_adv_fgd_stn_staged}"
 JOB_ID="${SLURM_JOB_ID:-local}"
 
+EVAL_ONLY="${EVAL_ONLY:-false}"
+EVAL_EPOCH0="${EVAL_EPOCH0:-false}"
+
 if [ "$STAGE" -eq 1 ]; then
-  EPOCHS="${EPOCHS:-5}"
+  EPOCHS="${EPOCHS:-3}"
+  LR0="${LR0:-1e-6}"
+  LRF="${LRF:-1.0}"
+  WARMUP_EPOCHS="${WARMUP_EPOCHS:-0.0}"
+  WARMUP_BIAS_LR="${WARMUP_BIAS_LR:-0.0}"
+  FREEZE_ALL_BN="${FREEZE_ALL_BN:-true}"
+  MOSAIC="${MOSAIC:-0.0}"
+  SCALE="${SCALE:-0.0}"
+  TRANSLATE="${TRANSLATE:-0.0}"
+  FLIPLR="${FLIPLR:-0.0}"
+  FLIPUD="${FLIPUD:-0.0}"
+  HSV_H="${HSV_H:-0.0}"
+  HSV_S="${HSV_S:-0.0}"
+  HSV_V="${HSV_V:-0.0}"
+  MIXUP="${MIXUP:-0.0}"
+  CUTMIX="${CUTMIX:-0.0}"
+  COPY_PASTE="${COPY_PASTE:-0.0}"
+  CLOSE_MOSAIC="${CLOSE_MOSAIC:-0}"
+  SAVE_PERIOD="${SAVE_PERIOD:-1}"
   P_CLEAN="${P_CLEAN:-1.0}"
   ADAPTIVE_RATIO="${ADAPTIVE_RATIO:-false}"
-  NAME="stage1_clean_finetune_${PREPROCESS_MODE}_ep${EPOCHS}"
+  NAME="${NAME:-stage1_clean_finetune_${PREPROCESS_MODE}_ep${EPOCHS}}"
 elif [ "$STAGE" -eq 2 ]; then
   EPOCHS="${EPOCHS:-20}"
+  LR0="${LR0:-1e-5}"
+  LRF="${LRF:-0.01}"
+  WARMUP_EPOCHS="${WARMUP_EPOCHS:-0.0}"
+  WARMUP_BIAS_LR="${WARMUP_BIAS_LR:-0.0}"
+  FREEZE_ALL_BN="${FREEZE_ALL_BN:-false}"
+  MOSAIC="${MOSAIC:-1.0}"
+  SCALE="${SCALE:-0.5}"
+  TRANSLATE="${TRANSLATE:-0.1}"
+  FLIPLR="${FLIPLR:-0.5}"
+  FLIPUD="${FLIPUD:-0.0}"
+  HSV_H="${HSV_H:-0.015}"
+  HSV_S="${HSV_S:-0.7}"
+  HSV_V="${HSV_V:-0.4}"
+  MIXUP="${MIXUP:-0.0}"
+  CUTMIX="${CUTMIX:-0.0}"
+  COPY_PASTE="${COPY_PASTE:-0.0}"
+  CLOSE_MOSAIC="${CLOSE_MOSAIC:-10}"
+  SAVE_PERIOD="${SAVE_PERIOD:--1}"
   P_CLEAN="${P_CLEAN:-0.65}"
   ADAPTIVE_RATIO="${ADAPTIVE_RATIO:-true}"
   TAU="${TAU:-5.0}"
@@ -99,7 +138,7 @@ elif [ "$STAGE" -eq 2 ]; then
   ATTACK_NAMES="${ATTACK_NAMES:-pgd bim mim worstk}"
   ATTACK_RATIOS="${ATTACK_RATIOS:-0.12 0.05 0.10 0.08}"
   EVAL_WEIGHTS="${EVAL_WEIGHTS:-0.20 0.20 0.15 0.15 0.30}"
-  NAME="stage2_adaptive_at_${PREPROCESS_MODE}_ep${EPOCHS}"
+  NAME="${NAME:-stage2_adaptive_at_${PREPROCESS_MODE}_ep${EPOCHS}}"
 
   if [ -z "$STAGE1_WEIGHTS" ]; then
     DEFAULT_S1="$PROJECT/stage1_clean_finetune/weights/best.pt"
@@ -162,14 +201,29 @@ ARGS=(
   --stn_weights "$STN_WEIGHTS"
   --train_head_only "$TRAIN_HEAD_ONLY"
   --freeze_bn "$FREEZE_BN"
+  --freeze_all_bn "$FREEZE_ALL_BN"
   --data "$DATA_ARG"
   --epochs "$EPOCHS"
   --batch "$BATCH"
   --imgsz "$IMGSZ"
   --optimizer "$OPTIMIZER"
   --lr0 "$LR0"
+  --lrf "$LRF"
   --warmup_epochs "$WARMUP_EPOCHS"
   --warmup_bias_lr "$WARMUP_BIAS_LR"
+  --mosaic "$MOSAIC"
+  --scale "$SCALE"
+  --translate "$TRANSLATE"
+  --fliplr "$FLIPLR"
+  --flipud "$FLIPUD"
+  --hsv_h "$HSV_H"
+  --hsv_s "$HSV_S"
+  --hsv_v "$HSV_V"
+  --mixup "$MIXUP"
+  --cutmix "$CUTMIX"
+  --copy_paste "$COPY_PASTE"
+  --close_mosaic "$CLOSE_MOSAIC"
+  --save_period "$SAVE_PERIOD"
   --device 0
   --workers "$NUM_WORKERS"
   --amp "$AMP"
@@ -179,6 +233,14 @@ ARGS=(
   --name "$NAME"
   --strict_attacks "$STRICT_ATTACKS"
 )
+
+if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then
+  ARGS+=(--eval_only)
+fi
+
+if [[ "$EVAL_EPOCH0" == "true" || "$EVAL_EPOCH0" == "1" ]]; then
+  ARGS+=(--eval_epoch0)
+fi
 
 if [ -n "${CLASSES}" ]; then
   read -r -a CLASS_IDS <<< "$CLASSES"

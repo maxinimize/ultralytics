@@ -58,6 +58,28 @@ def main():
         default=True,
         help="Whether to keep BatchNorm statistics in eval mode for all frozen layers (default: true).",
     )
+    parser.add_argument(
+        "--freeze_all_bn",
+        type=parse_bool,
+        default=None,
+        help="Freeze all YOLO BatchNorm layers in eval mode and freeze affine parameters (default: true for stage 1, false for stage 2).",
+    )
+    parser.add_argument(
+        "--eval_only",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="Evaluate baseline Clean mAP50 and mAP50-95 without training.",
+    )
+    parser.add_argument(
+        "--eval_epoch0",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="Evaluate Epoch 0 baseline before starting Stage 1 training.",
+    )
 
     # Preprocessing and Defense Modules
     parser.add_argument(
@@ -205,6 +227,25 @@ def main():
         default=1.0,
         help="Fraction of dataset to use for short smoke runs.",
     )
+    parser.add_argument("--lrf", type=float, default=None, help="Final learning rate fraction.")
+    parser.add_argument("--mosaic", type=float, default=None, help="Mosaic augmentation probability.")
+    parser.add_argument("--scale", type=float, default=None, help="Scale augmentation gain.")
+    parser.add_argument("--translate", type=float, default=None, help="Translation augmentation fraction.")
+    parser.add_argument("--fliplr", type=float, default=None, help="Horizontal flip probability.")
+    parser.add_argument("--flipud", type=float, default=None, help="Vertical flip probability.")
+    parser.add_argument("--hsv_h", type=float, default=None, help="HSV hue augmentation fraction.")
+    parser.add_argument("--hsv_s", type=float, default=None, help="HSV saturation augmentation fraction.")
+    parser.add_argument("--hsv_v", type=float, default=None, help="HSV value augmentation fraction.")
+    parser.add_argument("--mixup", type=float, default=None, help="MixUp augmentation probability.")
+    parser.add_argument("--cutmix", type=float, default=None, help="CutMix augmentation probability.")
+    parser.add_argument("--copy_paste", type=float, default=None, help="Copy-paste augmentation fraction.")
+    parser.add_argument("--close_mosaic", type=int, default=None, help="Disable mosaic for final N epochs.")
+    parser.add_argument(
+        "--save_period",
+        type=int,
+        default=None,
+        help="Save checkpoint every X epochs (default: 1 for stage 1, -1 for stage 2).",
+    )
 
     args = parser.parse_args()
 
@@ -220,8 +261,26 @@ def main():
 
     # Stage defaults
     if args.stage == 1:
-        default_name = "stage1_clean_finetune"
-        default_epochs = 5
+        default_name = f"stage1_baseline_eval_{mode}" if args.eval_only else "stage1_clean_finetune"
+        default_epochs = 3
+        default_lr0 = 1e-6
+        default_lrf = 1.0
+        default_warmup_epochs = 0.0
+        default_warmup_bias_lr = 0.0
+        default_freeze_all_bn = True
+        default_mosaic = 0.0
+        default_scale = 0.0
+        default_translate = 0.0
+        default_fliplr = 0.0
+        default_flipud = 0.0
+        default_hsv_h = 0.0
+        default_hsv_s = 0.0
+        default_hsv_v = 0.0
+        default_mixup = 0.0
+        default_cutmix = 0.0
+        default_copy_paste = 0.0
+        default_close_mosaic = 0
+        default_save_period = 1
         default_p_clean = 1.0
         default_adaptive = False
         default_att_names = []
@@ -230,6 +289,24 @@ def main():
     else:
         default_name = "stage2_adaptive_at"
         default_epochs = 20
+        default_lr0 = 1e-5
+        default_lrf = 0.01
+        default_warmup_epochs = 0.0
+        default_warmup_bias_lr = 0.0
+        default_freeze_all_bn = False
+        default_mosaic = 1.0
+        default_scale = 0.5
+        default_translate = 0.1
+        default_fliplr = 0.5
+        default_flipud = 0.0
+        default_hsv_h = 0.015
+        default_hsv_s = 0.7
+        default_hsv_v = 0.4
+        default_mixup = 0.0
+        default_cutmix = 0.0
+        default_copy_paste = 0.0
+        default_close_mosaic = 10
+        default_save_period = -1
         default_p_clean = 0.65
         default_adaptive = True
         default_att_names = ["pgd", "bim", "mim", "worstk"]
@@ -237,6 +314,24 @@ def main():
         default_eval_w = [0.20, 0.20, 0.15, 0.15, 0.30]
 
     epochs = args.epochs if args.epochs is not None else default_epochs
+    lr0 = args.lr0 if args.lr0 is not None else default_lr0
+    lrf = args.lrf if args.lrf is not None else default_lrf
+    warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else default_warmup_epochs
+    warmup_bias_lr = args.warmup_bias_lr if args.warmup_bias_lr is not None else default_warmup_bias_lr
+    freeze_all_bn = args.freeze_all_bn if args.freeze_all_bn is not None else default_freeze_all_bn
+    mosaic = args.mosaic if args.mosaic is not None else default_mosaic
+    scale = args.scale if args.scale is not None else default_scale
+    translate = args.translate if args.translate is not None else default_translate
+    fliplr = args.fliplr if args.fliplr is not None else default_fliplr
+    flipud = args.flipud if args.flipud is not None else default_flipud
+    hsv_h = args.hsv_h if args.hsv_h is not None else default_hsv_h
+    hsv_s = args.hsv_s if args.hsv_s is not None else default_hsv_s
+    hsv_v = args.hsv_v if args.hsv_v is not None else default_hsv_v
+    mixup = args.mixup if args.mixup is not None else default_mixup
+    cutmix = args.cutmix if args.cutmix is not None else default_cutmix
+    copy_paste = args.copy_paste if args.copy_paste is not None else default_copy_paste
+    close_mosaic = args.close_mosaic if args.close_mosaic is not None else default_close_mosaic
+    save_period = args.save_period if args.save_period is not None else default_save_period
     p_clean = args.p_clean if args.p_clean is not None else default_p_clean
     adaptive_ratio = args.adaptive_ratio if args.adaptive_ratio is not None else default_adaptive
     attack_name = args.attack_name if args.attack_name is not None else default_att_names
@@ -254,6 +349,9 @@ def main():
         "stage1_weights": args.stage1_weights,
         "train_head_only": args.train_head_only,
         "freeze_bn": args.freeze_bn,
+        "freeze_all_bn": freeze_all_bn,
+        "eval_only": args.eval_only,
+        "eval_epoch0": args.eval_epoch0,
         "model": model_path,
         "data": args.data,
         "epochs": epochs,
@@ -261,9 +359,23 @@ def main():
         "device": args.device,
         "imgsz": args.imgsz,
         "optimizer": args.optimizer,
-        "lr0": args.lr0,
-        "warmup_epochs": args.warmup_epochs,
-        "warmup_bias_lr": args.warmup_bias_lr,
+        "lr0": lr0,
+        "lrf": lrf,
+        "warmup_epochs": warmup_epochs,
+        "warmup_bias_lr": warmup_bias_lr,
+        "mosaic": mosaic,
+        "scale": scale,
+        "translate": translate,
+        "fliplr": fliplr,
+        "flipud": flipud,
+        "hsv_h": hsv_h,
+        "hsv_s": hsv_s,
+        "hsv_v": hsv_v,
+        "mixup": mixup,
+        "cutmix": cutmix,
+        "copy_paste": copy_paste,
+        "close_mosaic": close_mosaic,
+        "save_period": save_period,
         "seed": args.seed,
         "project": args.project,
         "name": exp_name,
@@ -292,7 +404,10 @@ def main():
         overrides["classes"] = args.classes
 
     trainer = DetectionTrainerAdvFGDSTNStaged(overrides=overrides, attack_weights=args.attack_weights)
-    trainer.train()
+    if args.eval_only:
+        trainer.eval_only()
+    else:
+        trainer.train()
 
 
 if __name__ == "__main__":
