@@ -573,6 +573,20 @@ class TestStagedPipeline(unittest.TestCase):
 
     def test_stage1_dataset_clean_sample_allocation(self):
         """Verify Improvement 2: Stage 1 dataset subclass strictly allocates 100% raw samples."""
+        from ultralytics.data.utils import check_det_dataset
+
+        # Full __init__ instantiation test with coco8
+        data = check_det_dataset("coco8.yaml")
+        cfg = get_cfg(overrides={"data": "coco8.yaml", "imgsz": 64})
+        real_dataset = YOLODatasetStage1Clean(cfg, data["train"], batch=2, data=data, mode="train")
+        self.assertTrue(hasattr(real_dataset, "cfg"))
+        self.assertTrue(hasattr(real_dataset, "transforms_raw"))
+        self.assertEqual(len(real_dataset), 4)
+        sample = real_dataset[0]
+        self.assertEqual(sample["sample_type"], "raw")
+        self.assertIsNone(sample["attack_name"])
+
+        # Large scale virtual sample allocation test
         dataset = YOLODatasetStage1Clean.__new__(YOLODatasetStage1Clean)
         dataset.im_files = [f"img_{i}.jpg" for i in range(5000)]
         dataset.update_virtual_samples()

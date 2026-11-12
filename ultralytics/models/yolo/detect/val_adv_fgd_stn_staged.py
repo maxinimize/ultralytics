@@ -84,6 +84,22 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             raw_stage = args.pop("stage", raw_stage)
             raw_strict = args.pop("strict_attacks", raw_strict)
             raw_eval_w = args.pop("eval_weights", raw_eval_w)
+            for k in (
+                "eval_only",
+                "eval_epoch0",
+                "freeze_all_bn",
+                "freeze_bn",
+                "train_head_only",
+                "stage1_weights",
+                "adaptive_ratio",
+                "attack_weights",
+                "attack_ratio",
+                "attack_num",
+                "p_clean",
+                "tau",
+                "update_interval",
+            ):
+                args.pop(k, None)
         elif args is not None:
             for k in (
                 "preprocess_mode",
@@ -93,6 +109,19 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 "stage",
                 "strict_attacks",
                 "eval_weights",
+                "eval_only",
+                "eval_epoch0",
+                "freeze_all_bn",
+                "freeze_bn",
+                "train_head_only",
+                "stage1_weights",
+                "adaptive_ratio",
+                "attack_weights",
+                "attack_ratio",
+                "attack_num",
+                "p_clean",
+                "tau",
+                "update_interval",
             ):
                 if hasattr(args, k):
                     val = getattr(args, k)

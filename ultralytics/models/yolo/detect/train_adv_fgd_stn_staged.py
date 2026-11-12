@@ -57,6 +57,7 @@ class YOLODatasetStage1Clean(YOLODataset):
     """Stage 1 Dataset: strictly 100% clean raw samples with no adversarial attacks."""
 
     def __init__(self, cfg, img_path, batch, data, mode="train", rect=False, stride=32, **kwargs):
+        self.cfg = cfg
         super().__init__(
             img_path=img_path,
             imgsz=cfg.imgsz,
@@ -80,6 +81,7 @@ class YOLODatasetStage1Clean(YOLODataset):
         self.p_clean = 1.0
         self.update_virtual_samples()
         self.transforms_raw = self.build_transforms(self.cfg)
+        self.transforms = self.transforms_raw
 
     def update_virtual_samples(self, attack_ratios=None, seed=None):
         """Construct virtual samples allocating exactly 100% raw samples."""
@@ -94,6 +96,7 @@ class YOLODatasetStage1Clean(YOLODataset):
         """Build data augmentation transforms using configured hyp parameters."""
         if hyp is None:
             hyp = self.cfg
+        hyp = copy(hyp)
         if self.augment:
             hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
             hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
@@ -136,6 +139,16 @@ class YOLODatasetStage1Clean(YOLODataset):
         hyp.mixup = 0.0
         hyp.cutmix = 0.0
         self.transforms_raw = self.build_transforms(hyp)
+        self.transforms = self.transforms_raw
+
+
+def _strip_frozen_bn_train(model: nn.Module) -> None:
+    """Remove monkeypatched train method from BatchNorm modules to allow clean serialization."""
+    if model is None:
+        return
+    for mod in model.modules():
+        if "train" in mod.__dict__:
+            del mod.__dict__["train"]
 
 
 def find_detection_head(model: nn.Module) -> tuple[nn.Module | None, int | None]:
@@ -768,7 +781,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             "stage1_weights",
             "train_head_only",
             "freeze_bn",
+            "freeze_all_bn",
             "strict_attacks",
+            "eval_only",
+            "eval_epoch0",
         ]:
             if hasattr(validator_args, arg):
                 try:
@@ -837,6 +853,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             if isinstance(v, torch.Tensor) and v.is_floating_point():
                 torch.nan_to_num_(v)
         strip_qat(ema)
+        _strip_frozen_bn_train(ema)
 
         live_model = deepcopy(unwrap_model(self.model)).half().to(memory_format=torch.contiguous_format)
         if hasattr(live_model, "criterion"):
@@ -845,6 +862,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             if isinstance(v, torch.Tensor) and v.is_floating_point():
                 torch.nan_to_num_(v)
         strip_qat(live_model)
+        _strip_frozen_bn_train(live_model)
 
         ckpt_data = {
             "epoch": self.epoch,
