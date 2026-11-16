@@ -258,12 +258,22 @@ def isolate_rng(
             atk_list = list(attackers)
         else:
             atk_list = [attackers]
-    saved_atk_states = []
+
+    unique_atks = []
+    seen_ids = set()
     for atk in atk_list:
+        if atk is not None and id(atk) not in seen_ids:
+            seen_ids.add(id(atk))
+            unique_atks.append(atk)
+
+    saved_atk_states = []
+    for atk in unique_atks:
         if hasattr(atk, "state_dict"):
             state = None
-            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+            try:
                 state = atk.state_dict()
+            except (RuntimeError, TypeError, ValueError, AttributeError) as e:
+                LOGGER.debug(f"Could not capture attacker state_dict: {e}")
             saved_atk_states.append((atk, state))
         elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
             saved_atk_states.append((atk, {"generator_state": atk._generator.get_state().clone()}))
@@ -273,8 +283,10 @@ def isolate_rng(
     # Capture DataLoader generator state
     saved_dl_gen_state = None
     if dataloader is not None and hasattr(dataloader, "generator") and dataloader.generator is not None:
-        with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+        try:
             saved_dl_gen_state = dataloader.generator.get_state().clone()
+        except (RuntimeError, TypeError, ValueError, AttributeError) as e:
+            LOGGER.debug(f"Could not capture dataloader generator state: {e}")
 
     # Apply isolated seed if specified
     if seed is not None:
@@ -297,19 +309,28 @@ def isolate_rng(
         for atk, state in saved_atk_states:
             if state is not None:
                 if hasattr(atk, "load_state_dict"):
-                    with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                    try:
                         atk.load_state_dict(state)
+                    except Exception as e:
+                        LOGGER.error(f"Failed to restore attacker state: {e}")
+                        raise
                 elif hasattr(atk, "_generator") and "generator_state" in state:
-                    with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                    try:
                         atk._generator.set_state(state["generator_state"])
+                    except Exception as e:
+                        LOGGER.error(f"Failed to restore generator state: {e}")
+                        raise
 
         if (
             saved_dl_gen_state is not None
             and dataloader is not None
             and getattr(dataloader, "generator", None) is not None
         ):
-            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+            try:
                 dataloader.generator.set_state(saved_dl_gen_state)
+            except Exception as e:
+                LOGGER.error(f"Failed to restore dataloader generator state: {e}")
+                raise
 
         if cuda_states is not None and torch.cuda.is_available():
             with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
@@ -320,6 +341,18 @@ def isolate_rng(
         random.setstate(py_state)
 
 
+TRANSIENT_ATTACKER_ATTRS = (
+    "last_scores",
+    "last_best_indices",
+    "last_params",
+    "last_selected_matrices",
+    "last_selected_params",
+    "last_metadata",
+    "last_clean_images",
+    "last_validity_masks",
+    "last_transformed_targets",
+)
+
 AFFECTED_ATTACK_KEYS = (
     "img",
     "batch_idx",
@@ -329,6 +362,8 @@ AFFECTED_ATTACK_KEYS = (
     "keypoints",
     "segments",
     "obb",
+    "clean_img",
+    "validity_mask",
     "gt_matrix",
     "attack_matrices",
     "gt_params",
@@ -346,43 +381,61 @@ AFFECTED_ATTACK_KEYS = (
 def snapshot_batch_state(batch: dict) -> dict[str, Any]:
     """Snapshot the mutable state of a batch dictionary before attack execution.
 
-    Only captures keys that can be modified or written by adversarial or spatial attacks,
-    avoiding expensive deepcopies of the entire model or immutable dataset fields.
+    Records the complete pre-attack key set and takes non-aliased copies of all
+    potentially modified geometric, label, and defense-specific fields without
+    deepcopying the entire model or immutable dataset metadata.
     """
-    backup = {}
-    for k in AFFECTED_ATTACK_KEYS:
-        if k in batch:
-            v = batch[k]
+    backup: dict[str, Any] = {
+        "_orig_keys": set(batch.keys()),
+        "_saved_fields": {},
+    }
+    for k, v in batch.items():
+        if k in AFFECTED_ATTACK_KEYS or k.startswith(("pre_attack_", "clean_")):
             if isinstance(v, torch.Tensor):
-                backup[k] = v.clone()
+                backup["_saved_fields"][k] = v.clone()
             elif isinstance(v, (list, tuple, dict)):
-                backup[k] = deepcopy(v)
+                backup["_saved_fields"][k] = deepcopy(v)
+            elif hasattr(v, "clone"):
+                backup["_saved_fields"][k] = v.clone()
             else:
-                backup[k] = v
+                backup["_saved_fields"][k] = deepcopy(v)
     return backup
 
 
 def rollback_batch_state(batch: dict, backup: dict[str, Any], attacker: Any = None) -> None:
     """Roll back a batch dictionary to its pre-attack snapshot on attack failure.
 
-    Deletes all newly added attack keys (such as gt_matrix, gt_params, pre_attack_*)
-    and restores the original values of pre-existing keys. Also resets any transient
-    attacker state attributes if an attacker instance is supplied.
+    Deletes all newly added attack keys (via key set difference) and restores
+    pre-existing fields. Also resets transient attacker output cache attributes without
+    resetting model parameters or random generators.
     """
-    # 1. Delete keys introduced by the failed attack
-    for k in AFFECTED_ATTACK_KEYS:
-        if k in batch and k not in backup:
+    orig_keys: set[str] = backup.get("_orig_keys", set())
+    saved_fields: dict[str, Any] = backup.get("_saved_fields", backup)
+
+    # 1. Delete all keys introduced by the attack
+    current_keys = list(batch.keys())
+    for k in current_keys:
+        if orig_keys and k not in orig_keys or not orig_keys and k in AFFECTED_ATTACK_KEYS and k not in saved_fields:
             del batch[k]
 
-    # 2. Restore pre-existing values
-    for k, v in backup.items():
+    # 2. Restore pre-existing values that were saved
+    for k, v in saved_fields.items():
+        if k.startswith("_"):
+            continue
         batch[k] = v
 
-    # 3. Clean transient attacker attributes if present
+    # 3. Clean transient attacker attributes if an attacker instance is supplied
     if attacker is not None:
-        if hasattr(attacker, "last_selected_matrices"):
-            attacker.last_selected_matrices = None
-        if hasattr(attacker, "last_selected_params"):
-            attacker.last_selected_params = None
-        if hasattr(attacker, "last_metadata"):
-            attacker.last_metadata = None
+        target_attackers = [attacker]
+        if hasattr(attacker, "attackers") and isinstance(attacker.attackers, dict):
+            target_attackers.extend(attacker.attackers.values())
+        if hasattr(attacker, "attacker") and attacker.attacker is not None:
+            target_attackers.append(attacker.attacker)
+
+        seen_atk_ids = set()
+        for atk in target_attackers:
+            if atk is not None and id(atk) not in seen_atk_ids:
+                seen_atk_ids.add(id(atk))
+                for attr in TRANSIENT_ATTACKER_ATTRS:
+                    if hasattr(atk, attr):
+                        setattr(atk, attr, None)

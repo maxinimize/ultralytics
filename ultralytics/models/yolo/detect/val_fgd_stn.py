@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
+from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
     VALID_MODES,
@@ -339,6 +340,22 @@ class UnifiedFGDSTNValidator(BaseValidator):
         Returns:
             Dict[str, Dict[str, float]]: Results mapped by mode name.
         """
+        atks = []
+        if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+            atks.extend(self.attackers.values())
+        if getattr(self, "attacker", None) is not None:
+            atks.append(self.attacker)
+        dl = getattr(self, "dataloader", None)
+
+        with isolate_rng(seed=int(seed), attackers=atks, dataloader=dl):
+            return self._execute_run_eval_for_attack(attack, modes, seed=seed)
+
+    def _execute_run_eval_for_attack(
+        self,
+        attack: str,
+        modes: Sequence[str],
+        seed: int = 0,
+    ) -> Dict[str, Dict[str, float]]:
         # Ensure reproducibility
         torch.manual_seed(int(seed))
         np.random.seed(int(seed))
@@ -418,7 +435,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
         attacks: Sequence[str] | str = "all",
         seed: int = 0,
     ) -> Dict[str, Any]:
-        """Orchestrate evaluation across specified preprocessing modes and attacks.
+        """Orchestrate evaluation across specified preprocessing modes and attacks with RNG isolation.
 
         Args:
             modes (Sequence[str] | str): Modes to evaluate (or 'all' for E1-E5).
@@ -429,6 +446,22 @@ class UnifiedFGDSTNValidator(BaseValidator):
             Dict[str, Any]: Consolidated results containing per-attack and per-mode metrics,
                 comparison tables, and export summaries.
         """
+        atks = []
+        if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+            atks.extend(self.attackers.values())
+        if getattr(self, "attacker", None) is not None:
+            atks.append(self.attacker)
+        dl = getattr(self, "dataloader", None)
+
+        with isolate_rng(seed=int(seed), attackers=atks, dataloader=dl):
+            return self._execute_evaluate_all(modes=modes, attacks=attacks, seed=int(seed))
+
+    def _execute_evaluate_all(
+        self,
+        modes: Sequence[str] | str = "all",
+        attacks: Sequence[str] | str = "all",
+        seed: int = 0,
+    ) -> Dict[str, Any]:
         # Resolve modes
         if isinstance(modes, str):
             if modes.strip().lower() == "all":

@@ -131,27 +131,26 @@ def main():
     save_dir = Path(args.project) / args.name
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    validator_args = dict(
-        task="detect",
-        model=args.model,
-        data=args.data,
-        split=args.split,
-        classes=args.classes,
-        conf=args.conf,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        workers=args.workers,
-        project=args.project,
-        name=args.name,
-        preprocess_mode=mode,
-        fgd_weights=args.fgd_weights,
-        stn_weights=args.stn_weights,
-        attack_through_preprocess=args.attack_through_preprocess,
-        attack_name=args.attack_name,
-        eval_weights=args.eval_weights,
-    )
+    validator_args = {
+        "task": "detect",
+        "model": args.model,
+        "data": args.data,
+        "split": args.split,
+        "classes": args.classes,
+        "conf": args.conf,
+        "iou": args.iou,
+        "imgsz": args.imgsz,
+        "batch": args.batch,
+        "device": args.device,
+        "workers": args.workers,
+        "project": args.project,
+        "name": args.name,
+        "preprocess_mode": mode,
+        "fgd_weights": args.fgd_weights,
+        "stn_weights": args.stn_weights,
+        "attack_through_preprocess": args.attack_through_preprocess,
+        "attack_name": args.attack_name,
+    }
     if args.attack_weights is not None:
         validator_args["attack_weights"] = args.attack_weights
     if args.seed is not None:
@@ -165,6 +164,7 @@ def main():
         stn_weights=args.stn_weights,
         attack_through_preprocess=args.attack_through_preprocess,
         attack_weights=args.attack_weights,
+        eval_weights=args.eval_weights,
     )
     validator()
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from copy import deepcopy
+from copy import copy, deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +129,8 @@ class DetectionValidator(BaseValidator):
         _callbacks=None,
         attack_weights: str | Path | None = None,
         strict_attacks: bool = True,
+        eval_weights: Any | None = None,
+        **kwargs: Any,
     ) -> None:
         """Initialize detection validator with necessary variables and settings.
 
@@ -139,18 +141,24 @@ class DetectionValidator(BaseValidator):
             _callbacks (list[Any], optional): List of callback functions.
             attack_weights (str | Path | None, optional): Surrogate weights source ('current' or checkpoint path).
             strict_attacks (bool, optional): Whether to abort immediately on adversarial generation failure.
+            eval_weights (Sequence[float] | dict | None, optional): Evaluation weights for fitness calculation.
         """
         attack_names = []
         attack_ratios = []
-        eval_weights = None
         raw_attack_weights = attack_weights
         raw_strict = strict_attacks
+        raw_eval_w = eval_weights
+
+        # Safely copy args before popping to prevent modifying caller dictionary/namespace
         if isinstance(args, dict):
+            args = dict(args)
             raw_attack_name = args.pop("attack_name", None)
             raw_attack_names = args.pop("attack_names", None)
             raw_ratio = args.pop("ratio", None)
             raw_ratios = args.pop("ratios", None)
-            raw_eval_w = args.pop("eval_weights", None)
+            arg_eval_w = args.pop("eval_weights", None)
+            if raw_eval_w is None:
+                raw_eval_w = arg_eval_w
             raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
             raw_strict = args.pop("strict_attacks", raw_strict)
             if raw_attack_name is not None:
@@ -161,9 +169,8 @@ class DetectionValidator(BaseValidator):
                 attack_ratios = parse_list_arg(raw_ratio, float)
             elif raw_ratios is not None:
                 attack_ratios = parse_list_arg(raw_ratios, float)
-            if raw_eval_w is not None:
-                eval_weights = raw_eval_w
         elif args is not None:
+            args = copy(args)
             for k in (
                 "attack_name",
                 "attack_names",
@@ -179,11 +186,11 @@ class DetectionValidator(BaseValidator):
                         attack_names = parse_list_arg(val, str)
                     elif k in ("ratio", "ratios") and val is not None:
                         attack_ratios = parse_list_arg(val, float)
-                    elif k == "eval_weights" and val is not None:
-                        eval_weights = val
-                    elif k == "attack_weights" and val is not None:
+                    elif k == "eval_weights" and raw_eval_w is None:
+                        raw_eval_w = val
+                    elif k == "attack_weights" and raw_attack_weights is None:
                         raw_attack_weights = val
-                    elif k == "strict_attacks" and val is not None:
+                    elif k == "strict_attacks":
                         raw_strict = val
                     try:
                         delattr(args, k)
@@ -412,10 +419,21 @@ class DetectionValidator(BaseValidator):
         if val_seed is None and trainer is not None:
             val_seed = getattr(getattr(trainer, "args", None), "seed", None)
         val_seed = int(val_seed) if val_seed is not None else 0
-        train_attackers = getattr(trainer, "attackers", getattr(trainer, "attacker", None)) if trainer else None
+
+        active_attackers = []
+        if getattr(self, "attacker", None) is not None:
+            active_attackers.append(self.attacker)
+        if getattr(self, "attackers", None) and isinstance(self.attackers, dict):
+            active_attackers.extend(self.attackers.values())
+        if trainer is not None:
+            if getattr(trainer, "attacker", None) is not None:
+                active_attackers.append(trainer.attacker)
+            if getattr(trainer, "attackers", None) and isinstance(trainer.attackers, dict):
+                active_attackers.extend(trainer.attackers.values())
+
         dl = getattr(trainer, "train_loader", None) if trainer else None
 
-        with isolate_rng(seed=val_seed, attackers=train_attackers, dataloader=dl):
+        with isolate_rng(seed=val_seed, attackers=active_attackers, dataloader=dl):
             return self._execute_validation(trainer=trainer, model=model)
 
     def _execute_validation(self, trainer=None, model=None):

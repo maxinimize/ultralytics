@@ -1033,15 +1033,29 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         clean_map50_95 = float(stats.get("metrics/mAP50-95(B)", 0.0))
         fitness = float(stats.get("fitness", clean_map50_95))
 
-        val_precision = "FP32" if getattr(getattr(validator, "args", None), "quantize", None) != 16 else "FP16"
+        val_ctx = getattr(validator, "last_validation_context", {}) or {}
+        val_precision = val_ctx.get(
+            "precision",
+            "FP32" if getattr(getattr(validator, "args", None), "quantize", None) != 16 else "FP16",
+        )
+        actual_batch = val_ctx.get(
+            "actual_batch",
+            getattr(getattr(validator, "dataloader", None), "batch_size", None)
+            or getattr(getattr(self, "test_loader", None), "batch_size", None)
+            or int(getattr(self, "batch_size", getattr(self.args, "batch", 16))),
+        )
+        effective_imgsz = val_ctx.get("effective_imgsz", getattr(self.args, "imgsz", 640))
+        model_name = val_ctx.get("model_source", str(self.args.model))
+
         results_record = {
             "epoch": eval_epoch,
             "stage": self.stage,
             "model": str(self.args.model),
+            "model_source": model_name,
             "precision": val_precision,
-            "split": str(getattr(self.args, "split", "val")),
-            "imgsz": int(getattr(self.args, "imgsz", 640)),
-            "batch": int(getattr(self, "batch_size", getattr(self.args, "batch", 16))),
+            "split": str(val_ctx.get("split", getattr(self.args, "split", "val"))),
+            "imgsz": effective_imgsz,
+            "batch": int(actual_batch),
             "preprocess_mode": self.preprocess_mode,
             "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
             "stn_weights": str(self.stn_weights) if self.stn_weights else None,
@@ -1156,7 +1170,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             seed_val = getattr(self.args, "seed", None)
             base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
-            needs_reset = False
+            needs_reset = self.stage == 1
             if (
                 self.stage == 2
                 and self.adaptive_controller is not None

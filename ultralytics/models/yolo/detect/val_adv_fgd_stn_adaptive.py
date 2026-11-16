@@ -10,6 +10,7 @@ from typing import Any, Sequence
 import torch
 
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
+from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
     FGDSTNPipeline,
@@ -58,15 +59,21 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         raw_att_through = attack_through_preprocess
         raw_attack_weights = attack_weights
         raw_strict = strict_attacks
+        raw_eval_w = eval_weights
 
         if isinstance(args, dict):
+            args = dict(args)
             raw_mode = args.pop("preprocess_mode", raw_mode)
             raw_fgd_w = args.pop("fgd_weights", raw_fgd_w)
             raw_stn_w = args.pop("stn_weights", raw_stn_w)
             raw_att_through = args.pop("attack_through_preprocess", raw_att_through)
             raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
             raw_strict = args.pop("strict_attacks", raw_strict)
+            arg_eval_w = args.pop("eval_weights", None)
+            if raw_eval_w is None:
+                raw_eval_w = arg_eval_w
         elif args is not None:
+            args = copy(args)
             for k in (
                 "preprocess_mode",
                 "fgd_weights",
@@ -74,6 +81,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                 "attack_through_preprocess",
                 "attack_weights",
                 "strict_attacks",
+                "eval_weights",
             ):
                 if hasattr(args, k):
                     val = getattr(args, k)
@@ -89,6 +97,8 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                         raw_attack_weights = val
                     elif k == "strict_attacks":
                         raw_strict = val
+                    elif k == "eval_weights" and raw_eval_w is None:
+                        raw_eval_w = val
                     try:
                         delattr(args, k)
                     except AttributeError:
@@ -101,6 +111,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             _callbacks=_callbacks,
             attack_weights=raw_attack_weights,
             strict_attacks=raw_strict,
+            eval_weights=raw_eval_w,
             **kwargs,
         )
 
@@ -121,7 +132,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         self.current_pred_matrix: torch.Tensor | None = None
         self._current_hw: tuple[int, int] = (640, 640)
         self.attack_failures = set()
-        self.eval_weights = eval_weights
+        self.eval_weights = raw_eval_w
         self.end2end = False
 
     def _setup_pipeline(self, device: torch.device):
@@ -158,25 +169,49 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         self.pipeline.eval().requires_grad_(False)
 
     def __call__(self, trainer=None, model=None):
-        """Execute multi-attack validation with configured defense preprocessing pipeline."""
+        """Execute multi-attack validation with RNG isolation covering pipeline setup and execution."""
+        val_seed = getattr(self.args, "seed", None)
+        if val_seed is None and trainer is not None:
+            val_seed = getattr(getattr(trainer, "args", None), "seed", None)
+        val_seed = int(val_seed) if val_seed is not None else 0
+
+        active_attackers = []
+        if getattr(self, "attacker", None) is not None:
+            active_attackers.append(self.attacker)
+        if getattr(self, "attackers", None) and isinstance(self.attackers, dict):
+            active_attackers.extend(self.attackers.values())
         if trainer is not None:
-            if hasattr(trainer, "strict_attacks"):
-                self.strict_attacks = bool(trainer.strict_attacks)
-                self.args.strict_attacks = self.strict_attacks
-            if hasattr(trainer, "preprocess_mode"):
-                self.preprocess_mode = canonicalize_mode(trainer.preprocess_mode)
-            if hasattr(trainer, "fgd_weights"):
-                self.fgd_weights = trainer.fgd_weights
-            if hasattr(trainer, "stn_weights"):
-                self.stn_weights = trainer.stn_weights
-            if hasattr(trainer, "pipeline") and trainer.pipeline is not None:
-                self.pipeline = trainer.pipeline
+            if getattr(trainer, "attacker", None) is not None:
+                active_attackers.append(trainer.attacker)
+            if getattr(trainer, "attackers", None) and isinstance(trainer.attackers, dict):
+                active_attackers.extend(trainer.attackers.values())
 
-        target_device = trainer.device if trainer is not None else getattr(self, "device", None)
-        if target_device is None:
-            target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self._setup_pipeline(target_device)
+        dl = getattr(trainer, "train_loader", None) if trainer else None
 
+        with isolate_rng(seed=val_seed, attackers=active_attackers, dataloader=dl):
+            if trainer is not None:
+                if hasattr(trainer, "strict_attacks"):
+                    self.strict_attacks = bool(trainer.strict_attacks)
+                    self.args.strict_attacks = self.strict_attacks
+                if hasattr(trainer, "preprocess_mode"):
+                    self.preprocess_mode = canonicalize_mode(trainer.preprocess_mode)
+                if hasattr(trainer, "fgd_weights"):
+                    self.fgd_weights = trainer.fgd_weights
+                if hasattr(trainer, "stn_weights"):
+                    self.stn_weights = trainer.stn_weights
+                if hasattr(trainer, "pipeline") and trainer.pipeline is not None:
+                    self.pipeline = trainer.pipeline
+                if hasattr(trainer, "eval_weights") and trainer.eval_weights is not None:
+                    self.eval_weights = trainer.eval_weights
+
+            target_device = trainer.device if trainer is not None else getattr(self, "device", None)
+            if target_device is None:
+                target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self._setup_pipeline(target_device)
+            return self._execute_validation(trainer=trainer, model=model)
+
+    def _execute_validation(self, trainer=None, model=None):
+        """Execute validation body inside isolate_rng."""
         if self.attack_through_preprocess and self.preprocess_mode != "none":
             att_desc = "Validation attacks configured to pass through defense preprocessing"
         else:
@@ -187,7 +222,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         )
 
         try:
-            return super().__call__(trainer=trainer, model=model)
+            return super()._execute_validation(trainer=trainer, model=model)
         finally:
             self.current_pred_matrix = None
             self._current_hw = None

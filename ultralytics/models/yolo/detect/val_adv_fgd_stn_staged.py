@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -314,11 +316,101 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         if val_seed is None and trainer is not None:
             val_seed = getattr(getattr(trainer, "args", None), "seed", None)
         val_seed = int(val_seed) if val_seed is not None else 0
-        train_attackers = getattr(trainer, "attackers", getattr(trainer, "attacker", None)) if trainer else None
+
+        active_attackers = []
+        if getattr(self, "attacker", None) is not None:
+            active_attackers.append(self.attacker)
+        if getattr(self, "attackers", None) and isinstance(self.attackers, dict):
+            active_attackers.extend(self.attackers.values())
+        if trainer is not None:
+            if getattr(trainer, "attacker", None) is not None:
+                active_attackers.append(trainer.attacker)
+            if getattr(trainer, "attackers", None) and isinstance(trainer.attackers, dict):
+                active_attackers.extend(trainer.attackers.values())
+
         dl = getattr(trainer, "train_loader", None) if trainer else None
 
-        with isolate_rng(seed=val_seed, attackers=train_attackers, dataloader=dl):
+        with isolate_rng(seed=val_seed, attackers=active_attackers, dataloader=dl):
             return self._execute_validation(trainer=trainer, model=model)
+
+    def record_validation_context(self, trainer=None) -> dict[str, Any]:
+        """Record and log validation configuration context and actual runtime parameters."""
+        is_training = getattr(self, "training", False) or (trainer is not None)
+        if is_training:
+            if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None):
+                model_source = "trainer.ema"
+            elif getattr(trainer, "model", None):
+                model_source = "trainer.model"
+            else:
+                model_source = "trainer"
+        else:
+            model_source = getattr(self.args, "model", "AutoBackend")
+
+        # Determine actual precision
+        val_precision = "FP32" if self.stage == 1 or getattr(self.args, "quantize", None) != 16 else "FP16"
+
+        stride_val = getattr(self, "stride", None)
+        if stride_val is None and trainer is not None:
+            stride_val = getattr(trainer, "stride", None)
+        if stride_val is None:
+            stride_val = 32
+        if isinstance(stride_val, (torch.Tensor, np.ndarray, list, tuple)):
+            stride_max = int(max(stride_val))
+        else:
+            stride_max = int(stride_val)
+        effective_imgsz = check_imgsz(getattr(self.args, "imgsz", 640), stride=stride_max)
+        actual_batch = (
+            getattr(self.dataloader, "batch_size", None)
+            or getattr(getattr(trainer, "test_loader", None), "batch_size", None)
+            or getattr(self.args, "batch", 16)
+            or 16
+        )
+        data_obj = getattr(self, "data", None)
+        if data_obj is None and trainer is not None:
+            data_obj = getattr(trainer, "data", None)
+        dataset_yaml = (
+            data_obj.get("yaml_file", getattr(self.args, "data", "unknown"))
+            if isinstance(data_obj, dict)
+            else getattr(self.args, "data", "unknown")
+        )
+
+        val_seed = getattr(self.args, "seed", None)
+        if val_seed is None and trainer is not None:
+            val_seed = getattr(getattr(trainer, "args", None), "seed", None)
+        val_seed = int(val_seed) if val_seed is not None else 0
+
+        self.last_validation_context = {
+            "epoch": getattr(trainer, "epoch", 0) if trainer else 0,
+            "stage": self.stage,
+            "model_source": str(model_source),
+            "dataset": str(dataset_yaml),
+            "split": str(self.args.split),
+            "requested_imgsz": self.args.imgsz,
+            "effective_imgsz": effective_imgsz,
+            "requested_batch": getattr(self.args, "batch", 16),
+            "actual_batch": int(actual_batch),
+            "seed": val_seed,
+            "precision": val_precision,
+            "preprocess_mode": self.preprocess_mode,
+            "attack_through_preprocess": self.attack_through_preprocess,
+        }
+
+        LOGGER.info(
+            f"Validation Context: Stage={self.stage} | Model={model_source} | Precision={val_precision} | "
+            f"Dataset={dataset_yaml} (split='{self.args.split}') | "
+            f"Batch: requested={getattr(self.args, 'batch', 16)}, actual={actual_batch} | "
+            f"Imgsz: requested={self.args.imgsz}, effective={effective_imgsz} | Seed={val_seed}"
+        )
+
+        if getattr(self, "save_dir", None):
+            try:
+                context_file = Path(self.save_dir) / "validation_context.jsonl"
+                with open(context_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(self.last_validation_context) + "\n")
+            except (OSError, TypeError, ValueError) as e:
+                LOGGER.debug(f"Could not append to validation_context.jsonl: {e}")
+
+        return self.last_validation_context
 
     def _execute_validation(self, trainer=None, model=None):
         if trainer is not None:
@@ -420,6 +512,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 model = attempt_compile(model, device=self.device)
             ch = self.data.get("channels", 3) if isinstance(self.data, dict) else 3
             model.warmup(imgsz=(1 if pt else self.args.batch, ch, imgsz, imgsz))
+
+        self.record_validation_context(trainer=trainer)
 
         # Determine validation runs based on stage
         if self.stage == 1:

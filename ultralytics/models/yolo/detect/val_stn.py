@@ -287,7 +287,18 @@ class STNDetectionValidator(BaseValidator):
                 seed = 0
 
         effective_seed = int(seed)
-        with isolate_rng(seed=effective_seed, attackers=self.attacker):
+
+        # Collect candidate attackers before entering isolate_rng to ensure both trainer and validator attackers are isolated
+        active_attackers = []
+        if getattr(self, "attacker", None) is not None:
+            active_attackers.append(self.attacker)
+        if trainer is not None:
+            if getattr(trainer, "attacker", None) is not None:
+                active_attackers.append(trainer.attacker)
+            if getattr(trainer, "attackers", None) and isinstance(trainer.attackers, dict):
+                active_attackers.extend(trainer.attackers.values())
+
+        with isolate_rng(seed=effective_seed, attackers=active_attackers):
             if trainer is not None:
                 self.device = trainer.device
                 self.stn = trainer.stn
@@ -319,9 +330,9 @@ class STNDetectionValidator(BaseValidator):
             # Standardize main summary metrics
             if "worstk_stn/mAP50-95" in all_results:
                 all_results["worstk/mAP50-95"] = all_results["worstk_stn/mAP50-95"]
-                all_results["worstk/mAP50"] = all_results["worstk_stn/mAP50"]
+                all_results["worstk/mAP50"] = all_results.get("worstk_stn/mAP50", 0.0)
             if "clean_stn/mAP50-95" in all_results:
                 all_results["clean/mAP50-95"] = all_results["clean_stn/mAP50-95"]
-                all_results["clean/mAP50"] = all_results["clean_stn/mAP50"]
+                all_results["clean/mAP50"] = all_results.get("clean_stn/mAP50", 0.0)
 
             return all_results
