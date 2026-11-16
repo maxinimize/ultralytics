@@ -536,25 +536,27 @@ class TestStagedPipeline(unittest.TestCase):
         trainer.attack_names = []
         trainer.attackers = {}
         trainer.attacker = None
+        trainer.attack_model = None
         trainer.device = self.device
         trainer.preprocess_mode = "stn_fgd"
         trainer.fgd_weights = str(self.fgd_path)
         trainer.stn_weights = str(self.stn_path)
         trainer.save_dir = self.temp_dir / "parity_exp"
+        trainer.save_dir.mkdir(parents=True, exist_ok=True)
         trainer.eval_weights = [1.0]
         trainer.strict_attacks = True
         trainer.train_head_only = True
         trainer.freeze_all_bn = True
         trainer.callbacks = {}
 
-        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "split": "val"}
+        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "val": "val_dummy", "split": "val"}
         args = get_cfg(DEFAULT_CFG)
         args.imgsz = 640
         args.attack_weights = "current"
         args.model = "yolo12l.pt"
         args.split = "val"
         args.task = "detect"
-        args.batch = 4
+        args.batch = 2
         args.augment = False
         args.quantize = None
         args.plots = False
@@ -570,6 +572,42 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertEqual(val1.preprocess_mode, "stn_fgd")
         self.assertTrue(val1.pipeline.has_stn)
         self.assertTrue(val1.pipeline.has_denoiser)
+
+        dummy_batch = {
+            "img": torch.rand(2, 3, 640, 640),
+            "sample_type": ["raw", "raw"],
+            "batch_idx": torch.tensor([0, 1], dtype=torch.long),
+            "cls": torch.tensor([[0.0], [1.0]], dtype=torch.float32),
+            "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]], dtype=torch.float32),
+            "ori_shape": [(640, 640), (640, 640)],
+            "ratio_pad": [((1.0, 1.0), (0.0, 0.0)), ((1.0, 1.0), (0.0, 0.0))],
+            "im_file": ["img1.jpg", "img2.jpg"],
+        }
+        mock_loader = type(
+            "MockLoader", (list,), {"dataset": type("Dataset", (), {"im_files": ["img1.jpg", "img2.jpg"]})()}
+        )([copy.deepcopy(dummy_batch)])
+        trainer.test_loader = mock_loader
+
+        # 1. Run Epoch 0 evaluation without optimizer
+        trainer.optimizer = None
+        trainer.scheduler = None
+        results_epoch0 = trainer.run_epoch0_eval(save_results=True)
+        self.assertIsNone(trainer.optimizer)
+        self.assertIsNone(trainer.scheduler)
+        self.assertTrue((trainer.save_dir / "epoch0_results.json").exists())
+        self.assertTrue((trainer.save_dir / "epoch0_results.csv").exists())
+
+        # 2. Run regular Stage 1 validation
+        val_train = trainer.get_validator()
+        val_train.dataloader = type(
+            "MockLoader", (list,), {"dataset": type("Dataset", (), {"im_files": ["img1.jpg", "img2.jpg"]})()}
+        )([copy.deepcopy(dummy_batch)])
+        trainer.epoch = 1
+        results_stage1 = val_train(trainer)
+
+        self.assertEqual(results_epoch0["metrics/mAP50(B)"], results_stage1["metrics/mAP50(B)"])
+        self.assertEqual(results_epoch0["metrics/mAP50-95(B)"], results_stage1["metrics/mAP50-95(B)"])
+        self.assertEqual(results_epoch0["fitness"], results_stage1["fitness"])
 
     def test_stage1_dataset_clean_sample_allocation(self):
         """Verify Improvement 2: Stage 1 dataset subclass strictly allocates 100% raw samples."""
@@ -806,6 +844,101 @@ class TestStagedPipeline(unittest.TestCase):
         # Unwarp back to canvas using m_forward_trans
         recovered_boxes = transform_boxes(t_xyxy, m_forward_trans, height=h, width=w, clip=False)
         self.assertTrue(torch.allclose(recovered_boxes, orig_boxes, atol=1e-3))
+
+    def test_staged_validator_postprocess_single_unwarp(self):
+        """Verify postprocess unwarps bounding boxes exactly once across normal detector and list[dict] inputs."""
+        from types import SimpleNamespace
+
+        def _build_validator(cls, stage=1):
+            val = cls.__new__(cls)
+            val.stage = stage
+            val.pipeline = object()
+            val._current_hw = (640, 640)
+            val.args = SimpleNamespace(
+                conf=0.25, iou=0.45, task="detect", single_cls=False, agnostic_nms=False, max_det=300
+            )
+            val.nc = 1
+            val.end2end = False
+            return val
+
+        val_s1 = _build_validator(DetectionValidatorAdvFGDSTNStaged, stage=1)
+        val_s2 = _build_validator(DetectionValidatorAdvFGDSTNStaged, stage=2)
+        val_parent = _build_validator(DetectionValidatorAdvFGDSTNAdaptive)
+
+        # +10 pixel horizontal translation: [10, 20, 30, 40] must unwarp to [20, 20, 40, 40], never [30, 20, 50, 40]
+        params_shift = torch.tensor([[0.0, 10.0, 0.0]])
+        m_shift = build_forward_matrix(params_shift, 640, 640)
+        for v in [val_s1, val_s2, val_parent]:
+            v.current_pred_matrix = m_shift
+
+        # Entry 1: Normal detector raw tensor output passing through real NMS
+        # Center=(20, 30), w=20, h=20 -> [10, 20, 30, 40]
+        raw_preds = torch.zeros(1, 5, 1)
+        raw_preds[0, 0, 0] = 20.0
+        raw_preds[0, 1, 0] = 30.0
+        raw_preds[0, 2, 0] = 20.0
+        raw_preds[0, 3, 0] = 20.0
+        raw_preds[0, 4, 0] = 0.9
+
+        out_s1 = val_s1.postprocess(raw_preds.clone())
+        out_s2 = val_s2.postprocess(raw_preds.clone())
+        out_parent = val_parent.postprocess(raw_preds.clone())
+        expected_box = torch.tensor([[20.0, 20.0, 40.0, 40.0]])
+        wrong_double_unwarp_box = torch.tensor([[30.0, 20.0, 50.0, 40.0]])
+
+        self.assertTrue(torch.allclose(out_s1[0]["bboxes"], expected_box))
+        self.assertFalse(torch.allclose(out_s1[0]["bboxes"], wrong_double_unwarp_box))
+        self.assertTrue(torch.allclose(out_s1[0]["bboxes"], out_s2[0]["bboxes"]))
+        self.assertTrue(torch.allclose(out_s1[0]["bboxes"], out_parent[0]["bboxes"]))
+
+        # Entry 2: list[dict] input
+        preds_dict = [
+            {
+                "bboxes": torch.tensor([[10.0, 20.0, 30.0, 40.0]]),
+                "conf": torch.tensor([0.9]),
+                "cls": torch.tensor([0.0]),
+            }
+        ]
+        out_dict = val_s1.postprocess(copy.deepcopy(preds_dict))
+        self.assertTrue(torch.allclose(out_dict[0]["bboxes"], expected_box))
+
+        # Identity matrix leaves coordinates unchanged
+        params_id = torch.tensor([[0.0, 0.0, 0.0]])
+        val_s1.current_pred_matrix = build_forward_matrix(params_id, 640, 640)
+        out_id = val_s1.postprocess(copy.deepcopy(preds_dict))
+        self.assertTrue(torch.allclose(out_id[0]["bboxes"], torch.tensor([[10.0, 20.0, 30.0, 40.0]])))
+
+        # Empty predictions (raw below conf threshold and empty list[dict])
+        raw_empty = torch.zeros(1, 5, 1)
+        raw_empty[0, :4, 0] = torch.tensor([20.0, 30.0, 20.0, 20.0])
+        raw_empty[0, 4, 0] = 0.01
+        self.assertEqual(val_s1.postprocess(raw_empty)[0]["bboxes"].numel(), 0)
+        dict_empty = [{"bboxes": torch.zeros((0, 4)), "conf": torch.zeros(0), "cls": torch.zeros(0)}]
+        self.assertEqual(val_s1.postprocess(dict_empty)[0]["bboxes"].numel(), 0)
+
+        # No STN: pipeline or matrix is None
+        val_no_stn = _build_validator(DetectionValidatorAdvFGDSTNStaged)
+        val_no_stn.pipeline = None
+        val_no_stn.current_pred_matrix = None
+        out_no_stn = val_no_stn.postprocess(copy.deepcopy(preds_dict))
+        self.assertTrue(torch.allclose(out_no_stn[0]["bboxes"], torch.tensor([[10.0, 20.0, 30.0, 40.0]])))
+
+        # Clip, degenerate box filtering, and extra synchronization
+        val_s1.current_pred_matrix = m_shift
+        dict_deg = [
+            {
+                "bboxes": torch.tensor([[10.0, 20.0, 30.0, 40.0], [635.0, 20.0, 640.0, 40.0]]),
+                "conf": torch.tensor([0.9, 0.8]),
+                "cls": torch.tensor([0.0, 0.0]),
+                "extra": torch.tensor([[100.0], [200.0]]),
+            }
+        ]
+        out_deg = val_s1.postprocess(dict_deg)
+        self.assertEqual(out_deg[0]["bboxes"].shape, (1, 4))
+        self.assertTrue(torch.allclose(out_deg[0]["bboxes"], expected_box))
+        self.assertTrue(torch.allclose(out_deg[0]["conf"], torch.tensor([0.9])))
+        self.assertTrue(torch.allclose(out_deg[0]["cls"], torch.tensor([0.0])))
+        self.assertTrue(torch.allclose(out_deg[0]["extra"], torch.tensor([[100.0]])))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,6 @@ from ultralytics.defenses.fgd_stn_pipeline import (
     canonicalize_mode,
     transform_batch_bboxes_for_stn,
 )
-from ultralytics.defenses.spatial_transformer import transform_boxes
 from ultralytics.models.yolo.detect.val_adv_adaptive import (
     parse_list_arg,
 )
@@ -282,42 +281,6 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             self.current_pred_matrix = None
 
         return batch
-
-    def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
-        """Perform NMS and unwarp bounding boxes back to canvas coordinates if STN was applied."""
-        if isinstance(preds, (list, tuple)) and len(preds) > 0 and isinstance(preds[0], dict):
-            processed_preds = preds
-        else:
-            processed_preds = super().postprocess(preds)
-
-        if self.current_pred_matrix is not None and self.pipeline is not None:
-            h, w = self._current_hw
-            unwarped_preds = []
-            for si, pred_dict in enumerate(processed_preds):
-                boxes = pred_dict.get("bboxes")
-                if boxes is None or boxes.numel() == 0:
-                    unwarped_preds.append(pred_dict)
-                    continue
-
-                m_si = self.current_pred_matrix[si]
-                mapped_boxes = transform_boxes(boxes, m_si, height=h, width=w, clip=True)
-
-                bw = mapped_boxes[:, 2] - mapped_boxes[:, 0]
-                bh = mapped_boxes[:, 3] - mapped_boxes[:, 1]
-                valid = (bw > 0.0) & (bh > 0.0)
-
-                new_dict = {
-                    "bboxes": mapped_boxes[valid],
-                    "conf": pred_dict["conf"][valid],
-                    "cls": pred_dict["cls"][valid],
-                }
-                if "extra" in pred_dict and pred_dict["extra"] is not None:
-                    new_dict["extra"] = pred_dict["extra"][valid]
-                unwarped_preds.append(new_dict)
-
-            return unwarped_preds
-
-        return processed_preds
 
     def __call__(self, trainer=None, model=None):
         """Execute staged validation process with defense preprocessing and proper fitness computation."""
