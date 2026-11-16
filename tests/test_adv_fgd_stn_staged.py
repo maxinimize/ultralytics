@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -557,7 +558,13 @@ class TestStagedPipeline(unittest.TestCase):
         trainer.eval_weights = [1.0]
         trainer.strict_attacks = True
 
-        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "val": "val_dummy", "split": "val"}
+        data = {
+            "nc": 10,
+            "names": {i: f"cls_{i}" for i in range(10)},
+            "channels": 3,
+            "val": "val_dummy",
+            "split": "val",
+        }
         args = get_cfg(DEFAULT_CFG)
         args.imgsz = 640
         args.attack_weights = "current"
@@ -636,7 +643,13 @@ class TestStagedPipeline(unittest.TestCase):
         trainer.freeze_all_bn = True
         trainer.callbacks = {}
 
-        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "val": "val_dummy", "split": "val"}
+        data = {
+            "nc": 10,
+            "names": {i: f"cls_{i}" for i in range(10)},
+            "channels": 3,
+            "val": "val_dummy",
+            "split": "val",
+        }
         args = get_cfg(DEFAULT_CFG)
         args.imgsz = 640
         args.attack_weights = "current"
@@ -1158,7 +1171,13 @@ class TestStagedPipeline(unittest.TestCase):
         trainer.freeze_all_bn = True
         trainer.callbacks = {}
 
-        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "val": "val_dummy", "split": "val"}
+        data = {
+            "nc": 10,
+            "names": {i: f"cls_{i}" for i in range(10)},
+            "channels": 3,
+            "val": "val_dummy",
+            "split": "val",
+        }
         args = get_cfg(DEFAULT_CFG)
         args.imgsz = 640
         args.attack_weights = "current"
@@ -1192,6 +1211,233 @@ class TestStagedPipeline(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx2:
             trainer.eval_only()
         self.assertIn("only supported for Stage 1", str(ctx2.exception))
+
+    def test_validation_attacker_current_mode_training_vs_final_eval(self):
+        """Verify Item 5: In current mode, training val targets EMA while final_eval targets best.pt."""
+        model_early_best = MockYOLOModel()
+        with torch.no_grad():
+            model_early_best.model[0].conv.weight.fill_(5.0)
+
+        model_last_ema = MockYOLOModel()
+        with torch.no_grad():
+            model_last_ema.model[0].conv.weight.fill_(1.0)
+
+        best_orig_weight = model_early_best.model[0].conv.weight.clone()
+        ema_orig_weight = model_last_ema.model[0].conv.weight.clone()
+
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 2
+        trainer.device = self.device
+        trainer.preprocess_mode = "none"
+        trainer.fgd_weights = None
+        trainer.stn_weights = None
+        trainer.pipeline = None
+        trainer.attack_through_preprocess = False
+        trainer.save_dir = self.temp_dir / "val_item5_current"
+        trainer.save_dir.mkdir(parents=True, exist_ok=True)
+        trainer.eval_weights = [1.0]
+        trainer.strict_attacks = True
+        trainer.attack_names = ["worstk"]
+        trainer.attack_ratios = [1.0]
+        trainer.attack_weights = "current"
+        trainer.callbacks = {}
+        trainer.epoch = 10
+        trainer.ema = SimpleNamespace(ema=model_last_ema)
+        trainer.model = model_last_ema
+        trainer.loss_items = {
+            "box_loss": torch.tensor(0.0),
+            "cls_loss": torch.tensor(0.0),
+            "dfl_loss": torch.tensor(0.0),
+        }
+
+        data = {
+            "nc": 10,
+            "names": {i: f"cls_{i}" for i in range(10)},
+            "channels": 3,
+            "val": "val_dummy",
+            "split": "val",
+        }
+        args = get_cfg(DEFAULT_CFG)
+        args.imgsz = 640
+        args.attack_weights = "current"
+        args.model = "mock.pt"
+        args.split = "val"
+        args.task = "detect"
+        args.batch = 2
+        args.augment = False
+        args.quantize = None
+        args.plots = False
+        args.compile = False
+        trainer.data = data
+        trainer.args = args
+
+        dummy_batch = {
+            "img": torch.rand(2, 3, 640, 640),
+            "sample_type": ["raw", "raw"],
+            "batch_idx": torch.tensor([0, 1], dtype=torch.long),
+            "cls": torch.tensor([[0.0], [1.0]], dtype=torch.float32),
+            "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]], dtype=torch.float32),
+            "ori_shape": [(640, 640), (640, 640)],
+            "ratio_pad": [((1.0, 1.0), (0.0, 0.0)), ((1.0, 1.0), (0.0, 0.0))],
+            "im_file": ["img1.jpg", "img2.jpg"],
+        }
+        mock_loader = type(
+            "MockLoader", (list,), {"dataset": type("Dataset", (), {"im_files": ["img1.jpg", "img2.jpg"]})()}
+        )([copy.deepcopy(dummy_batch)])
+        trainer.test_loader = mock_loader
+
+        val = trainer.get_validator()
+        val.dataloader = mock_loader
+
+        # 1. Training-time validation: must target model_last_ema (weight=1.0)
+        val(trainer)
+        self.assertIn("worstk", val.attackers)
+        surrogate_train = val.attackers["worstk"].model
+        self.assertAlmostEqual(surrogate_train.model[0].conv.weight.mean().item(), 1.0, places=4)
+
+        # 2. final_eval (trainer=None, model=model_early_best): must target model_early_best (weight=5.0)
+        val.dataloader = type(
+            "MockLoader", (list,), {"dataset": type("Dataset", (), {"im_files": ["img1.jpg", "img2.jpg"]})()}
+        )([copy.deepcopy(dummy_batch)])
+        val(model=model_early_best)
+        self.assertIn("worstk", val.attackers)
+        surrogate_final = val.attackers["worstk"].model
+        self.assertAlmostEqual(surrogate_final.model[0].conv.weight.mean().item(), 5.0, places=4)
+
+        # 3. Verify evaluated models' weights and states are completely unharmed
+        self.assertTrue(torch.equal(model_early_best.model[0].conv.weight.cpu(), best_orig_weight.cpu()))
+        self.assertTrue(torch.equal(model_last_ema.model[0].conv.weight.cpu(), ema_orig_weight.cpu()))
+
+    def test_validation_attacker_fixed_surrogate_mode(self):
+        """Verify Item 5: Fixed surrogate mode targets the fixed model in both training val and final_eval."""
+        fixed_surrogate_model = MockYOLOModel()
+        with torch.no_grad():
+            fixed_surrogate_model.model[0].conv.weight.fill_(10.0)
+
+        fixed_ckpt_path = self.temp_dir / "fixed_surrogate.pt"
+        torch.save({"model": fixed_surrogate_model}, fixed_ckpt_path)
+
+        model_early_best = MockYOLOModel()
+        with torch.no_grad():
+            model_early_best.model[0].conv.weight.fill_(5.0)
+
+        model_last_ema = MockYOLOModel()
+        with torch.no_grad():
+            model_last_ema.model[0].conv.weight.fill_(1.0)
+
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 2
+        trainer.device = self.device
+        trainer.preprocess_mode = "none"
+        trainer.fgd_weights = None
+        trainer.stn_weights = None
+        trainer.pipeline = None
+        trainer.attack_through_preprocess = False
+        trainer.save_dir = self.temp_dir / "val_item5_fixed"
+        trainer.save_dir.mkdir(parents=True, exist_ok=True)
+        trainer.eval_weights = [1.0]
+        trainer.strict_attacks = True
+        trainer.attack_names = ["worstk"]
+        trainer.attack_ratios = [1.0]
+        trainer.attack_weights = str(fixed_ckpt_path)
+        trainer.callbacks = {}
+        trainer.epoch = 10
+        trainer.ema = SimpleNamespace(ema=model_last_ema)
+        trainer.model = model_last_ema
+        trainer.loss_items = {
+            "box_loss": torch.tensor(0.0),
+            "cls_loss": torch.tensor(0.0),
+            "dfl_loss": torch.tensor(0.0),
+        }
+
+        data = {
+            "nc": 10,
+            "names": {i: f"cls_{i}" for i in range(10)},
+            "channels": 3,
+            "val": "val_dummy",
+            "split": "val",
+        }
+        args = get_cfg(DEFAULT_CFG)
+        args.imgsz = 640
+        args.attack_weights = str(fixed_ckpt_path)
+        args.model = "mock.pt"
+        args.split = "val"
+        args.task = "detect"
+        args.batch = 2
+        args.augment = False
+        args.quantize = None
+        args.plots = False
+        args.compile = False
+        trainer.data = data
+        trainer.args = args
+
+        val = trainer.get_validator()
+
+        # Training-time val targets fixed surrogate (10.0)
+        val.setup_validation_attackers(["worstk"], model=None, trainer=trainer)
+        self.assertAlmostEqual(val.attackers["worstk"].model.model[0].conv.weight.mean().item(), 10.0, places=4)
+
+        # final_eval targets the exact same fixed surrogate (10.0), NOT downgrading to best.pt (5.0)
+        val.setup_validation_attackers(["worstk"], model=model_early_best, trainer=None)
+        self.assertAlmostEqual(val.attackers["worstk"].model.model[0].conv.weight.mean().item(), 10.0, places=4)
+
+    def test_validation_attacker_missing_fixed_weights_raises_error(self):
+        """Verify Item 5: Specifying a non-existent attack_weights file raises FileNotFoundError and does not fallback."""
+        val = DetectionValidatorAdvFGDSTNStaged(
+            stage=2,
+            attack_weights=str(self.temp_dir / "non_existent_weights.pt"),
+            args={"imgsz": 640, "task": "detect"},
+        )
+        val.device = self.device
+        with self.assertRaises(FileNotFoundError):
+            val.setup_validation_attackers(["worstk"], model=MockYOLOModel(), trainer=None)
+
+    def test_standalone_validator_consecutive_models(self):
+        """Verify Item 5: Standalone validator following multiple models updates attackers without stale models."""
+        model_a = MockYOLOModel()
+        with torch.no_grad():
+            model_a.model[0].conv.weight.fill_(2.0)
+
+        model_b = MockYOLOModel()
+        with torch.no_grad():
+            model_b.model[0].conv.weight.fill_(8.0)
+
+        val = DetectionValidatorAdvFGDSTNStaged(
+            stage=2,
+            attack_weights="current",
+            args={"imgsz": 640, "task": "detect"},
+        )
+        val.device = self.device
+
+        # First run on Model A
+        val.setup_validation_attackers(["worstk"], model=model_a, trainer=None)
+        self.assertAlmostEqual(val.attackers["worstk"].model.model[0].conv.weight.mean().item(), 2.0, places=4)
+
+        # Second run on Model B
+        val.setup_validation_attackers(["worstk"], model=model_b, trainer=None)
+        self.assertAlmostEqual(val.attackers["worstk"].model.model[0].conv.weight.mean().item(), 8.0, places=4)
+
+    def test_stage1_skips_attacker_construction_stage2_builds_attackers(self):
+        """Verify Item 5: Stage 1 validator skips attacker construction while Stage 2 builds attackers."""
+        val_s1 = DetectionValidatorAdvFGDSTNStaged(
+            stage=1,
+            attack_weights="current",
+            args={"imgsz": 640, "task": "detect"},
+        )
+        val_s1.device = self.device
+        val_s1.setup_validation_attackers(["worstk"], model=MockYOLOModel(), trainer=None)
+        self.assertEqual(val_s1.attackers, {})
+        self.assertIsNone(val_s1.attacker)
+
+        val_s2 = DetectionValidatorAdvFGDSTNStaged(
+            stage=2,
+            attack_weights="current",
+            args={"imgsz": 640, "task": "detect"},
+        )
+        val_s2.device = self.device
+        val_s2.setup_validation_attackers(["worstk"], model=MockYOLOModel(), trainer=None)
+        self.assertIn("worstk", val_s2.attackers)
+        self.assertIsNotNone(val_s2.attacker)
 
 
 if __name__ == "__main__":

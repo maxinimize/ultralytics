@@ -47,6 +47,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         stn_weights: str | Path | None = None,
         attack_through_preprocess: bool = False,
         eval_weights: Sequence[float] | None = None,
+        attack_weights: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize validator with defense pipeline and preprocessing options."""
@@ -54,14 +55,16 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         raw_fgd_w = fgd_weights
         raw_stn_w = stn_weights
         raw_att_through = attack_through_preprocess
+        raw_attack_weights = attack_weights
 
         if isinstance(args, dict):
             raw_mode = args.pop("preprocess_mode", raw_mode)
             raw_fgd_w = args.pop("fgd_weights", raw_fgd_w)
             raw_stn_w = args.pop("stn_weights", raw_stn_w)
             raw_att_through = args.pop("attack_through_preprocess", raw_att_through)
+            raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
         elif args is not None:
-            for k in ("preprocess_mode", "fgd_weights", "stn_weights", "attack_through_preprocess"):
+            for k in ("preprocess_mode", "fgd_weights", "stn_weights", "attack_through_preprocess", "attack_weights"):
                 if hasattr(args, k):
                     val = getattr(args, k)
                     if k == "preprocess_mode":
@@ -72,12 +75,21 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                         raw_stn_w = val
                     elif k == "attack_through_preprocess":
                         raw_att_through = val
+                    elif k == "attack_weights":
+                        raw_attack_weights = val
                     try:
                         delattr(args, k)
                     except AttributeError:
                         pass
 
-        super().__init__(dataloader=dataloader, save_dir=save_dir, args=args, _callbacks=_callbacks, **kwargs)
+        super().__init__(
+            dataloader=dataloader,
+            save_dir=save_dir,
+            args=args,
+            _callbacks=_callbacks,
+            attack_weights=raw_attack_weights,
+            **kwargs,
+        )
 
         self.preprocess_mode = canonicalize_mode(raw_mode or "none")
         self.fgd_weights = raw_fgd_w

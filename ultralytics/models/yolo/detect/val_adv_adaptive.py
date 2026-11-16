@@ -13,11 +13,23 @@ import torch
 import torch.distributed as dist
 
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_utils import extract_detection_model, setup_attack_model
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
+from ultralytics.defenses.fgd_stn_pipeline import PreprocessDetectorWrapper
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, colorstr, nms, ops
+from ultralytics.utils import (
+    DEFAULT_CFG_DICT,
+    LOGGER,
+    RANK,
+    TQDM,
+    IterableSimpleNamespace,
+    callbacks,
+    colorstr,
+    nms,
+    ops,
+)
 from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
@@ -70,7 +82,14 @@ class DetectionValidator(BaseValidator):
         >>> validator()
     """
 
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None) -> None:
+    def __init__(
+        self,
+        dataloader=None,
+        save_dir=None,
+        args=None,
+        _callbacks=None,
+        attack_weights: str | Path | None = None,
+    ) -> None:
         """Initialize detection validator with necessary variables and settings.
 
         Args:
@@ -78,14 +97,17 @@ class DetectionValidator(BaseValidator):
             save_dir (Path, optional): Directory to save results.
             args (dict[str, Any], optional): Arguments for the validator.
             _callbacks (list[Any], optional): List of callback functions.
+            attack_weights (str | Path | None, optional): Surrogate weights source ('current' or checkpoint path).
         """
         attack_names = []
         attack_ratios = []
         eval_weights = None
+        raw_attack_weights = attack_weights
         if isinstance(args, dict):
             raw_attack_name = args.pop("attack_name", None)
             raw_ratio = args.pop("ratio", None)
             raw_eval_w = args.pop("eval_weights", None)
+            raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
             if raw_attack_name is not None:
                 attack_names = parse_list_arg(raw_attack_name, str)
             if raw_ratio is not None:
@@ -93,28 +115,19 @@ class DetectionValidator(BaseValidator):
             if raw_eval_w is not None:
                 eval_weights = raw_eval_w
         elif args is not None:
-            if hasattr(args, "attack_name"):
-                raw_attack_name = getattr(args, "attack_name", None)
-                if raw_attack_name is not None:
-                    attack_names = parse_list_arg(raw_attack_name, str)
+            for k in ("attack_name", "ratio", "eval_weights", "attack_weights"):
+                if hasattr(args, k):
+                    val = getattr(args, k)
+                    if k == "attack_name" and val is not None:
+                        attack_names = parse_list_arg(val, str)
+                    elif k == "ratio" and val is not None:
+                        attack_ratios = parse_list_arg(val, float)
+                    elif k == "eval_weights" and val is not None:
+                        eval_weights = val
+                    elif k == "attack_weights" and val is not None:
+                        raw_attack_weights = val
                     try:
-                        delattr(args, "attack_name")
-                    except AttributeError:
-                        pass
-            if hasattr(args, "ratio"):
-                raw_ratio = getattr(args, "ratio", None)
-                if raw_ratio is not None:
-                    attack_ratios = parse_list_arg(raw_ratio, float)
-                    try:
-                        delattr(args, "ratio")
-                    except AttributeError:
-                        pass
-            if hasattr(args, "eval_weights"):
-                raw_eval_w = getattr(args, "eval_weights", None)
-                if raw_eval_w is not None:
-                    eval_weights = raw_eval_w
-                    try:
-                        delattr(args, "eval_weights")
+                        delattr(args, k)
                     except AttributeError:
                         pass
 
@@ -129,6 +142,9 @@ class DetectionValidator(BaseValidator):
         self.attack_names = attack_names
         self.attack_ratios = attack_ratios
         self.eval_weights = eval_weights
+        self.attack_weights = raw_attack_weights
+        self._fixed_surrogate = None
+        self._fixed_surrogate_source = None
         self.last_attack_maps = {}
         self.attack_failures = set()
 
@@ -143,6 +159,12 @@ class DetectionValidator(BaseValidator):
             (dict): Dictionary containing validation statistics.
         """
         self.training = trainer is not None
+        if trainer is not None and getattr(self, "attack_weights", None) is None:
+            self.attack_weights = (
+                getattr(trainer, "attack_weights", None)
+                or getattr(trainer, "_attack_weights_arg", None)
+                or getattr(getattr(trainer, "args", None), "attack_weights", None)
+            )
         augment = self.args.augment and (not self.training)
         if self.training:
             self.device = trainer.device
@@ -190,7 +212,9 @@ class DetectionValidator(BaseValidator):
                 self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
                 LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
 
-            if str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"}:
+            if isinstance(getattr(self, "data", None), dict):
+                pass
+            elif str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"}:
                 self.data = check_det_dataset(self.args.data)
             elif self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data, split=self.args.split)
@@ -207,7 +231,8 @@ class DetectionValidator(BaseValidator):
             model.eval()
             if self.args.compile:
                 model = attempt_compile(model, device=self.device)
-            model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz, imgsz))  # warmup
+            ch = self.data.get("channels", 3) if isinstance(self.data, dict) else 3
+            model.warmup(imgsz=(1 if pt else self.args.batch, ch, imgsz, imgsz))  # warmup
 
         # Determine the runs to execute: Always evaluate clean (raw) + specified attacks
         raw_att = (
@@ -260,18 +285,7 @@ class DetectionValidator(BaseValidator):
 
         self.run_callbacks("on_val_start")
 
-        # Align adversarial validation attack target with evaluated model (Strict White-Box evaluation)
-        if self.training and getattr(trainer, "attack_model", None) is None:
-            eval_surrogate = deepcopy(unwrap_model(model)).float()
-            for p in eval_surrogate.parameters():
-                p.requires_grad_(False)
-            eval_surrogate.eval()
-            val_attackers = {}
-            for att in eval_attacks:
-                val_attackers[att] = build_attacker(att, model=eval_surrogate, img_size=self.args.imgsz)
-            if val_attackers:
-                self.attackers = val_attackers
-                self.attacker = val_attackers.get(eval_attacks[0], None)
+        self.setup_validation_attackers(eval_attacks, model=model, trainer=trainer)
 
         for run in unique_runs:
             if run != "raw":
@@ -464,6 +478,141 @@ class DetectionValidator(BaseValidator):
         if target is None:
             raise ValueError("No model provided or available on validator to compute validation loss.")
         return target.loss(batch, preds)
+
+    def setup_validation_attackers(
+        self,
+        eval_attacks: list[str],
+        model: Any,
+        trainer: Any = None,
+    ) -> None:
+        """Setup validation attackers with unified source model resolution.
+
+        Supports training-time validation (targeting EMA), final evaluation (targeting best.pt),
+        and standalone validation (targeting evaluated model), or fixed surrogate weights.
+
+        Args:
+            eval_attacks (list[str]): List of attack names to evaluate.
+            model (Any): The model being validated (AutoBackend, DetectionModel, or checkpoint).
+            trainer (Any, optional): Trainer instance if called during training.
+        """
+        if getattr(self, "stage", None) == 1 or not eval_attacks:
+            self.attackers = {}
+            self.attacker = None
+            return
+
+        # Determine attack_weights source semantics
+        if getattr(self, "attack_weights", None) is None and trainer is not None:
+            self.attack_weights = (
+                getattr(trainer, "attack_weights", None)
+                or getattr(trainer, "_attack_weights_arg", None)
+                or getattr(getattr(trainer, "args", None), "attack_weights", None)
+            )
+        if getattr(self, "attack_weights", None) is None and hasattr(self, "args"):
+            self.attack_weights = getattr(self.args, "attack_weights", None)
+
+        att_w = self.attack_weights
+        is_current = (att_w is None) or (isinstance(att_w, str) and att_w.strip().lower() in {"", "none", "current"})
+
+        imgsz = getattr(self.args, "imgsz", 640)
+        target_device = getattr(self, "device", None)
+        if target_device is None:
+            target_device = getattr(trainer, "device", None) or torch.device(
+                "cuda:0" if torch.cuda.is_available() else "cpu"
+            )
+            self.device = target_device
+
+        if is_current:
+            if trainer is not None:
+                source_model = (
+                    (getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None))
+                    or getattr(trainer, "model", None)
+                    or model
+                )
+                epoch_val = getattr(trainer, "epoch", -1)
+                source_desc = f"trainer.ema/model (epoch {epoch_val})"
+            else:
+                source_model = model
+                model_name = (
+                    getattr(model, "pt_path", None)
+                    or getattr(getattr(model, "model", None), "yaml_file", None)
+                    or type(model).__name__
+                )
+                source_desc = f"evaluated model ({model_name})"
+
+            raw_detector = extract_detection_model(source_model)
+            eval_surrogate = deepcopy(raw_detector).float()
+            if hasattr(eval_surrogate, "args") and isinstance(eval_surrogate.args, dict):
+                eval_surrogate.args = IterableSimpleNamespace(**eval_surrogate.args)
+            elif not hasattr(eval_surrogate, "args") or eval_surrogate.args is None:
+                eval_surrogate.args = IterableSimpleNamespace(**DEFAULT_CFG_DICT)
+            for p in eval_surrogate.parameters():
+                p.requires_grad_(False)
+            eval_surrogate.eval()
+            eval_surrogate.to(self.device)
+            if hasattr(eval_surrogate, "init_criterion") and getattr(eval_surrogate, "criterion", None) is None:
+                try:
+                    eval_surrogate.criterion = eval_surrogate.init_criterion()
+                except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+                    LOGGER.warning(f"Could not pre-initialize criterion on surrogate: {e}")
+            target_surrogate = eval_surrogate
+            self._fixed_surrogate = None
+            self._fixed_surrogate_source = None
+            unwrapped_info = f"unwrapped from {type(source_model).__name__} to {type(raw_detector).__name__}"
+        else:
+            # Fixed surrogate mode: must evaluate on fixed surrogate, cannot fallback to current
+            if getattr(self, "_fixed_surrogate", None) is not None and getattr(
+                self, "_fixed_surrogate_source", None
+            ) == str(att_w):
+                target_surrogate = self._fixed_surrogate
+                target_surrogate.to(self.device)
+                source_desc = f"cached fixed weights ({att_w})"
+            else:
+                nc = 80
+                if isinstance(getattr(self, "data", None), dict):
+                    nc = self.data.get("nc", 80)
+                target_surrogate = setup_attack_model(
+                    att_w,
+                    device=self.device,
+                    nc=nc,
+                    training=False,
+                    imgsz=imgsz,
+                )
+                self._fixed_surrogate = target_surrogate
+                self._fixed_surrogate_source = str(att_w)
+                source_desc = f"fixed weights ({att_w})"
+            unwrapped_info = "fixed_surrogate (no unwrapping)"
+
+        if (
+            getattr(self, "attack_through_preprocess", False)
+            and getattr(self, "preprocess_mode", "none") != "none"
+            and getattr(self, "pipeline", None) is not None
+        ):
+            LOGGER.info(
+                f"Validation attacks configured to pass through defense preprocessing (mode='{self.preprocess_mode}')."
+            )
+            val_attack_target = PreprocessDetectorWrapper(
+                pipeline=self.pipeline,
+                detector=target_surrogate,
+                mode=self.preprocess_mode,
+            )
+            target_desc = f"PreprocessDetectorWrapper(mode={self.preprocess_mode}) -> YOLO"
+        else:
+            LOGGER.info("Validation attacks target YOLO detector directly (defense applied only during inference).")
+            val_attack_target = target_surrogate
+            target_desc = "pure YOLO detector directly"
+
+        weight_checksum = sum(p.sum().item() for p in target_surrogate.parameters() if p.numel() > 0)
+        mode_str = "current (evaluated YOLO)" if is_current else f"fixed surrogate ({att_w})"
+        LOGGER.info(
+            f"Validation attack source setup: mode={mode_str} | source={source_desc} | "
+            f"{unwrapped_info} | target={target_desc} | weight_checksum={weight_checksum:.6f}"
+        )
+
+        val_attackers = {}
+        for att in eval_attacks:
+            val_attackers[att] = build_attacker(att, model=val_attack_target, img_size=imgsz)
+        self.attackers = val_attackers
+        self.attacker = val_attackers.get(eval_attacks[0], None)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation."""

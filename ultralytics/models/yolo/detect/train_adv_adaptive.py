@@ -773,11 +773,18 @@ class DetectionTrainer(BaseTrainer):
             if hasattr(validator_args, arg):
                 delattr(validator_args, arg)
 
-        validator = DetectionValidatorAdvAdaptive(
-            getattr(self, "test_loader", None), save_dir=self.save_dir, args=validator_args, _callbacks=self.callbacks
+        raw_att_w = (
+            getattr(self, "attack_weights", None)
+            or getattr(self, "_attack_weights_arg", None)
+            or getattr(self.args, "attack_weights", None)
         )
-        validator.attacker = getattr(self, "attacker", None)
-        validator.attackers = getattr(self, "attackers", {})
+        validator = DetectionValidatorAdvAdaptive(
+            getattr(self, "test_loader", None),
+            save_dir=self.save_dir,
+            args=validator_args,
+            _callbacks=self.callbacks,
+            attack_weights=raw_att_w,
+        )
         validator.attack_names = self.attack_names
         validator.attack_ratios = self.attack_ratios
         validator.eval_weights = self.eval_weights

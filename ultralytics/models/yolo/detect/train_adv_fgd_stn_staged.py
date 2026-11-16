@@ -792,6 +792,11 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 except AttributeError:
                     pass
 
+        raw_att_w = (
+            getattr(self, "attack_weights", None)
+            or getattr(self, "_attack_weights_arg", None)
+            or getattr(self.args, "attack_weights", None)
+        )
         validator = DetectionValidatorAdvFGDSTNStaged(
             getattr(self, "test_loader", None),
             save_dir=self.save_dir,
@@ -805,9 +810,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             stage=self.stage,
             eval_weights=self.eval_weights,
             strict_attacks=self.strict_attacks,
+            attack_weights=raw_att_w,
         )
-        validator.attacker = getattr(self, "attacker", None)
-        validator.attackers = getattr(self, "attackers", {})
         validator.attack_names = getattr(self, "attack_names", [])
         validator.attack_ratios = getattr(self, "attack_ratios", [])
         validator.eval_weights = getattr(self, "eval_weights", None)

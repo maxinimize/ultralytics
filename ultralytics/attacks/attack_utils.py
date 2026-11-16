@@ -1,4 +1,5 @@
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -12,7 +13,7 @@ def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
     Set up the attack model based on the provided parameters.
 
     Args:
-        attack_weights (str): Path to the attack model weights.
+        attack_weights (str | Path | torch.nn.Module): Path to the attack model weights or existing module.
         device (torch.device): Device.
         nc (int): Number of classes.
         training (bool): Whether in training mode.
@@ -24,8 +25,18 @@ def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
     if not attack_weights:
         raise ValueError("attack_weights must be provided for setup_attack_model()")
 
+    if isinstance(attack_weights, torch.nn.Module):
+        model = attack_weights.to(device)
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        return model
+
+    if isinstance(attack_weights, (str, Path)) and not Path(attack_weights).exists():
+        raise FileNotFoundError(f"Attack weights file '{attack_weights}' not found.")
+
     # load checkpoint
-    ckpt = torch.load(attack_weights, map_location="cpu", weights_only=False)
+    ckpt = torch.load(str(attack_weights), map_location="cpu", weights_only=False)
 
     # model configuration
     cfg = ckpt.get("model").yaml if hasattr(ckpt.get("model", {}), "yaml") else None
@@ -59,6 +70,13 @@ def setup_attack_model(attack_weights, device, nc, training=False, imgsz=640):
     # set model to eval mode if not training
     if not training:
         attack_model.eval()
+    for p in attack_model.parameters():
+        p.requires_grad_(False)
+    if hasattr(attack_model, "init_criterion") and getattr(attack_model, "criterion", None) is None:
+        try:
+            attack_model.criterion = attack_model.init_criterion()
+        except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+            LOGGER.warning(f"Could not pre-initialize criterion on surrogate: {e}")
 
     return attack_model
 

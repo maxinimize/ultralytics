@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,13 +10,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
-from ultralytics.attacks.attack_utils import extract_detection_model
+from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
     FGDSTNPipeline,
-    PreprocessDetectorWrapper,
     build_fgd_stn_pipeline,
     canonicalize_mode,
 )
@@ -28,7 +25,7 @@ from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
 )
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, RANK, TQDM, IterableSimpleNamespace, callbacks, ops
+from ultralytics.utils import LOGGER, RANK, TQDM, callbacks, ops
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
 
@@ -63,6 +60,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         stage: int = 1,
         eval_weights: Sequence[float] | dict[str, float] | None = None,
         strict_attacks: bool = True,
+        attack_weights: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize staged detection validator with defense pipeline and stage options."""
@@ -73,6 +71,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         raw_stage = stage
         raw_strict = strict_attacks
         raw_eval_w = eval_weights
+        raw_attack_weights = attack_weights
 
         if isinstance(args, dict):
             raw_mode = args.pop("preprocess_mode", raw_mode)
@@ -82,6 +81,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             raw_stage = args.pop("stage", raw_stage)
             raw_strict = args.pop("strict_attacks", raw_strict)
             raw_eval_w = args.pop("eval_weights", raw_eval_w)
+            raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
             for k in (
                 "eval_only",
                 "eval_epoch0",
@@ -90,7 +90,6 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 "train_head_only",
                 "stage1_weights",
                 "adaptive_ratio",
-                "attack_weights",
                 "attack_ratio",
                 "attack_num",
                 "p_clean",
@@ -137,12 +136,21 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                         raw_strict = val
                     elif k == "eval_weights":
                         raw_eval_w = val
+                    elif k == "attack_weights":
+                        raw_attack_weights = val
                     try:
                         delattr(args, k)
                     except AttributeError:
                         pass
 
-        super().__init__(dataloader=dataloader, save_dir=save_dir, args=args, _callbacks=_callbacks, **kwargs)
+        super().__init__(
+            dataloader=dataloader,
+            save_dir=save_dir,
+            args=args,
+            _callbacks=_callbacks,
+            attack_weights=raw_attack_weights,
+            **kwargs,
+        )
 
         self.preprocess_mode = canonicalize_mode(raw_mode or "stn_fgd")
         self.fgd_weights = raw_fgd_w
@@ -356,7 +364,9 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
                 self.args.batch = model.metadata.get("batch", 1)
 
-            if str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"}:
+            if isinstance(getattr(self, "data", None), dict):
+                pass
+            elif str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"}:
                 self.data = check_det_dataset(self.args.data)
             elif self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data, split=self.args.split)
@@ -372,7 +382,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             model.eval()
             if self.args.compile:
                 model = attempt_compile(model, device=self.device)
-            model.warmup(imgsz=(1 if pt else self.args.batch, self.data["channels"], imgsz, imgsz))
+            ch = self.data.get("channels", 3) if isinstance(self.data, dict) else 3
+            model.warmup(imgsz=(1 if pt else self.args.batch, ch, imgsz, imgsz))
 
         # Determine validation runs based on stage
         if self.stage == 1:
@@ -438,55 +449,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
 
         # Build validation attackers if needed
         self.attack_failures = set()
-        if eval_attacks:
-            imgsz = getattr(self.args, "imgsz", 640)
-            target_surrogate = None
-            if trainer is not None and getattr(trainer, "attack_model", None) is not None:
-                target_surrogate = trainer.attack_model
-            else:
-                # White-box AT / final evaluation: Attack the evaluated model (live/EMA during training, or best.pt during final_eval)
-                source_model = (
-                    ((getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None)) or trainer.model)
-                    if trainer is not None
-                    else model
-                )
-                raw_detector = extract_detection_model(source_model)
-                eval_surrogate = deepcopy(raw_detector).float()
-                if hasattr(eval_surrogate, "args") and isinstance(eval_surrogate.args, dict):
-                    eval_surrogate.args = IterableSimpleNamespace(**eval_surrogate.args)
-                elif not hasattr(eval_surrogate, "args") or eval_surrogate.args is None:
-                    eval_surrogate.args = IterableSimpleNamespace(**DEFAULT_CFG_DICT)
-                for p in eval_surrogate.parameters():
-                    p.requires_grad_(False)
-                eval_surrogate.eval()
-                if hasattr(eval_surrogate, "init_criterion") and getattr(eval_surrogate, "criterion", None) is None:
-                    try:
-                        eval_surrogate.criterion = eval_surrogate.init_criterion()
-                    except (AttributeError, TypeError, ValueError, RuntimeError) as e:
-                        LOGGER.warning(f"Could not pre-initialize criterion on surrogate: {e}")
-                target_surrogate = eval_surrogate
-
-            if self.attack_through_preprocess and self.preprocess_mode != "none":
-                LOGGER.info(
-                    f"Validation attacks configured to pass through defense preprocessing (mode='{self.preprocess_mode}')."
-                )
-                val_attack_target = PreprocessDetectorWrapper(
-                    pipeline=self.pipeline,
-                    detector=target_surrogate,
-                    mode=self.preprocess_mode,
-                )
-            else:
-                LOGGER.info("Validation attacks target YOLO detector directly (defense applied only during inference).")
-                val_attack_target = target_surrogate
-
-            val_attackers = {}
-            for att in eval_attacks:
-                val_attackers[att] = build_attacker(att, model=val_attack_target, img_size=imgsz)
-            self.attackers = val_attackers
-            self.attacker = val_attackers.get(eval_attacks[0], None)
-        else:
-            self.attackers = {}
-            self.attacker = None
+        self.setup_validation_attackers(eval_attacks, model=model, trainer=trainer)
 
         all_results = {}
         all_losses = {}

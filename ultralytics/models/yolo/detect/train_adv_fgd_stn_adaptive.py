@@ -373,6 +373,11 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             if hasattr(validator_args, arg):
                 delattr(validator_args, arg)
 
+        raw_att_w = (
+            getattr(self, "attack_weights", None)
+            or getattr(self, "_attack_weights_arg", None)
+            or getattr(self.args, "attack_weights", None)
+        )
         validator = DetectionValidatorAdvFGDSTNAdaptive(
             getattr(self, "test_loader", None),
             save_dir=self.save_dir,
@@ -383,9 +388,8 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             fgd_weights=self.fgd_weights,
             stn_weights=self.stn_weights,
             attack_through_preprocess=getattr(self.args, "val_attack_through_preprocess", False),
+            attack_weights=raw_att_w,
         )
-        validator.attacker = getattr(self, "attacker", None)
-        validator.attackers = getattr(self, "attackers", {})
         validator.attack_names = self.attack_names
         validator.attack_ratios = self.attack_ratios
         validator.eval_weights = self.eval_weights
