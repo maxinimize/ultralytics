@@ -538,13 +538,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
 
                     self.print_results()
                     all_results[run] = stats
-                    metric_arrays[run] = {
-                        "p": self.metrics.box.p,
-                        "r": self.metrics.box.r,
-                        "f1": self.metrics.box.f1,
-                        "all_ap": self.metrics.box.all_ap,
-                        "ap_class_index": self.metrics.box.ap_class_index,
-                    }
+                    metric_arrays[run] = self._snapshot_metric_arrays()
 
                     if self.training:
                         loss = {k: v.clone().detach() for k, v in self.loss.items()}
@@ -560,37 +554,6 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         if RANK > 0:
             return {}
 
-        # Calculate final fitness and aggregate metrics
-        ref_run = unique_runs[0]
-        weighted_p = np.zeros_like(metric_arrays[ref_run]["p"])
-        weighted_r = np.zeros_like(metric_arrays[ref_run]["r"])
-        weighted_f1 = np.zeros_like(metric_arrays[ref_run]["f1"])
-        weighted_all_ap = np.zeros_like(metric_arrays[ref_run]["all_ap"])
-
-        for r in unique_runs:
-            w = norm_eval_weights.get(r, 0.0)
-            weighted_p += w * metric_arrays[r]["p"]
-            weighted_r += w * metric_arrays[r]["r"]
-            weighted_f1 += w * metric_arrays[r]["f1"]
-            weighted_all_ap += w * metric_arrays[r]["all_ap"]
-
-        self.metrics.box.p = weighted_p
-        self.metrics.box.r = weighted_r
-        self.metrics.box.f1 = weighted_f1
-        self.metrics.box.all_ap = weighted_all_ap
-        self.metrics.box.ap_class_index = metric_arrays[ref_run]["ap_class_index"]
-        self.metrics.box.nc = len(self.names)
-        self.speed = {k: v / len(unique_runs) for k, v in all_speeds.items()}
-        self.finalize_metrics()
-
-        LOGGER.info("\nValidation Results Summary (Clean + Attacks):")
-        for run in unique_runs:
-            m50_95 = all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0)
-            m50 = all_results.get(run, {}).get("metrics/mAP50(B)", 0.0)
-            w_str = f"(Weight: {norm_eval_weights.get(run, 0.0):.4f})"
-            LOGGER.info(f"  {run:10s} -> mAP50-95: {m50_95:.5f}, mAP50: {m50:.5f}  {w_str}")
-
-        self.run_callbacks("on_val_end")
         # Check for attack failures
         if self.attack_failures:
             if self.strict_attacks:
@@ -602,22 +565,34 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 if f_att in all_results:
                     all_results[f_att]["metrics/mAP50-95(B)"] = 0.0
                     all_results[f_att]["metrics/mAP50(B)"] = 0.0
+                    all_results[f_att]["metrics/precision(B)"] = 0.0
+                    all_results[f_att]["metrics/recall(B)"] = 0.0
 
-        stats = self.metrics.results_dict
+        eval_runs = ["raw"] if self.stage == 1 else unique_runs
+        stats = self.aggregate_multirun_metrics(
+            metric_arrays=metric_arrays,
+            all_results=all_results,
+            norm_eval_weights=norm_eval_weights,
+            eval_runs=eval_runs,
+            failures=self.attack_failures,
+        )
 
-        # Compute fitness
+        self.speed = {k: v / len(unique_runs) for k, v in all_speeds.items()}
+        self.finalize_metrics()
+
+        LOGGER.info("\nValidation Results Summary (Clean + Attacks):")
+        for run in unique_runs:
+            m50_95 = all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0)
+            m50 = all_results.get(run, {}).get("metrics/mAP50(B)", 0.0)
+            w_str = f"(Weight: {norm_eval_weights.get(run, 0.0):.4f})"
+            LOGGER.info(f"  {run:10s} -> mAP50-95: {m50_95:.5f}, mAP50: {m50:.5f}  {w_str}")
+
+        self.run_callbacks("on_val_end")
+
         if self.stage == 1:
-            fitness = float(all_results.get("raw", {}).get("metrics/mAP50-95(B)", 0.0))
-            LOGGER.info(f"Stage 1 fitness (Clean mAP50-95): {fitness:.5f}\n")
+            LOGGER.info(f"Stage 1 fitness (Clean mAP50-95): {stats['fitness']:.5f}\n")
         else:
-            fitness = sum(
-                norm_eval_weights.get(r, 0.0)
-                * (0.0 if r in self.attack_failures else float(all_results.get(r, {}).get("metrics/mAP50-95(B)", 0.0)))
-                for r in unique_runs
-            )
-            LOGGER.info(f"Stage 2 fitness (Weighted Clean + Attacks mAP50-95): {fitness:.5f}\n")
-
-        stats["fitness"] = float(fitness)
+            LOGGER.info(f"Stage 2 fitness (Weighted Clean + Attacks mAP50-95): {stats['fitness']:.5f}\n")
 
         # Record every individual metric
         self.last_attack_maps = {}
@@ -632,6 +607,9 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             self.last_attack_maps[run] = m50_95
             stats[f"metrics/mAP50-95(B)_{run}"] = m50_95
             stats[f"metrics/mAP50(B)_{run}"] = m50
+
+        if hasattr(self.metrics, "_overall_results"):
+            self.metrics._overall_results.update(stats)
 
         return stats
 

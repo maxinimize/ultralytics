@@ -58,6 +58,45 @@ def parse_list_arg(val, type_conv=str):
     return [type_conv(p.strip()) for p in parts if p.strip()]
 
 
+class AdversarialDetMetrics(DetMetrics):
+    """Detection metrics wrapper for multi-run adversarial evaluation."""
+
+    def __init__(self, names: dict[int, str] | None = None) -> None:
+        """Initialize AdversarialDetMetrics."""
+        super().__init__(names=names)
+        self._overall_results: dict[str, float] | None = None
+
+    def clear_stats(self) -> None:
+        """Clear the stored statistics and overall cached results."""
+        super().clear_stats()
+        self._overall_results = None
+
+    def mean_results(self) -> list[float]:
+        """Return mean precision, recall, mAP50, and mAP50-95."""
+        if self._overall_results is not None:
+            return [
+                float(self._overall_results.get("metrics/precision(B)", 0.0)),
+                float(self._overall_results.get("metrics/recall(B)", 0.0)),
+                float(self._overall_results.get("metrics/mAP50(B)", 0.0)),
+                float(self._overall_results.get("metrics/mAP50-95(B)", 0.0)),
+            ]
+        return super().mean_results()
+
+    @property
+    def fitness(self) -> float:
+        """Return fitness."""
+        if self._overall_results is not None and "fitness" in self._overall_results:
+            return float(self._overall_results["fitness"])
+        return super().fitness
+
+    @property
+    def results_dict(self) -> dict[str, float]:
+        """Return results dictionary."""
+        if self._overall_results is not None:
+            return dict(self._overall_results)
+        return super().results_dict
+
+
 class DetectionValidator(BaseValidator):
     """A class extending the BaseValidator class for validation based on a detection model.
 
@@ -158,7 +197,7 @@ class DetectionValidator(BaseValidator):
         self.args.task = "detect"
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
-        self.metrics = DetMetrics()
+        self.metrics = AdversarialDetMetrics()
         self.attack_names = attack_names
         self.attack_ratios = attack_ratios
         self.eval_weights = eval_weights
@@ -171,6 +210,193 @@ class DetectionValidator(BaseValidator):
         self._fixed_surrogate_source = None
         self.last_attack_maps = {}
         self.attack_failures = set()
+
+    def _snapshot_metric_arrays(self) -> dict[str, np.ndarray]:
+        """Create an independent snapshot of current metric arrays."""
+        box = getattr(self.metrics, "box", None)
+        if box is None:
+            return {
+                "p": np.empty(0, dtype=np.float64),
+                "r": np.empty(0, dtype=np.float64),
+                "f1": np.empty(0, dtype=np.float64),
+                "all_ap": np.empty((0, 10), dtype=np.float64),
+                "ap_class_index": np.empty(0, dtype=int),
+            }
+
+        p = getattr(box, "p", None)
+        p_copy = (
+            np.asanyarray(p, dtype=np.float64).copy() if p is not None and len(p) else np.empty(0, dtype=np.float64)
+        )
+
+        r = getattr(box, "r", None)
+        r_copy = (
+            np.asanyarray(r, dtype=np.float64).copy() if r is not None and len(r) else np.empty(0, dtype=np.float64)
+        )
+
+        f1 = getattr(box, "f1", None)
+        f1_copy = (
+            np.asanyarray(f1, dtype=np.float64).copy() if f1 is not None and len(f1) else np.empty(0, dtype=np.float64)
+        )
+
+        all_ap = getattr(box, "all_ap", None)
+        if all_ap is None or len(all_ap) == 0:
+            all_ap_copy = np.empty((0, 10), dtype=np.float64)
+        else:
+            all_ap_copy = np.asanyarray(all_ap, dtype=np.float64).copy()
+            if all_ap_copy.ndim == 1 and all_ap_copy.size == 10:
+                all_ap_copy = all_ap_copy[None, :]
+
+        ap_class_index = getattr(box, "ap_class_index", None)
+        if ap_class_index is None or len(ap_class_index) == 0:
+            ap_ci_copy = np.empty(0, dtype=int)
+        else:
+            ap_ci_copy = np.asanyarray(ap_class_index, dtype=int).copy()
+
+        return {
+            "p": p_copy,
+            "r": r_copy,
+            "f1": f1_copy,
+            "all_ap": all_ap_copy,
+            "ap_class_index": ap_ci_copy,
+        }
+
+    def aggregate_multirun_metrics(
+        self,
+        metric_arrays: dict[str, dict[str, np.ndarray]],
+        all_results: dict[str, dict[str, float]],
+        norm_eval_weights: dict[str, float],
+        eval_runs: list[str],
+        failures: set[str] | None = None,
+    ) -> dict[str, float]:
+        """Aggregate per-class metric arrays and overall scalar metrics across evaluation runs.
+
+        Args:
+            metric_arrays (dict): Run name -> snapshot dict with 'p', 'r', 'f1', 'all_ap', 'ap_class_index'.
+            all_results (dict): Run name -> run results dictionary.
+            norm_eval_weights (dict): Run name -> evaluation weight.
+            eval_runs (list[str]): List of run names participating in evaluation.
+            failures (set[str], optional): Set of failed attack run names.
+
+        Returns:
+            dict[str, float]: Base aggregated metrics dictionary containing overall scalars and fitness.
+        """
+        failures = failures or set()
+
+        # 1. Identify runs participating in weighting with weight > 0
+        active_runs = [r for r in eval_runs if norm_eval_weights.get(r, 0.0) > 0 and r in metric_arrays]
+
+        # 2. Compute overall scalar metrics by weighting each run's overall scalars directly
+        overall_precision = 0.0
+        overall_recall = 0.0
+        overall_map50 = 0.0
+        overall_map50_95 = 0.0
+        total_eval_weight = sum(norm_eval_weights.get(r, 0.0) for r in active_runs)
+
+        for r in active_runs:
+            w = norm_eval_weights.get(r, 0.0)
+            if r in failures:
+                # Failed attacks contribute 0.0
+                continue
+            r_stats = all_results.get(r, {})
+            overall_precision += w * float(r_stats.get("metrics/precision(B)", 0.0))
+            overall_recall += w * float(r_stats.get("metrics/recall(B)", 0.0))
+            overall_map50 += w * float(r_stats.get("metrics/mAP50(B)", 0.0))
+            overall_map50_95 += w * float(r_stats.get("metrics/mAP50-95(B)", 0.0))
+
+        fitness = overall_map50_95
+
+        # 3. Class alignment: build sorted union of classes present across active runs
+        union_classes_set = set()
+        for r in active_runs:
+            if r in failures:
+                continue
+            c_idx = metric_arrays[r].get("ap_class_index", np.empty(0, dtype=int))
+            if len(c_idx):
+                union_classes_set.update(int(x) for x in c_idx)
+        union_classes = sorted(union_classes_set)
+
+        num_classes = len(union_classes)
+        class_support = {}
+
+        if num_classes == 0 or total_eval_weight <= 0:
+            weighted_p = np.empty(0, dtype=np.float64)
+            weighted_r = np.empty(0, dtype=np.float64)
+            weighted_f1 = np.empty(0, dtype=np.float64)
+            weighted_all_ap = np.empty((0, 10), dtype=np.float64)
+            ap_class_index = np.empty(0, dtype=int)
+        else:
+            weighted_p = np.zeros(num_classes, dtype=np.float64)
+            weighted_r = np.zeros(num_classes, dtype=np.float64)
+            weighted_f1 = np.zeros(num_classes, dtype=np.float64)
+            weighted_all_ap = np.zeros((num_classes, 10), dtype=np.float64)
+            ap_class_index = np.array(union_classes, dtype=int)
+
+            for i, c in enumerate(union_classes):
+                runs_with_c = []
+                w_sum_c = 0.0
+                p_sum_c = 0.0
+                r_sum_c = 0.0
+                f1_sum_c = 0.0
+                all_ap_sum_c = np.zeros(10, dtype=np.float64)
+
+                for r in active_runs:
+                    w = norm_eval_weights.get(r, 0.0)
+                    if r in failures:
+                        continue
+                    r_ap_ci = metric_arrays[r].get("ap_class_index", np.empty(0, dtype=int))
+                    pos = np.where(r_ap_ci == c)[0]
+                    if len(pos) > 0:
+                        idx_in_r = int(pos[0])
+                        runs_with_c.append(r)
+                        w_sum_c += w
+
+                        p_arr = metric_arrays[r].get("p", [])
+                        r_arr = metric_arrays[r].get("r", [])
+                        f1_arr = metric_arrays[r].get("f1", [])
+                        ap_arr = metric_arrays[r].get("all_ap", np.empty((0, 10)))
+
+                        p_val = float(p_arr[idx_in_r]) if len(p_arr) > idx_in_r else 0.0
+                        r_val = float(r_arr[idx_in_r]) if len(r_arr) > idx_in_r else 0.0
+                        f1_val = float(f1_arr[idx_in_r]) if len(f1_arr) > idx_in_r else 0.0
+                        ap_val = ap_arr[idx_in_r] if len(ap_arr) > idx_in_r else np.zeros(10, dtype=np.float64)
+
+                        p_sum_c += w * p_val
+                        r_sum_c += w * r_val
+                        f1_sum_c += w * f1_val
+                        all_ap_sum_c += w * ap_val
+
+                if w_sum_c > 0:
+                    weighted_p[i] = p_sum_c / w_sum_c
+                    weighted_r[i] = r_sum_c / w_sum_c
+                    weighted_f1[i] = f1_sum_c / w_sum_c
+                    weighted_all_ap[i] = all_ap_sum_c / w_sum_c
+
+                class_support[c] = {
+                    "runs": runs_with_c,
+                    "weight_sum": w_sum_c,
+                }
+
+        # 4. Update validator's metrics object
+        self.metrics.box.p = weighted_p
+        self.metrics.box.r = weighted_r
+        self.metrics.box.f1 = weighted_f1
+        self.metrics.box.all_ap = weighted_all_ap
+        self.metrics.box.ap_class_index = ap_class_index
+        self.metrics.box.nc = len(self.names) if hasattr(self, "names") and self.names else len(union_classes)
+        self.class_support = class_support
+
+        base_stats = {
+            "metrics/precision(B)": float(overall_precision),
+            "metrics/recall(B)": float(overall_recall),
+            "metrics/mAP50(B)": float(overall_map50),
+            "metrics/mAP50-95(B)": float(overall_map50_95),
+            "fitness": float(fitness),
+        }
+        self.overall_metrics = dict(base_stats)
+        if hasattr(self.metrics, "_overall_results"):
+            self.metrics._overall_results = dict(base_stats)
+
+        return base_stats
 
     def __call__(self, trainer=None, model=None):
         """Execute validation process, running inference on dataloader and computing performance metrics.
@@ -386,13 +612,7 @@ class DetectionValidator(BaseValidator):
 
                 # Save results and metric arrays for this run
                 all_results[run] = stats
-                metric_arrays[run] = {
-                    "p": self.metrics.box.p,
-                    "r": self.metrics.box.r,
-                    "f1": self.metrics.box.f1,
-                    "all_ap": self.metrics.box.all_ap,
-                    "ap_class_index": self.metrics.box.ap_class_index,
-                }
+                metric_arrays[run] = self._snapshot_metric_arrays()
 
                 if self.training and hasattr(self, "loss") and self.loss is not None:
                     loss = {k: v.clone().detach() for k, v in self.loss.items()}
@@ -405,26 +625,29 @@ class DetectionValidator(BaseValidator):
             return
 
         if RANK in {-1, 0}:
-            # Compute weighted metrics/arrays using normalized fixed evaluation weights
-            ref_run = eval_attacks[0] if eval_attacks else unique_runs[0]
-            weighted_p = np.zeros_like(metric_arrays[ref_run]["p"])
-            weighted_r = np.zeros_like(metric_arrays[ref_run]["r"])
-            weighted_f1 = np.zeros_like(metric_arrays[ref_run]["f1"])
-            weighted_all_ap = np.zeros_like(metric_arrays[ref_run]["all_ap"])
+            # Check for attack failures
+            if self.attack_failures:
+                if self.strict_attacks:
+                    raise RuntimeError(
+                        f"Adversarial generation failed during validation for attacks: {self.attack_failures}. "
+                        "Silent fallback to clean data is prohibited in strict mode."
+                    )
+                for f_att in self.attack_failures:
+                    if f_att in all_results:
+                        all_results[f_att]["metrics/mAP50-95(B)"] = 0.0
+                        all_results[f_att]["metrics/mAP50(B)"] = 0.0
+                        all_results[f_att]["metrics/precision(B)"] = 0.0
+                        all_results[f_att]["metrics/recall(B)"] = 0.0
 
-            for a in eval_attacks:
-                w = norm_eval_weights.get(a, 0.0)
-                weighted_p += w * metric_arrays[a]["p"]
-                weighted_r += w * metric_arrays[a]["r"]
-                weighted_f1 += w * metric_arrays[a]["f1"]
-                weighted_all_ap += w * metric_arrays[a]["all_ap"]
-
-            self.metrics.box.p = weighted_p
-            self.metrics.box.r = weighted_r
-            self.metrics.box.f1 = weighted_f1
-            self.metrics.box.all_ap = weighted_all_ap
-            self.metrics.box.ap_class_index = metric_arrays[ref_run]["ap_class_index"]
-            self.metrics.box.nc = len(self.names)
+            # Aggregate per-class metric arrays and overall scalar metrics
+            eval_runs = eval_attacks if eval_attacks else unique_runs
+            stats = self.aggregate_multirun_metrics(
+                metric_arrays=metric_arrays,
+                all_results=all_results,
+                norm_eval_weights=norm_eval_weights,
+                eval_runs=eval_runs,
+                failures=self.attack_failures,
+            )
 
             self.speed = {k: v / len(unique_runs) for k, v in all_speeds.items()}
             self.finalize_metrics()
@@ -442,28 +665,6 @@ class DetectionValidator(BaseValidator):
 
             self.run_callbacks("on_val_end")
 
-            # Check for attack failures
-            if self.attack_failures:
-                if self.strict_attacks:
-                    raise RuntimeError(
-                        f"Adversarial generation failed during validation for attacks: {self.attack_failures}. "
-                        "Silent fallback to clean data is prohibited in strict mode."
-                    )
-                for f_att in self.attack_failures:
-                    if f_att in all_results:
-                        all_results[f_att]["metrics/mAP50-95(B)"] = 0.0
-                        all_results[f_att]["metrics/mAP50(B)"] = 0.0
-
-            # Extract final metrics dict
-            stats = self.metrics.results_dict
-
-            # Fitness is computed strictly from fixed evaluation weights on attack mAP50-95 (Clean weight=0)
-            fitness = sum(
-                norm_eval_weights.get(a, 0.0)
-                * (0.0 if a in self.attack_failures else all_results.get(a, {}).get("metrics/mAP50-95(B)", 0.0))
-                for a in eval_attacks
-            )
-            stats["fitness"] = float(fitness)
             LOGGER.info(f"fitness (fixed weighted attack mAP50-95, Clean weight=0): {stats['fitness']:.5f}\n")
 
             # Record individual attack mAPs into stats
@@ -480,9 +681,21 @@ class DetectionValidator(BaseValidator):
                 stats[f"metrics/mAP50-95(B)_{run}"] = float(m50_95)
                 stats[f"metrics/mAP50(B)_{run}"] = float(m50)
 
+            # Record clean mAP for monitoring/logging only (not in fitness)
+            if "raw" in all_results:
+                clean_m50_95 = all_results["raw"].get("metrics/mAP50-95(B)", 0.0)
+                clean_m50 = all_results["raw"].get("metrics/mAP50(B)", 0.0)
+                stats["metrics/clean_mAP50-95(B)"] = float(clean_m50_95)
+                stats["metrics/clean_mAP50(B)"] = float(clean_m50)
+                self.last_clean_map = float(clean_m50_95)
+
+            if hasattr(self.metrics, "_overall_results"):
+                self.metrics._overall_results.update(stats)
+
             if self.training:
                 # Compute weighted validation loss across attacks
-                weighted_loss = {k: torch.zeros_like(v) for k, v in all_losses[ref_run].items()}
+                ref_run = eval_attacks[0] if eval_attacks else unique_runs[0]
+                weighted_loss = {k: torch.zeros_like(v) for k, v in all_losses.get(ref_run, {}).items()}
                 for a in eval_attacks:
                     w = norm_eval_weights.get(a, 0.0)
                     for k, v in all_losses.get(a, {}).items():
@@ -782,7 +995,10 @@ class DetectionValidator(BaseValidator):
         self.end2end = getattr(model, "end2end", False)
         self.seen = 0
         self.jdict = []
+        if not isinstance(self.metrics, AdversarialDetMetrics):
+            self.metrics = AdversarialDetMetrics(names=model.names)
         self.metrics.names = model.names
+        self.metrics.clear_stats()
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
 
     def get_desc(self) -> str:

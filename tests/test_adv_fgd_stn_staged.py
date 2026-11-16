@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -1841,6 +1842,418 @@ class TestStagedPipeline(unittest.TestCase):
         out = transform_batch_bboxes_for_stn(batch, pred_matrices, height=100, width=100)
         self.assertTrue("bboxes" in out)
         torch.testing.assert_close(out["bboxes"], batch["bboxes"])
+
+    def test_req8_class_alignment_and_scalar_weighting(self):
+        """Verify Item 8: Disjoint class IDs A=[0,2], B=[2,5] aligned into union [0,2,5] without broadcast errors,
+        per-class conditional weighting, and overall scalar weighted mAP matching scalar combination (not row average).
+        """
+        val = DetectionValidatorAdvAdaptive(args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1", 2: "c2", 3: "c3", 4: "c4", 5: "c5"}
+
+        # Run A: classes [0, 2], weight 0.40
+        # AP50-95: class 0 = 0.80, class 2 = 0.60 -> scalar mAP50-95 = 0.70
+        ap_A = np.zeros((2, 10), dtype=np.float64)
+        ap_A[0, :] = 0.80
+        ap_A[1, :] = 0.60
+        m_A = {
+            "p": np.array([0.85, 0.65]),
+            "r": np.array([0.75, 0.55]),
+            "f1": np.array([0.80, 0.60]),
+            "all_ap": ap_A,
+            "ap_class_index": np.array([0, 2], dtype=int),
+        }
+        res_A = {
+            "metrics/precision(B)": 0.75,
+            "metrics/recall(B)": 0.65,
+            "metrics/mAP50(B)": 0.72,
+            "metrics/mAP50-95(B)": 0.70,
+        }
+
+        # Run B: classes [2, 5], weight 0.60
+        # AP50-95: class 2 = 0.40, class 5 = 0.90 -> scalar mAP50-95 = 0.65
+        ap_B = np.zeros((2, 10), dtype=np.float64)
+        ap_B[0, :] = 0.40
+        ap_B[1, :] = 0.90
+        m_B = {
+            "p": np.array([0.45, 0.95]),
+            "r": np.array([0.35, 0.85]),
+            "f1": np.array([0.40, 0.90]),
+            "all_ap": ap_B,
+            "ap_class_index": np.array([2, 5], dtype=int),
+        }
+        res_B = {
+            "metrics/precision(B)": 0.70,
+            "metrics/recall(B)": 0.60,
+            "metrics/mAP50(B)": 0.68,
+            "metrics/mAP50-95(B)": 0.65,
+        }
+
+        metric_arrays = {"runA": m_A, "runB": m_B}
+        all_results = {"runA": res_A, "runB": res_B}
+        weights = {"runA": 0.40, "runB": 0.60}
+        eval_runs = ["runA", "runB"]
+
+        stats = val.aggregate_multirun_metrics(
+            metric_arrays=metric_arrays,
+            all_results=all_results,
+            norm_eval_weights=weights,
+            eval_runs=eval_runs,
+        )
+
+        # 1. Aligned union of classes is [0, 2, 5]
+        np.testing.assert_array_equal(val.metrics.box.ap_class_index, np.array([0, 2, 5]))
+        self.assertEqual(val.metrics.box.all_ap.shape, (3, 10))
+
+        # 2. Per-class AP:
+        # Class 0: only in A -> 0.80
+        # Class 2: (0.4*0.60 + 0.6*0.40) / 1.0 = 0.48
+        # Class 5: only in B -> 0.90
+        self.assertAlmostEqual(val.metrics.box.all_ap[0, :].mean(), 0.80, places=4)
+        self.assertAlmostEqual(val.metrics.box.all_ap[1, :].mean(), 0.48, places=4)
+        self.assertAlmostEqual(val.metrics.box.all_ap[2, :].mean(), 0.90, places=4)
+
+        # Class support records
+        self.assertEqual(val.class_support[0]["runs"], ["runA"])
+        self.assertAlmostEqual(val.class_support[0]["weight_sum"], 0.40)
+        self.assertEqual(val.class_support[2]["runs"], ["runA", "runB"])
+        self.assertAlmostEqual(val.class_support[2]["weight_sum"], 1.0)
+        self.assertEqual(val.class_support[5]["runs"], ["runB"])
+        self.assertAlmostEqual(val.class_support[5]["weight_sum"], 0.60)
+
+        # 3. Overall scalar mAP must equal scalar weighted combination:
+        # 0.40 * 0.70 + 0.60 * 0.65 = 0.6700
+        # (NOT the conditional array mean: (0.80 + 0.48 + 0.90) / 3 = 0.7267)
+        expected_overall_m50_95 = 0.40 * 0.70 + 0.60 * 0.65  # 0.67
+        expected_overall_m50 = 0.40 * 0.72 + 0.60 * 0.68  # 0.696
+        self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], expected_overall_m50_95, places=4)
+        self.assertAlmostEqual(stats["fitness"], expected_overall_m50_95, places=4)
+        self.assertAlmostEqual(stats["metrics/mAP50(B)"], expected_overall_m50, places=4)
+
+        # 4. Check val.metrics.results_dict and mean_results() match overall scalars (not row mean)
+        results_dict = val.metrics.results_dict
+        self.assertAlmostEqual(results_dict["metrics/mAP50-95(B)"], expected_overall_m50_95, places=4)
+        self.assertAlmostEqual(val.metrics.mean_results()[3], expected_overall_m50_95, places=4)
+
+    def test_req8_same_ids_different_ordering(self):
+        """Verify Item 8: Same class IDs under different permutations [2, 0] vs [0, 2] do not mix classes."""
+        val = DetectionValidatorAdvFGDSTNStaged(args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1", 2: "c2"}
+
+        ap_A = np.zeros((2, 10), dtype=np.float64)
+        ap_A[0, :] = 0.60  # class 2
+        ap_A[1, :] = 0.80  # class 0
+        m_A = {
+            "p": np.array([0.60, 0.80]),
+            "r": np.array([0.60, 0.80]),
+            "f1": np.array([0.60, 0.80]),
+            "all_ap": ap_A,
+            "ap_class_index": np.array([2, 0], dtype=int),
+        }
+        res_A = {
+            "metrics/mAP50-95(B)": 0.70,
+            "metrics/mAP50(B)": 0.70,
+            "metrics/precision(B)": 0.70,
+            "metrics/recall(B)": 0.70,
+        }
+
+        ap_B = np.zeros((2, 10), dtype=np.float64)
+        ap_B[0, :] = 0.30  # class 0
+        ap_B[1, :] = 0.40  # class 2
+        m_B = {
+            "p": np.array([0.30, 0.40]),
+            "r": np.array([0.30, 0.40]),
+            "f1": np.array([0.30, 0.40]),
+            "all_ap": ap_B,
+            "ap_class_index": np.array([0, 2], dtype=int),
+        }
+        res_B = {
+            "metrics/mAP50-95(B)": 0.35,
+            "metrics/mAP50(B)": 0.35,
+            "metrics/precision(B)": 0.35,
+            "metrics/recall(B)": 0.35,
+        }
+
+        stats = val.aggregate_multirun_metrics(
+            metric_arrays={"A": m_A, "B": m_B},
+            all_results={"A": res_A, "B": res_B},
+            norm_eval_weights={"A": 0.50, "B": 0.50},
+            eval_runs=["A", "B"],
+        )
+
+        np.testing.assert_array_equal(val.metrics.box.ap_class_index, np.array([0, 2]))
+        # Class 0: (0.5*0.80 + 0.5*0.30) = 0.55
+        # Class 2: (0.5*0.60 + 0.5*0.40) = 0.50
+        self.assertAlmostEqual(val.metrics.box.all_ap[0, :].mean(), 0.55, places=4)
+        self.assertAlmostEqual(val.metrics.box.all_ap[1, :].mean(), 0.50, places=4)
+
+    def test_req8_empty_run_and_gt_without_predictions(self):
+        """Verify Item 8: Handles entirely empty runs, zero-weight runs, and distinguishes GT-without-preds (AP=0) from absent GT."""
+        val = DetectionValidatorAdvAdaptive(args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1", 2: "c2"}
+
+        # Run A: evaluated class 0 (AP=0.8) and class 1 (has GT but 0 predictions -> AP=0.0)
+        ap_A = np.zeros((2, 10), dtype=np.float64)
+        ap_A[0, :] = 0.80
+        ap_A[1, :] = 0.00
+        m_A = {
+            "p": np.array([0.80, 0.00]),
+            "r": np.array([0.80, 0.00]),
+            "f1": np.array([0.80, 0.00]),
+            "all_ap": ap_A,
+            "ap_class_index": np.array([0, 1], dtype=int),
+        }
+        res_A = {
+            "metrics/mAP50-95(B)": 0.40,
+            "metrics/mAP50(B)": 0.40,
+            "metrics/precision(B)": 0.40,
+            "metrics/recall(B)": 0.40,
+        }
+
+        # Run B: completely empty (e.g. no targets in dataset slice)
+        m_B = {
+            "p": np.empty(0, dtype=np.float64),
+            "r": np.empty(0, dtype=np.float64),
+            "f1": np.empty(0, dtype=np.float64),
+            "all_ap": np.empty((0, 10), dtype=np.float64),
+            "ap_class_index": np.empty(0, dtype=int),
+        }
+        res_B = {
+            "metrics/mAP50-95(B)": 0.0,
+            "metrics/mAP50(B)": 0.0,
+            "metrics/precision(B)": 0.0,
+            "metrics/recall(B)": 0.0,
+        }
+
+        stats = val.aggregate_multirun_metrics(
+            metric_arrays={"A": m_A, "B": m_B},
+            all_results={"A": res_A, "B": res_B},
+            norm_eval_weights={"A": 0.60, "B": 0.40},
+            eval_runs=["A", "B"],
+        )
+
+        # Classes in union: [0, 1] (only present in A)
+        np.testing.assert_array_equal(val.metrics.box.ap_class_index, np.array([0, 1]))
+        # Class 0: evaluated by A -> AP=0.80
+        self.assertAlmostEqual(val.metrics.box.all_ap[0, :].mean(), 0.80, places=4)
+        # Class 1: evaluated by A with GT and AP=0.0 -> included in evaluation with 0.0
+        self.assertAlmostEqual(val.metrics.box.all_ap[1, :].mean(), 0.00, places=4)
+
+        # Completely empty evaluation across all runs
+        stats_empty = val.aggregate_multirun_metrics(
+            metric_arrays={"B1": m_B, "B2": m_B},
+            all_results={"B1": res_B, "B2": res_B},
+            norm_eval_weights={"B1": 0.50, "B2": 0.50},
+            eval_runs=["B1", "B2"],
+        )
+        self.assertEqual(len(val.metrics.box.ap_class_index), 0)
+        self.assertEqual(val.metrics.box.all_ap.shape, (0, 10))
+        self.assertEqual(stats_empty["metrics/mAP50-95(B)"], 0.0)
+        self.assertFalse(np.isnan(stats_empty["metrics/mAP50-95(B)"]))
+
+    def test_req8_stage1_epoch0_single_raw_output_preserved(self):
+        """Verify Item 8: Stage 1 / Epoch 0 with single raw run preserves metrics, fitness, and JSON/CSV output."""
+        val = DetectionValidatorAdvFGDSTNStaged(stage=1, args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1"}
+
+        ap_raw = np.zeros((2, 10), dtype=np.float64)
+        ap_raw[0, :] = 0.85
+        ap_raw[1, :] = 0.75
+        m_raw = {
+            "p": np.array([0.80, 0.70]),
+            "r": np.array([0.90, 0.80]),
+            "f1": np.array([0.85, 0.75]),
+            "all_ap": ap_raw,
+            "ap_class_index": np.array([0, 1], dtype=int),
+        }
+        res_raw = {
+            "metrics/precision(B)": 0.75,
+            "metrics/recall(B)": 0.85,
+            "metrics/mAP50(B)": 0.82,
+            "metrics/mAP50-95(B)": 0.80,
+        }
+
+        stats = val.aggregate_multirun_metrics(
+            metric_arrays={"raw": m_raw},
+            all_results={"raw": res_raw},
+            norm_eval_weights={"raw": 1.0},
+            eval_runs=["raw"],
+        )
+
+        self.assertAlmostEqual(stats["metrics/mAP50(B)"], 0.82)
+        self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], 0.80)
+        self.assertAlmostEqual(stats["fitness"], 0.80)
+        self.assertEqual(len(val.metrics.box.ap_class_index), 2)
+
+    def test_req8_e2e_snapshot_isolation_and_results_dict_consistency(self):
+        """Verify Item 8: Snapshot isolation guarantees that later runs mutating self.metrics.box do not corrupt
+        earlier run snapshots, and self.metrics.results_dict consistently exposes overall scalar weighted metrics.
+        """
+        val = DetectionValidatorAdvFGDSTNStaged(stage=2, args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1", 2: "c2", 3: "c3", 4: "c4", 5: "c5"}
+
+        # Simulate Run 1
+        val.metrics.box.p = np.array([0.9, 0.8])
+        val.metrics.box.r = np.array([0.7, 0.6])
+        val.metrics.box.f1 = np.array([0.8, 0.7])
+        ap1 = np.zeros((2, 10), dtype=np.float64)
+        ap1[0, :] = 0.80
+        ap1[1, :] = 0.60
+        val.metrics.box.all_ap = ap1
+        val.metrics.box.ap_class_index = np.array([0, 2], dtype=int)
+
+        snap1 = val._snapshot_metric_arrays()
+
+        # Simulate Run 2 mutating val.metrics.box in-place or reassigning
+        val.metrics.box.p = np.array([0.3, 0.4])
+        val.metrics.box.r = np.array([0.5, 0.6])
+        val.metrics.box.f1 = np.array([0.4, 0.5])
+        ap2 = np.zeros((2, 10), dtype=np.float64)
+        ap2[0, :] = 0.40
+        ap2[1, :] = 0.90
+        val.metrics.box.all_ap = ap2
+        val.metrics.box.ap_class_index = np.array([2, 5], dtype=int)
+
+        snap2 = val._snapshot_metric_arrays()
+
+        # Verify snap1 was NOT mutated by Run 2
+        np.testing.assert_array_equal(snap1["ap_class_index"], np.array([0, 2]))
+        self.assertAlmostEqual(snap1["all_ap"][0, 0], 0.80)
+        self.assertAlmostEqual(snap1["all_ap"][1, 0], 0.60)
+        self.assertAlmostEqual(snap1["p"][0], 0.90)
+
+        # Aggregate across both runs
+        metric_arrays = {"run1": snap1, "run2": snap2}
+        all_results = {
+            "run1": {
+                "metrics/mAP50-95(B)": 0.70,
+                "metrics/mAP50(B)": 0.75,
+                "metrics/precision(B)": 0.85,
+                "metrics/recall(B)": 0.65,
+            },
+            "run2": {
+                "metrics/mAP50-95(B)": 0.65,
+                "metrics/mAP50(B)": 0.70,
+                "metrics/precision(B)": 0.35,
+                "metrics/recall(B)": 0.55,
+            },
+        }
+        weights = {"run1": 0.50, "run2": 0.50}
+
+        stats = val.aggregate_multirun_metrics(
+            metric_arrays=metric_arrays,
+            all_results=all_results,
+            norm_eval_weights=weights,
+            eval_runs=["run1", "run2"],
+        )
+
+        # Overall mAP is 0.5*0.70 + 0.5*0.65 = 0.675
+        self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], 0.675)
+        self.assertAlmostEqual(stats["fitness"], 0.675)
+        # val.metrics.results_dict must match stats
+        self.assertAlmostEqual(val.metrics.results_dict["metrics/mAP50-95(B)"], 0.675)
+        self.assertAlmostEqual(val.metrics.results_dict["fitness"], 0.675)
+
+    def test_req8_identical_sets_parity_vs_different_sets_discrepancy(self):
+        """Verify Item 8: When class sets and orders are identical, overall weighted mAP matches both
+        scalar combination and row mean. When class sets differ, overall weighted mAP strictly equals
+        scalar combination and does NOT equal the conditional row mean.
+        """
+        val = DetectionValidatorAdvAdaptive(args={"data": "coco8.yaml", "imgsz": 64})
+        val.names = {0: "c0", 1: "c1", 2: "c2", 3: "c3"}
+
+        # Case 1: Identical class sets and identical order: [0, 1] for both runs
+        ap_r1 = np.full((2, 10), 0.80, dtype=np.float64)
+        ap_r2 = np.full((2, 10), 0.60, dtype=np.float64)
+        m1 = {
+            "p": np.array([0.8, 0.8]),
+            "r": np.array([0.8, 0.8]),
+            "f1": np.array([0.8, 0.8]),
+            "all_ap": ap_r1,
+            "ap_class_index": np.array([0, 1], dtype=int),
+        }
+        m2 = {
+            "p": np.array([0.6, 0.6]),
+            "r": np.array([0.6, 0.6]),
+            "f1": np.array([0.6, 0.6]),
+            "all_ap": ap_r2,
+            "ap_class_index": np.array([0, 1], dtype=int),
+        }
+        res1 = {
+            "metrics/mAP50-95(B)": 0.80,
+            "metrics/mAP50(B)": 0.80,
+            "metrics/precision(B)": 0.80,
+            "metrics/recall(B)": 0.80,
+        }
+        res2 = {
+            "metrics/mAP50-95(B)": 0.60,
+            "metrics/mAP50(B)": 0.60,
+            "metrics/precision(B)": 0.60,
+            "metrics/recall(B)": 0.60,
+        }
+
+        stats_id = val.aggregate_multirun_metrics(
+            metric_arrays={"r1": m1, "r2": m2},
+            all_results={"r1": res1, "r2": res2},
+            norm_eval_weights={"r1": 0.50, "r2": 0.50},
+            eval_runs=["r1", "r2"],
+        )
+        # Expected: 0.50*0.80 + 0.50*0.60 = 0.70
+        self.assertAlmostEqual(stats_id["metrics/mAP50-95(B)"], 0.70)
+        # When classes are identical, conditional row mean is also 0.70
+        self.assertAlmostEqual(val.metrics.box.all_ap.mean(), 0.70)
+
+        # Case 2: Different class sets: Run 1 has [0] (mAP=0.9), Run 2 has [0, 1, 2] (mAP=(0.9+0.3+0.3)/3 = 0.5)
+        # Weights: 0.5 each. Scalar combination: 0.5*0.90 + 0.5*0.50 = 0.70.
+        # Conditional per-class:
+        # Class 0: evaluated by both -> (0.5*0.90 + 0.5*0.90)/1.0 = 0.90
+        # Class 1: evaluated only by r2 -> 0.30
+        # Class 2: evaluated only by r2 -> 0.30
+        # Row mean of per-class array: (0.90 + 0.30 + 0.30) / 3 = 0.50 != 0.70!
+        ap_d1 = np.full((1, 10), 0.90, dtype=np.float64)
+        ap_d2 = np.zeros((3, 10), dtype=np.float64)
+        ap_d2[0, :] = 0.90
+        ap_d2[1, :] = 0.30
+        ap_d2[2, :] = 0.30
+
+        md1 = {
+            "p": np.array([0.9]),
+            "r": np.array([0.9]),
+            "f1": np.array([0.9]),
+            "all_ap": ap_d1,
+            "ap_class_index": np.array([0], dtype=int),
+        }
+        md2 = {
+            "p": np.array([0.9, 0.3, 0.3]),
+            "r": np.array([0.9, 0.3, 0.3]),
+            "f1": np.array([0.9, 0.3, 0.3]),
+            "all_ap": ap_d2,
+            "ap_class_index": np.array([0, 1, 2], dtype=int),
+        }
+        res_d1 = {
+            "metrics/mAP50-95(B)": 0.90,
+            "metrics/mAP50(B)": 0.90,
+            "metrics/precision(B)": 0.90,
+            "metrics/recall(B)": 0.90,
+        }
+        res_d2 = {
+            "metrics/mAP50-95(B)": 0.50,
+            "metrics/mAP50(B)": 0.50,
+            "metrics/precision(B)": 0.50,
+            "metrics/recall(B)": 0.50,
+        }
+
+        stats_diff = val.aggregate_multirun_metrics(
+            metric_arrays={"d1": md1, "d2": md2},
+            all_results={"d1": res_d1, "d2": res_d2},
+            norm_eval_weights={"d1": 0.50, "d2": 0.50},
+            eval_runs=["d1", "d2"],
+        )
+
+        expected_scalar = 0.50 * 0.90 + 0.50 * 0.50  # 0.70
+        row_mean = float(val.metrics.box.all_ap.mean())  # 0.50
+        self.assertAlmostEqual(stats_diff["metrics/mAP50-95(B)"], expected_scalar)
+        self.assertNotAlmostEqual(stats_diff["metrics/mAP50-95(B)"], row_mean)
+        self.assertAlmostEqual(val.metrics.results_dict["metrics/mAP50-95(B)"], expected_scalar)
 
 
 if __name__ == "__main__":
