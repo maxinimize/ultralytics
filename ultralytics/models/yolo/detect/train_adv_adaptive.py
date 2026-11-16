@@ -7,24 +7,27 @@ import io
 import math
 import random
 import time
+import warnings
 from copy import copy, deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-import warnings
 
-import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import distributed as dist
+from torch import nn
 
 from ultralytics import __version__
+from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_utils import rollback_batch_state, setup_attack_model, snapshot_batch_state
 from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
+from ultralytics.data.dataset import YOLODataset
 from ultralytics.engine.trainer import BaseTrainer
-from ultralytics.models import yolo
+from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, colorstr, TQDM
+from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, colorstr
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import (
@@ -36,12 +39,6 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-from ultralytics.data.dataset import YOLODataset
-from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
-
-from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
-from ultralytics.attacks.attack_utils import setup_attack_model
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 
 
 def parse_list_arg(val, type_conv=str):
@@ -178,7 +175,7 @@ class DynamicAttackRatioController:
                 f"  mClean: {clean_map:.4f}, Degradations: "
                 + ", ".join(f"{att}: {d:.4f}" for att, d in zip(self.attack_names, diffs))
                 + "\n"
-                f"  Computed new ratios for next epochs: "
+                "  Computed new ratios for next epochs: "
                 + ", ".join(f"{k}: {v:.4f}" for k, v in self.next_train_ratios.items())
                 + "\n"
             )
@@ -683,8 +680,6 @@ class DetectionTrainer(BaseTrainer):
                     if att not in self.attackers or self.attackers[att] is None:
                         if self.strict_attacks:
                             raise RuntimeError(f"Attacker '{att}' failed to initialize.")
-
-            self._restore_resume_rng_and_attackers()
         except Exception as e:
             if getattr(self, "strict_attacks", True):
                 raise
@@ -712,9 +707,9 @@ class DetectionTrainer(BaseTrainer):
 
     def setup_model(self):
         ckpt = super().setup_model()
-        if ckpt and "random_state" in ckpt:
+        if self.resume and ckpt and "random_state" in ckpt:
             self._resume_random_state = ckpt["random_state"]
-        if ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
+        if self.resume and ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
             self._resume_attacker_state = ckpt.get("attacker_state", ckpt.get("attackers_state"))
         if self.resume and ckpt and ckpt.get("model") is not None:
             live_model = ckpt["model"]
@@ -742,9 +737,9 @@ class DetectionTrainer(BaseTrainer):
                 f"Restored adaptive_state from checkpoint: current ratios = {self.adaptive_controller.current_train_ratios}, "
                 f"last_updated_epoch = {self.adaptive_controller.last_updated_epoch}"
             )
-        if ckpt and "random_state" in ckpt:
+        if self.resume and ckpt and "random_state" in ckpt:
             self._resume_random_state = ckpt["random_state"]
-        if ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
+        if self.resume and ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
             self._resume_attacker_state = ckpt.get("attacker_state", ckpt.get("attackers_state"))
         if self.resume and ckpt and ckpt.get("model") is not None:
             live_model = ckpt["model"]
@@ -758,7 +753,12 @@ class DetectionTrainer(BaseTrainer):
                 LOGGER.warning(f"Failed to restore live model in _load_checkpoint_state: {e}")
 
     def _restore_resume_rng_and_attackers(self):
-        """Restore training RNG states and attacker generator states on resume after attackers are built."""
+        """Restore training RNG states and attacker generator states on resume after setup_train completes."""
+        if not getattr(self, "resume", False):
+            self._resume_attacker_state = None
+            self._resume_random_state = None
+            return
+
         if getattr(self, "_resume_attacker_state", None):
             atk_st = self._resume_attacker_state
             if hasattr(self, "attackers") and isinstance(self.attackers, dict):
@@ -775,7 +775,8 @@ class DetectionTrainer(BaseTrainer):
             if "torch" in rnd and rnd["torch"] is not None:
                 torch.set_rng_state(rnd["torch"])
             if torch.cuda.is_available() and rnd.get("cuda") is not None:
-                torch.cuda.set_rng_state_all(rnd["cuda"])
+                with contextlib.suppress(RuntimeError, TypeError, ValueError):
+                    torch.cuda.set_rng_state_all(rnd["cuda"])
             if "numpy" in rnd and rnd["numpy"] is not None:
                 np.random.set_state(rnd["numpy"])
             if "python" in rnd and rnd["python"] is not None:
@@ -1015,6 +1016,9 @@ class DetectionTrainer(BaseTrainer):
             self._setup_ddp()
         self._setup_train()
 
+        if self.resume:
+            self._restore_resume_rng_and_attackers()
+
         nb = len(self.train_loader)
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
         last_opt_step = -1
@@ -1053,14 +1057,7 @@ class DetectionTrainer(BaseTrainer):
             base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
             needs_reset = False
-            if epoch == self.start_epoch and self.resume:
-                if hasattr(self.train_loader.dataset, "update_virtual_samples"):
-                    self.train_loader.dataset.update_virtual_samples(
-                        attack_ratios=self.adaptive_controller.current_train_ratios,
-                        seed=epoch_seed,
-                    )
-                    needs_reset = True
-            elif epoch > self.start_epoch:
+            if epoch == self.start_epoch and self.resume or epoch > self.start_epoch:
                 if hasattr(self.train_loader.dataset, "update_virtual_samples"):
                     self.train_loader.dataset.update_virtual_samples(
                         attack_ratios=self.adaptive_controller.current_train_ratios,
@@ -1174,24 +1171,7 @@ class DetectionTrainer(BaseTrainer):
                                         continue
 
                                     # Backup sub_batch before running attack for potential rollback
-                                    sub_backup = {
-                                        "img": sub_batch["img"].clone(),
-                                        "bboxes": (
-                                            sub_batch["bboxes"].clone()
-                                            if ("bboxes" in sub_batch and torch.is_tensor(sub_batch["bboxes"]))
-                                            else None
-                                        ),
-                                        "cls": (
-                                            sub_batch["cls"].clone()
-                                            if ("cls" in sub_batch and torch.is_tensor(sub_batch["cls"]))
-                                            else None
-                                        ),
-                                        "batch_idx": (
-                                            sub_batch["batch_idx"].clone()
-                                            if ("batch_idx" in sub_batch and torch.is_tensor(sub_batch["batch_idx"]))
-                                            else None
-                                        ),
-                                    }
+                                    sub_backup = snapshot_batch_state(sub_batch)
 
                                     try:
                                         if hasattr(attacker, "proxy_model"):
@@ -1252,13 +1232,7 @@ class DetectionTrainer(BaseTrainer):
                                             f"Adversarial generation failed for attack '{att}' at batch {i}: {e}. Rolling back to raw."
                                         )
                                         # Rollback sub_batch to guarantee paired image and labels
-                                        sub_batch["img"] = sub_backup["img"]
-                                        if sub_backup["bboxes"] is not None:
-                                            sub_batch["bboxes"] = sub_backup["bboxes"]
-                                        if sub_backup["cls"] is not None:
-                                            sub_batch["cls"] = sub_backup["cls"]
-                                        if sub_backup["batch_idx"] is not None:
-                                            sub_batch["batch_idx"] = sub_backup["batch_idx"]
+                                        rollback_batch_state(sub_batch, sub_backup, attacker)
                                         self.epoch_attack_stats["failed"][att] += n_sub
                                         self.epoch_attack_stats["actual_raw"] += n_sub
                         finally:
@@ -1417,7 +1391,7 @@ class DetectionTrainer(BaseTrainer):
                     f"  Planned:  "
                     + ", ".join(f"{t}: {r:.3f} ({self.epoch_counts[t]})" for t, r in planned_ratios.items())
                     + "\n"
-                    f"  Actual:   "
+                    "  Actual:   "
                     + ", ".join(f"{t}: {r:.3f} ({actual_counts[t]})" for t, r in actual_ratios.items())
                     + "\n"
                     f"  Details:  attempted={self.epoch_attack_stats['attempted']}, generated={self.epoch_attack_stats['generated']}, "

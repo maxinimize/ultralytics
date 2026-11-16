@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
-from ultralytics.attacks.attack_utils import extract_detection_model, setup_attack_model
+from ultralytics.attacks.attack_utils import extract_detection_model, isolate_rng, setup_attack_model
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import PreprocessDetectorWrapper
@@ -408,6 +408,17 @@ class DetectionValidator(BaseValidator):
         Returns:
             (dict): Dictionary containing validation statistics.
         """
+        val_seed = getattr(self.args, "seed", None)
+        if val_seed is None and trainer is not None:
+            val_seed = getattr(getattr(trainer, "args", None), "seed", None)
+        val_seed = int(val_seed) if val_seed is not None else 0
+        train_attackers = getattr(trainer, "attackers", getattr(trainer, "attacker", None)) if trainer else None
+        dl = getattr(trainer, "train_loader", None) if trainer else None
+
+        with isolate_rng(seed=val_seed, attackers=train_attackers, dataloader=dl):
+            return self._execute_validation(trainer=trainer, model=model)
+
+    def _execute_validation(self, trainer=None, model=None):
         self.training = trainer is not None
         if trainer is not None:
             if hasattr(trainer, "strict_attacks"):
@@ -868,10 +879,20 @@ class DetectionValidator(BaseValidator):
             f"{unwrapped_info} | target={target_desc} | weight_checksum={weight_checksum:.6f}"
         )
 
+        val_seed = getattr(self.args, "seed", None)
+        if val_seed is None and trainer is not None:
+            val_seed = getattr(getattr(trainer, "args", None), "seed", None)
+        val_seed = int(val_seed) if val_seed is not None else 0
+
         val_attackers = {}
         for att in eval_attacks:
             try:
-                val_attackers[att] = build_attacker(att, model=val_attack_target, img_size=imgsz)
+                val_attackers[att] = build_attacker(
+                    att,
+                    model=val_attack_target,
+                    img_size=imgsz,
+                    seed=val_seed,
+                )
             except Exception as e:
                 if self.strict_attacks:
                     raise RuntimeError(f"Failed to initialize validation attacker '{att}': {e}") from e

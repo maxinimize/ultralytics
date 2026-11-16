@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import random
 import shutil
 import tempfile
 import unittest
@@ -20,12 +21,14 @@ from ultralytics.attacks.art_bim import ARTBIM
 from ultralytics.attacks.art_fgsm import ARTFGSM
 from ultralytics.attacks.art_mim import ARTMIM
 from ultralytics.attacks.art_pgd import ARTPGD
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch, slice_batch_indices
 from ultralytics.attacks.attack_utils import (
     capture_module_training_states,
     extract_detection_model,
     preserve_module_training_states,
     restore_module_training_states,
+    rollback_batch_state,
+    snapshot_batch_state,
 )
 from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 from ultralytics.cfg import get_cfg
@@ -3228,6 +3231,401 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertEqual(last_ckpt["best_fitness"], 0.50)
         # Stage 1 periodic checkpoint uses 1-based indexing: epoch 2 -> epoch3.pt
         self.assertTrue((trainer.wdir / "epoch3.pt").is_file())
+
+    def test_part_a_validation_seed_binding_and_isolation(self):
+        """Verify Part A: Validation attackers bind experiment seed, WorstK private generator is deterministic,
+        STNTrainer.validate passes seed, and validator __call__ isolates RNG without advancing training state."""
+        # 1. Check setup_validation_attackers binds self.args.seed to WorstK
+        model = MockYOLOModel(ch=16)
+        val = DetectionValidatorAdvAdaptive.__new__(DetectionValidatorAdvAdaptive)
+        val.args = type("Args", (), {"seed": 17, "imgsz": 64})()
+        val.device = next(model.parameters()).device
+        val.attack_weights = "none"
+        val.strict_attacks = True
+        val.preprocess_mode = "none"
+        val.attack_through_preprocess = False
+
+        val.setup_validation_attackers(["worstk"], model=model)
+        self.assertIn("worstk", val.attackers)
+        worstk_att = val.attackers["worstk"]
+        self.assertEqual(worstk_att.seed, 17)
+
+        # 2. Test seed reproducibility and diversity: seed=17 produces identical candidates, seed=0 is different
+        batch1 = {
+            "img": torch.rand(2, 3, 64, 64),
+            "batch_idx": torch.tensor([0, 1]),
+            "cls": torch.tensor([[0.0], [0.0]]),
+            "bboxes": torch.tensor([[0.2, 0.2, 0.3, 0.3], [0.5, 0.5, 0.2, 0.2]]),
+        }
+        batch2 = copy.deepcopy(batch1)
+        batch3 = copy.deepcopy(batch1)
+
+        worstk_17_a = build_attacker("worstk", model, img_size=64, seed=17)
+        worstk_17_b = build_attacker("worstk", model, img_size=64, seed=17)
+        worstk_0 = build_attacker("worstk", model, img_size=64, seed=0)
+
+        run_attack_on_batch(worstk_17_a, batch1)
+        run_attack_on_batch(worstk_17_b, batch2)
+        run_attack_on_batch(worstk_0, batch3)
+
+        self.assertTrue(torch.allclose(batch1["gt_matrix"], batch2["gt_matrix"], atol=1e-5))
+        self.assertFalse(torch.allclose(batch1["gt_matrix"], batch3["gt_matrix"], atol=1e-5))
+
+        # 3. Check STNTrainer.validate passes seed to self.validator
+        from ultralytics.models.yolo.detect.train_stn import STNTrainer
+
+        stn_trainer = STNTrainer.__new__(STNTrainer)
+        stn_trainer.epoch = 0
+        stn_trainer.epochs = 1
+        stn_trainer.stn_cfg = {"val_interval": 1}
+        stn_trainer.stn = torch.nn.Identity()
+        stn_trainer.data = {}
+        stn_trainer.guidance_model = model
+        stn_trainer.attacker = worstk_17_a
+        stn_trainer.args = type("Args", (), {"seed": 42})()
+
+        recorded_val_call = {}
+
+        class MockSTNValidator:
+            data = None
+            stn = None
+            guidance_model = None
+            attacker = None
+
+            def __call__(self, trainer=None, seed=None):
+                recorded_val_call["seed"] = seed
+                return {"worstk/mAP50-95": 0.42}
+
+        stn_trainer.validator = MockSTNValidator()
+        _res, worstk_map = stn_trainer.validate()
+        self.assertEqual(recorded_val_call.get("seed"), 42, "STNTrainer.validate must pass val_seed to validator")
+        self.assertAlmostEqual(worstk_map, 0.42)
+
+        # 4. Check validator __call__ isolation: caller's training attacker generator is not advanced
+        train_worstk = build_attacker("worstk", model, img_size=64, seed=123)
+        before_gen_state = train_worstk._generator.get_state().clone()
+        import random
+
+        before_py_state = random.getstate()
+
+        # Direct validator call wrapped in isolate_rng
+        val_validator = DetectionValidatorAdvAdaptive.__new__(DetectionValidatorAdvAdaptive)
+        val_validator.args = type("Args", (), {"seed": 999, "plots": False, "save_json": False})()
+        val_trainer = SimpleNamespace(
+            device=torch.device("cpu"),
+            data={"nc": 80},
+            model=model,
+            args=SimpleNamespace(seed=999, compile=False, plots=False),
+            attackers={"worstk": train_worstk},
+            attacker=train_worstk,
+            train_loader=None,
+        )
+        val_validator._execute_validation = lambda trainer=None, model=None: {"fitness": 0.5}
+        val_validator(trainer=val_trainer)
+
+        after_gen_state = train_worstk._generator.get_state()
+        self.assertTrue(
+            torch.equal(before_gen_state, after_gen_state), "Validator must not advance training attacker generator"
+        )
+        self.assertEqual(before_py_state, random.getstate(), "Validator must not leak Python RNG state")
+
+        # 5. Check CLI runner parsers accept --seed
+        for desc in [
+            "train_adv_adaptive_run",
+            "train_adv_fgd_stn_adaptive_run",
+            "val_adv_fgd_stn_adaptive_run",
+        ]:
+            file_path = Path(__file__).resolve().parent.parent / f"{desc}.py"
+            content = file_path.read_text(encoding="utf-8")
+            self.assertIn("--seed", content, f"{desc}.py must have --seed CLI option")
+
+    def test_part_b_adaptive_resume_rng_restoration_timing(self):
+        """Verify Part B: Adaptive resume RNG restoration happens after setup_train completes,
+        does not prematurely fire in set_model_attributes, and ignores checkpoint RNG when not resuming."""
+        model = MockYOLOModel(ch=16)
+
+        # 1. set_model_attributes must NOT clear _resume_random_state prematurely
+        trainer = DetectionTrainerAdvAdaptive.__new__(DetectionTrainerAdvAdaptive)
+        trainer.resume = True
+        fake_rng = {
+            "torch": torch.get_rng_state().clone(),
+            "cuda": None,
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "dataloader": torch.get_rng_state().clone(),
+        }
+        trainer._resume_random_state = fake_rng
+        trainer._resume_attacker_state = {"worstk": {"seed": 123}}
+        trainer.attack_names = ["worstk"]
+        trainer.strict_attacks = False
+        trainer.device = torch.device("cpu")
+        trainer.args = type("Args", (), {"imgsz": 64, "seed": 42})()
+        trainer.data = {"nc": 80, "names": {i: f"cls_{i}" for i in range(80)}}
+        trainer.model = model
+        trainer.attack_model = None
+
+        trainer.set_model_attributes()
+        # _resume_random_state must STILL be present (not cleared in set_model_attributes!)
+        self.assertIsNotNone(
+            trainer._resume_random_state, "set_model_attributes must not prematurely restore/clear RNG state"
+        )
+        self.assertIsNotNone(trainer._resume_attacker_state)
+
+        # 2. _restore_resume_rng_and_attackers clears it only when explicitly invoked
+        trainer.train_loader = type("MockLoader", (), {"generator": torch.Generator()})()
+        trainer._restore_resume_rng_and_attackers()
+        self.assertIsNone(
+            trainer._resume_random_state, "_restore_resume_rng_and_attackers must clear _resume_random_state"
+        )
+        self.assertIsNone(trainer._resume_attacker_state)
+
+        # 3. If resume is False (e.g. stage1_weights starting a new Stage 2), checkpoint RNG is ignored
+        trainer_fresh = DetectionTrainerAdvAdaptive.__new__(DetectionTrainerAdvAdaptive)
+        trainer_fresh.resume = False
+        trainer_fresh._resume_random_state = fake_rng
+        trainer_fresh._resume_attacker_state = {"worstk": {"seed": 123}}
+        before_torch_rng = torch.get_rng_state()
+        trainer_fresh._restore_resume_rng_and_attackers()
+        self.assertIsNone(trainer_fresh._resume_random_state)
+        self.assertTrue(
+            torch.equal(before_torch_rng, torch.get_rng_state()), "Fresh training must not adopt checkpoint RNG"
+        )
+
+    def test_part_c_chunked_attack_metadata_slicing_and_aggregation(self):
+        """Verify Part C: Chunked WorstK attack correctly aggregates pre_attack_*, gt_matrix, gt_params,
+        and slice_batch_indices preserves per-sample matrices and independent target masks."""
+        model = MockYOLOModel(ch=16)
+        worstk = build_attacker("worstk", model, img_size=64, seed=42)
+
+        # Parent batch with 6 images and 8 targets
+        device = next(model.parameters()).device
+        orig_batch = {
+            "img": torch.rand(6, 3, 64, 64, device=device),
+            "batch_idx": torch.tensor([0, 0, 1, 2, 2, 3, 4, 5], device=device),
+            "cls": torch.zeros(8, 1, device=device),
+            "bboxes": torch.tensor(
+                [
+                    [0.2, 0.2, 0.2, 0.2],
+                    [0.6, 0.6, 0.2, 0.2],
+                    [0.3, 0.3, 0.2, 0.2],
+                    [0.1, 0.1, 0.1, 0.1],
+                    [0.7, 0.7, 0.2, 0.2],
+                    [0.4, 0.4, 0.3, 0.3],
+                    [0.5, 0.5, 0.2, 0.2],
+                    [0.2, 0.5, 0.2, 0.2],
+                ],
+                device=device,
+            ),
+        }
+
+        # 1. Test slice_batch_indices with pre_attack targets and per-sample gt_matrix
+        orig_batch["gt_matrix"] = torch.eye(3, device=device).unsqueeze(0).repeat(6, 1, 1)[:, :2, :]
+        orig_batch["gt_params"] = torch.zeros(6, 3, device=device)
+        orig_batch["pre_attack_batch_idx"] = orig_batch["batch_idx"].clone()
+        orig_batch["pre_attack_cls"] = orig_batch["cls"].clone()
+        orig_batch["pre_attack_bboxes"] = orig_batch["bboxes"].clone()
+
+        sub = slice_batch_indices(orig_batch, [2, 3])
+        self.assertEqual(sub["img"].shape[0], 2)
+        self.assertEqual(sub["gt_matrix"].shape[0], 2)
+        self.assertEqual(sub["gt_params"].shape[0], 2)
+        # In sub_batch, targets for images 2 and 3 should have new batch_idx 0 and 1
+        self.assertEqual(sub["batch_idx"].tolist(), [0, 0, 1])
+        self.assertEqual(sub["pre_attack_batch_idx"].tolist(), [0, 0, 1])
+        self.assertEqual(len(sub["bboxes"]), 3)
+
+        # 2. Test chunked run_attack_on_batch with max_batch_size=2 on 6-image batch
+        clean_batch = {
+            "img": orig_batch["img"].clone(),
+            "batch_idx": torch.tensor([0, 0, 1, 2, 2, 3, 4, 5], device=device),
+            "cls": orig_batch["cls"].clone(),
+            "bboxes": orig_batch["bboxes"].clone(),
+        }
+        adv_imgs = run_attack_on_batch(worstk, clean_batch, max_batch_size=2)
+        self.assertIsNotNone(adv_imgs)
+        self.assertEqual(adv_imgs.shape, orig_batch["img"].shape)
+
+        # Parent batch must have accumulated pre_attack_* and gt_matrix / gt_params across chunks!
+        self.assertIn("pre_attack_bboxes", clean_batch)
+        self.assertIn("pre_attack_batch_idx", clean_batch)
+        self.assertIn("pre_attack_cls", clean_batch)
+        self.assertIn("gt_matrix", clean_batch)
+        self.assertIn("gt_params", clean_batch)
+        self.assertEqual(clean_batch["gt_matrix"].shape[0], 6)
+        self.assertEqual(clean_batch["gt_params"].shape[0], 6)
+        self.assertEqual(clean_batch["pre_attack_bboxes"].shape[0], 8)
+
+        # 3. Verify transform_batch_bboxes_for_stn succeeds on the chunked attack output
+        pred_m = torch.eye(3, device=device).unsqueeze(0).repeat(6, 1, 1)
+        rect_batch = transform_batch_bboxes_for_stn(clean_batch, pred_m, height=64, width=64)
+        self.assertIn("bboxes", rect_batch)
+        self.assertGreater(rect_batch["bboxes"].shape[0], 0)
+
+    def test_part_d_non_strict_attack_transaction_rollback(self):
+        """Verify Part D: Non-strict attack failure completely rolls back all added attack fields
+        (gt_matrix, pre_attack_*, etc.) and restores clean images/labels without phantom matrices."""
+        device = torch.device("cpu")
+        sub_batch = {
+            "img": torch.ones(2, 3, 32, 32, device=device),
+            "batch_idx": torch.tensor([0, 1], device=device),
+            "cls": torch.tensor([[0.0], [1.0]], device=device),
+            "bboxes": torch.tensor([[0.2, 0.2, 0.3, 0.3], [0.4, 0.4, 0.2, 0.2]], device=device),
+        }
+
+        # Take snapshot
+        backup = snapshot_batch_state(sub_batch)
+
+        # Simulate a failed attack that corrupts img and injects spatial attack metadata before raising
+        sub_batch["img"] = torch.full_like(sub_batch["img"], 999.0)
+        sub_batch["bboxes"] = torch.tensor([[0.1, 0.1, 0.1, 0.1]], device=device)
+        sub_batch["gt_matrix"] = torch.rand(2, 2, 3, device=device)
+        sub_batch["gt_params"] = torch.rand(2, 3, device=device)
+        sub_batch["pre_attack_bboxes"] = torch.rand(2, 4, device=device)
+        sub_batch["attack_matrices"] = torch.rand(2, 3, 3, device=device)
+        sub_batch["attack_metadata"] = {"status": "partial"}
+
+        mock_attacker = SimpleNamespace(
+            last_selected_matrices=torch.rand(2, 2, 3),
+            last_selected_params=torch.rand(2, 3),
+            last_metadata={"test": 1},
+        )
+
+        # Execute rollback
+        rollback_batch_state(sub_batch, backup, mock_attacker)
+
+        # Newly injected keys must be deleted
+        self.assertNotIn("gt_matrix", sub_batch)
+        self.assertNotIn("gt_params", sub_batch)
+        self.assertNotIn("pre_attack_bboxes", sub_batch)
+        self.assertNotIn("attack_matrices", sub_batch)
+        self.assertNotIn("attack_metadata", sub_batch)
+
+        # Original keys must be perfectly restored
+        self.assertTrue(torch.equal(sub_batch["img"], torch.ones(2, 3, 32, 32, device=device)))
+        self.assertEqual(len(sub_batch["bboxes"]), 2)
+        self.assertTrue(torch.equal(sub_batch["batch_idx"], torch.tensor([0, 1], device=device)))
+
+        # Transient attacker state must be cleared
+        self.assertIsNone(mock_attacker.last_selected_matrices)
+        self.assertIsNone(mock_attacker.last_selected_params)
+        self.assertIsNone(mock_attacker.last_metadata)
+
+    def test_part_e_standalone_validation_default_pure_yolo_attack(self):
+        """Verify Part E: Standalone validation runner defaults to attack_through_preprocess=False,
+        targeting pure YOLO directly; missing fixed surrogate weights strictly raise FileNotFoundError."""
+        import val_adv_fgd_stn_adaptive_run as val_runner
+
+        # Check default value in main parser
+        runner_path = Path(val_runner.__file__).resolve()
+        content = runner_path.read_text(encoding="utf-8")
+        self.assertIn("default=False", content)
+
+        model = MockYOLOModel(ch=16)
+        val = DetectionValidatorAdvFGDSTNAdaptive.__new__(DetectionValidatorAdvFGDSTNAdaptive)
+        val.args = type("Args", (), {"seed": 0, "imgsz": 64})()
+        val.device = next(model.parameters()).device
+        val.preprocess_mode = "fgd_stn"
+        val.pipeline = FGDSTNPipeline(freeze_modules=True)
+        val.strict_attacks = True
+
+        # When attack_through_preprocess=False: targets pure YOLO detector
+        val.attack_through_preprocess = False
+        val.attack_weights = "none"
+        val.setup_validation_attackers(["pgd"], model=model)
+        pgd_att = val.attackers["pgd"]
+        self.assertNotIsInstance(
+            pgd_att.model, PreprocessDetectorWrapper, "Must target pure YOLO, not PreprocessDetectorWrapper"
+        )
+
+        # When attack_through_preprocess=True: targets PreprocessDetectorWrapper
+        val.attack_through_preprocess = True
+        val.setup_validation_attackers(["pgd"], model=model)
+        pgd_att_wrapper = val.attackers["pgd"]
+        self.assertIsInstance(
+            pgd_att_wrapper.model, PreprocessDetectorWrapper, "Explicit True must wrap with PreprocessDetectorWrapper"
+        )
+
+        # Missing fixed surrogate weights must raise FileNotFoundError
+        val.attack_weights = "/nonexistent/path/to/weights.pt"
+        with self.assertRaises(FileNotFoundError):
+            val.setup_validation_attackers(["pgd"], model=model)
+
+    def test_part_f_stage1_fp32_precision_unification(self):
+        """Verify Part F: Stage 1 validation across all paths defaults to FP32, does not inherit
+        FP16 from trainer.amp, and run_epoch0_eval records precision/split/imgsz/batch."""
+        model = MockYOLOModel(ch=16)
+
+        # 1. Training validation with trainer.amp=True in Stage 1 must STILL use FP32 (quantize=None)
+        val = DetectionValidatorAdvFGDSTNStaged.__new__(DetectionValidatorAdvFGDSTNStaged)
+        val.stage = 1
+        val.args = type("Args", (), {"augment": False, "quantize": 16, "plots": False})()
+        val._setup_pipeline = lambda device: None
+        val.preprocess_mode = "none"
+        val.attack_through_preprocess = False
+
+        fake_trainer = SimpleNamespace(
+            device=torch.device("cpu"),
+            data={"nc": 80},
+            amp=True,  # training uses AMP
+            model=model,
+            ema=None,
+            args=SimpleNamespace(compile=False, plots=False),
+            attackers=None,
+            attacker=None,
+            train_loader=None,
+            test_loader=None,
+        )
+        val.get_dataloader = lambda split, batch: []
+        val.setup_validation_attackers = lambda *args, **kwargs: None
+
+        def mock_val_loop(trainer=None, model=None):
+            return {"fitness": 0.5, "quantize": val.args.quantize}
+
+        val._execute_validation = mock_val_loop
+        val(trainer=fake_trainer)
+        self.assertIsNone(
+            val.args.quantize, "Stage 1 validation must be FP32 (quantize=None) regardless of trainer.amp"
+        )
+
+        # 2. Standalone eval_only in Stage 1: records precision='FP32' in results_record
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 1
+        trainer.model = model
+        trainer.device = torch.device("cpu")
+        trainer.preprocess_mode = "none"
+        trainer.fgd_weights = None
+        trainer.stn_weights = None
+        trainer.args = SimpleNamespace(
+            model="yolo12n.pt",
+            split="val",
+            imgsz=64,
+            batch=16,
+            seed=0,
+            task="detect",
+            eval_only=True,
+        )
+        trainer.save_dir = Path(tempfile.mkdtemp())
+        trainer.set_model_attributes = lambda: None
+        trainer.data = {"val": "data.yaml"}
+        trainer.test_loader = []
+
+        class MockValidator:
+            args = SimpleNamespace(quantize=None)
+
+            def __call__(self, tr):
+                return {"metrics/mAP50(B)": 0.8, "metrics/mAP50-95(B)": 0.6, "fitness": 0.6}
+
+        trainer.get_validator = lambda: MockValidator()
+        rec = trainer.run_epoch0_eval(save_results=True)
+        self.assertEqual(rec["precision"], "FP32")
+        self.assertEqual(rec["split"], "val")
+        self.assertEqual(rec["imgsz"], 64)
+        self.assertEqual(rec["batch"], 16)
+
+        # 3. Stage 2 eval_only must raise NotImplementedError
+        trainer.stage = 2
+        with self.assertRaises(NotImplementedError):
+            trainer.eval_only()
 
 
 if __name__ == "__main__":

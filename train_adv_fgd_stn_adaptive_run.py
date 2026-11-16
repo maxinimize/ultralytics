@@ -153,6 +153,12 @@ def main():
         help="Precision mode (default: bf16).",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: None, inherits default).",
+    )
+    parser.add_argument(
         "--fraction",
         type=float,
         default=1.0,
@@ -198,6 +204,9 @@ def main():
         overrides["data"] = args.data
     elif not args.resume:
         overrides["data"] = "coco128.yaml"
+
+    if args.seed is not None:
+        overrides["seed"] = int(args.seed)
 
     if args.attack_weights is not None:
         overrides["attack_weights"] = args.attack_weights

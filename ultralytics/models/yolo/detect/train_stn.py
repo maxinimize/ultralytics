@@ -411,7 +411,7 @@ class STNTrainer(DetectionTrainer):
             attackers=self.attacker,
             dataloader=getattr(self, "train_loader", None),
         ):
-            results = self.validator(trainer=self)
+            results = self.validator(trainer=self, seed=val_seed)
             worstk_map = float(results.get("worstk/mAP50-95", 0.0))
         self.stn.train().requires_grad_(True)
         return results, worstk_map

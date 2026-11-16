@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import csv
 import io
 import math
 import random
@@ -12,47 +11,38 @@ import warnings
 from copy import copy, deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Dict, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import distributed as dist
 
 from ultralytics import __version__
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
-from ultralytics.attacks.attack_utils import setup_attack_model
-from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.attacks.attack_bridge import run_attack_on_batch
+from ultralytics.attacks.attack_utils import rollback_batch_state, setup_attack_model, snapshot_batch_state
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
-    VALID_MODES,
     FGDSTNPipeline,
     PreprocessDetectorWrapper,
     build_fgd_stn_pipeline,
     canonicalize_mode,
     transform_batch_bboxes_for_stn,
 )
-from ultralytics.engine.trainer import BaseTrainer
-from ultralytics.models import yolo
 from ultralytics.models.yolo.detect.train_adv_adaptive import (
     DetectionTrainer as DetectionTrainerAdvAdaptive,
+)
+from ultralytics.models.yolo.detect.train_adv_adaptive import (
     DynamicAttackRatioController,
-    YOLODatasetAdvAdaptive,
-    parse_list_arg,
 )
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
 )
-from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, YAML, colorstr, TQDM
-from ultralytics.utils.patches import override_configs
-from ultralytics.utils.plotting import plot_images, plot_labels
+from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, YAML, colorstr
 from ultralytics.utils.torch_utils import (
     autocast,
     convert_optimizer_state_dict_to_fp16,
     qat_state,
     strip_qat,
-    torch_distributed_zero_first,
     unset_deterministic,
     unwrap_model,
 )
@@ -382,8 +372,6 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                     if att not in self.attackers or self.attackers[att] is None:
                         if self.strict_attacks:
                             raise RuntimeError(f"Attacker '{att}' failed to initialize.")
-
-            self._restore_resume_rng_and_attackers()
         except Exception as e:
             if getattr(self, "strict_attacks", True):
                 raise
@@ -620,6 +608,9 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             self._setup_ddp()
         self._setup_train()
 
+        if self.resume:
+            self._restore_resume_rng_and_attackers()
+
         nb = len(self.train_loader)
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
         last_opt_step = -1
@@ -659,14 +650,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
             needs_reset = False
-            if epoch == self.start_epoch and self.resume:
-                if hasattr(self.train_loader.dataset, "update_virtual_samples"):
-                    self.train_loader.dataset.update_virtual_samples(
-                        attack_ratios=self.adaptive_controller.current_train_ratios,
-                        seed=epoch_seed,
-                    )
-                    needs_reset = True
-            elif epoch > self.start_epoch:
+            if epoch == self.start_epoch and self.resume or epoch > self.start_epoch:
                 if hasattr(self.train_loader.dataset, "update_virtual_samples"):
                     self.train_loader.dataset.update_virtual_samples(
                         attack_ratios=self.adaptive_controller.current_train_ratios,
@@ -787,24 +771,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                                         continue
 
                                     # Backup sub_batch before running attack for potential rollback
-                                    sub_backup = {
-                                        "img": sub_batch["img"].clone(),
-                                        "bboxes": (
-                                            sub_batch["bboxes"].clone()
-                                            if ("bboxes" in sub_batch and torch.is_tensor(sub_batch["bboxes"]))
-                                            else None
-                                        ),
-                                        "cls": (
-                                            sub_batch["cls"].clone()
-                                            if ("cls" in sub_batch and torch.is_tensor(sub_batch["cls"]))
-                                            else None
-                                        ),
-                                        "batch_idx": (
-                                            sub_batch["batch_idx"].clone()
-                                            if ("batch_idx" in sub_batch and torch.is_tensor(sub_batch["batch_idx"]))
-                                            else None
-                                        ),
-                                    }
+                                    sub_backup = snapshot_batch_state(sub_batch)
 
                                     try:
                                         if hasattr(attacker, "proxy_model"):
@@ -865,13 +832,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                                             f"Adversarial generation failed for attack '{att}' at batch {i}: {e}. Rolling back to raw."
                                         )
                                         # Rollback sub_batch to guarantee paired image and labels
-                                        sub_batch["img"] = sub_backup["img"]
-                                        if sub_backup["bboxes"] is not None:
-                                            sub_batch["bboxes"] = sub_backup["bboxes"]
-                                        if sub_backup["cls"] is not None:
-                                            sub_batch["cls"] = sub_backup["cls"]
-                                        if sub_backup["batch_idx"] is not None:
-                                            sub_batch["batch_idx"] = sub_backup["batch_idx"]
+                                        rollback_batch_state(sub_batch, sub_backup, attacker)
                                         self.epoch_attack_stats["failed"][att] += n_sub
                                         self.epoch_attack_stats["actual_raw"] += n_sub
                         finally:
@@ -1166,6 +1127,6 @@ DetectionTrainer = DetectionTrainerAdvFGDSTNAdaptive
 
 __all__ = [
     "AdaptiveAttackRatioController",
-    "DetectionTrainerAdvFGDSTNAdaptive",
     "DetectionTrainer",
+    "DetectionTrainerAdvFGDSTNAdaptive",
 ]

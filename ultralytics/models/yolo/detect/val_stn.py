@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.defenses.spatial_transformer import (
     SpatialTransformer,
@@ -274,43 +275,53 @@ class STNDetectionValidator(BaseValidator):
         self,
         trainer=None,
         modes: list[str] | None = None,
-        seed: int = 0,
+        seed: int | None = None,
     ) -> dict[str, float]:
         """Execute evaluation across selected modes and return consolidated results."""
-        if trainer is not None:
-            self.device = trainer.device
-            self.stn = trainer.stn
-            self.guidance_model = trainer.guidance_model
-            self.attacker = trainer.attacker
-            self.dataloader = trainer.test_loader
-            if hasattr(trainer, "data") and trainer.data:
-                self.data = trainer.data
+        if seed is None:
+            if trainer is not None and getattr(getattr(trainer, "args", None), "seed", None) is not None:
+                seed = int(trainer.args.seed)
+            elif hasattr(self, "args") and getattr(self.args, "seed", None) is not None:
+                seed = int(self.args.seed)
+            else:
+                seed = 0
+
+        effective_seed = int(seed)
+        with isolate_rng(seed=effective_seed, attackers=self.attacker):
+            if trainer is not None:
+                self.device = trainer.device
+                self.stn = trainer.stn
+                self.guidance_model = trainer.guidance_model
+                self.attacker = trainer.attacker
+                self.dataloader = trainer.test_loader
+                if hasattr(trainer, "data") and trainer.data:
+                    self.data = trainer.data
+                if modes is None:
+                    # Fast epoch validation during training
+                    modes = ["clean_stn", "worstk_stn"]
+
             if modes is None:
-                # Fast epoch validation during training
-                modes = ["clean_stn", "worstk_stn"]
+                modes = ["clean_baseline", "worstk_baseline", "clean_stn", "worstk_stn"]
 
-        if modes is None:
-            modes = ["clean_baseline", "worstk_baseline", "clean_stn", "worstk_stn"]
+            self.guidance_model.eval().requires_grad_(False)
+            if self.stn is not None:
+                self.stn.eval()
 
-        self.guidance_model.eval().requires_grad_(False)
-        if self.stn is not None:
-            self.stn.eval()
+            all_results = {}
+            for m in modes:
+                LOGGER.info(f"--- Running STN Validator: {m} ---")
+                res = self.run_single_eval(m, seed=effective_seed)
+                all_results.update(res)
+                LOGGER.info(
+                    f"{m} -> mAP50: {res.get(f'{m}/mAP50', 0.0):.4f}, mAP50-95: {res.get(f'{m}/mAP50-95', 0.0):.4f}"
+                )
 
-        all_results = {}
-        for m in modes:
-            LOGGER.info(f"--- Running STN Validator: {m} ---")
-            res = self.run_single_eval(m, seed=seed)
-            all_results.update(res)
-            LOGGER.info(
-                f"{m} -> mAP50: {res.get(f'{m}/mAP50', 0.0):.4f}, mAP50-95: {res.get(f'{m}/mAP50-95', 0.0):.4f}"
-            )
+            # Standardize main summary metrics
+            if "worstk_stn/mAP50-95" in all_results:
+                all_results["worstk/mAP50-95"] = all_results["worstk_stn/mAP50-95"]
+                all_results["worstk/mAP50"] = all_results["worstk_stn/mAP50"]
+            if "clean_stn/mAP50-95" in all_results:
+                all_results["clean/mAP50-95"] = all_results["clean_stn/mAP50-95"]
+                all_results["clean/mAP50"] = all_results["clean_stn/mAP50"]
 
-        # Standardize main summary metrics
-        if "worstk_stn/mAP50-95" in all_results:
-            all_results["worstk/mAP50-95"] = all_results["worstk_stn/mAP50-95"]
-            all_results["worstk/mAP50"] = all_results["worstk_stn/mAP50"]
-        if "clean_stn/mAP50-95" in all_results:
-            all_results["clean/mAP50-95"] = all_results["clean_stn/mAP50-95"]
-            all_results["clean/mAP50"] = all_results["clean_stn/mAP50"]
-
-        return all_results
+            return all_results

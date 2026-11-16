@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
+from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
@@ -304,6 +305,22 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
 
     def __call__(self, trainer=None, model=None):
         """Execute staged validation process with defense preprocessing and proper fitness computation."""
+        if (getattr(self, "stage", None) == 1 or getattr(trainer, "stage", None) == 1) and hasattr(self, "args"):
+            self.args.quantize = None
+            if hasattr(self.args, "half"):
+                self.args.half = False
+
+        val_seed = getattr(self.args, "seed", None)
+        if val_seed is None and trainer is not None:
+            val_seed = getattr(getattr(trainer, "args", None), "seed", None)
+        val_seed = int(val_seed) if val_seed is not None else 0
+        train_attackers = getattr(trainer, "attackers", getattr(trainer, "attacker", None)) if trainer else None
+        dl = getattr(trainer, "train_loader", None) if trainer else None
+
+        with isolate_rng(seed=val_seed, attackers=train_attackers, dataloader=dl):
+            return self._execute_validation(trainer=trainer, model=model)
+
+    def _execute_validation(self, trainer=None, model=None):
         if trainer is not None:
             if hasattr(trainer, "stage"):
                 self.stage = int(trainer.stage)
@@ -336,7 +353,11 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         if self.training:
             self.device = trainer.device
             self.data = trainer.data
-            self.args.quantize = 16 if (self.device.type != "cpu" and getattr(trainer, "amp", False)) else None
+            if self.stage == 1:
+                # Stage 1: Explicitly unify validation precision to FP32 across all paths
+                self.args.quantize = None
+            else:
+                self.args.quantize = 16 if (self.device.type != "cpu" and getattr(trainer, "amp", False)) else None
             model = (getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None)) or trainer.model
             if getattr(trainer.args, "compile", False) and hasattr(model, "_orig_mod"):
                 model = model._orig_mod
@@ -360,15 +381,19 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             if str(self.args.model).endswith(".yaml") and model is None:
                 LOGGER.warning("Validating an untrained model YAML will result in 0 mAP.")
             callbacks.add_integration_callbacks(self)
+            use_fp16 = False if self.stage == 1 else (self.args.quantize == 16)
             model = AutoBackend(
                 model=model or self.args.model,
                 device=select_device(self.args.device) if RANK == -1 else torch.device("cuda", RANK),
                 dnn=self.args.dnn,
                 data=self.args.data,
-                fp16=self.args.quantize == 16,
+                fp16=use_fp16,
             )
             self.device = model.device
-            self.args.quantize = 16 if model.fp16 else None
+            if self.stage == 1:
+                self.args.quantize = None
+            else:
+                self.args.quantize = 16 if model.fp16 else None
             stride, fmt = model.stride, model.format
             pt = fmt == "pt"
             imgsz = check_imgsz(self.args.imgsz, stride=stride)

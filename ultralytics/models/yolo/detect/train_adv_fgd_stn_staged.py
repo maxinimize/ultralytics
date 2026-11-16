@@ -22,7 +22,7 @@ from torch import nn
 
 from ultralytics import __version__
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
-from ultralytics.attacks.attack_utils import isolate_rng, setup_attack_model
+from ultralytics.attacks.attack_utils import isolate_rng, rollback_batch_state, setup_attack_model, snapshot_batch_state
 from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.defenses.fgd_stn_pipeline import (
@@ -519,7 +519,6 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 LOGGER.info(f"Attacker initialized: {att}")
 
         self.attacker = self.attackers.get(self.attack_names[0], None) if self.attackers else None
-        self._restore_resume_rng_and_attackers()
 
     def _setup_train(self):
         """Freeze non-head parameters and verify parameter isolation before training."""
@@ -1034,10 +1033,15 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         clean_map50_95 = float(stats.get("metrics/mAP50-95(B)", 0.0))
         fitness = float(stats.get("fitness", clean_map50_95))
 
+        val_precision = "FP32" if getattr(getattr(validator, "args", None), "quantize", None) != 16 else "FP16"
         results_record = {
             "epoch": eval_epoch,
             "stage": self.stage,
             "model": str(self.args.model),
+            "precision": val_precision,
+            "split": str(getattr(self.args, "split", "val")),
+            "imgsz": int(getattr(self.args, "imgsz", 640)),
+            "batch": int(getattr(self, "batch_size", getattr(self.args, "batch", 16))),
             "preprocess_mode": self.preprocess_mode,
             "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
             "stn_weights": str(self.stn_weights) if self.stn_weights else None,
@@ -1095,6 +1099,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         if self.world_size > 1:
             self._setup_ddp()
         self._setup_train()
+
+        if self.resume:
+            self._restore_resume_rng_and_attackers()
 
         nb = len(self.train_loader)
         nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1
@@ -1287,24 +1294,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                                         self.epoch_attack_stats["actual_raw"] += n_sub
                                         continue
 
-                                    sub_backup = {
-                                        "img": sub_batch["img"].clone(),
-                                        "bboxes": (
-                                            sub_batch["bboxes"].clone()
-                                            if ("bboxes" in sub_batch and torch.is_tensor(sub_batch["bboxes"]))
-                                            else None
-                                        ),
-                                        "cls": (
-                                            sub_batch["cls"].clone()
-                                            if ("cls" in sub_batch and torch.is_tensor(sub_batch["cls"]))
-                                            else None
-                                        ),
-                                        "batch_idx": (
-                                            sub_batch["batch_idx"].clone()
-                                            if ("batch_idx" in sub_batch and torch.is_tensor(sub_batch["batch_idx"]))
-                                            else None
-                                        ),
-                                    }
+                                    # Backup sub_batch before running attack for potential rollback
+                                    sub_backup = snapshot_batch_state(sub_batch)
 
                                     try:
                                         if hasattr(attacker, "proxy_model"):
@@ -1363,13 +1354,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                                         LOGGER.warning(
                                             f"Adversarial generation failed for attack '{att}' at batch {i}: {e}. Rolling back to raw."
                                         )
-                                        sub_batch["img"] = sub_backup["img"]
-                                        if sub_backup["bboxes"] is not None:
-                                            sub_batch["bboxes"] = sub_backup["bboxes"]
-                                        if sub_backup["cls"] is not None:
-                                            sub_batch["cls"] = sub_backup["cls"]
-                                        if sub_backup["batch_idx"] is not None:
-                                            sub_batch["batch_idx"] = sub_backup["batch_idx"]
+                                        # Rollback sub_batch to guarantee paired image and labels
+                                        rollback_batch_state(sub_batch, sub_backup, attacker)
                                         self.epoch_attack_stats["failed"][att] += n_sub
                                         self.epoch_attack_stats["actual_raw"] += n_sub
                         finally:

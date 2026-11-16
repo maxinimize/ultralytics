@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ultralytics.attacks.attack_utils import (
     capture_module_training_states,
@@ -310,9 +310,23 @@ def build_single_labels_from_batch(
 def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
     """Slice a batch dictionary for the specified sample indices."""
     sub_batch = {}
+    n_imgs = batch["img"].shape[0] if "img" in batch and torch.is_tensor(batch["img"]) else None
+
+    # Target group definitions: (batch_idx_key, associated_keys)
+    target_groups = [
+        ("batch_idx", ["cls", "bboxes", "masks", "keypoints", "segments", "obb"]),
+        ("pre_attack_batch_idx", ["pre_attack_cls", "pre_attack_bboxes"]),
+        ("clean_batch_idx", ["clean_cls", "clean_bboxes"]),
+    ]
+    all_target_keys = set()
+    for bi_k, f_keys in target_groups:
+        all_target_keys.add(bi_k)
+        all_target_keys.update(f_keys)
 
     for k, v in batch.items():
-        if k == "img":
+        if k in all_target_keys:
+            continue
+        elif k == "img":
             sub_batch["img"] = v[indices]
         elif k in {"im_file", "ori_shape", "ratio_pad", "sample_type", "attack_name"}:
             if isinstance(v, (list, tuple)):
@@ -321,66 +335,56 @@ def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
                 sub_batch[k] = v[indices]
             else:
                 sub_batch[k] = v
-        elif k in {"visuals", "sem_masks", "text_feats", "depth", "semantic_mask"}:
+        elif k in {
+            "visuals",
+            "sem_masks",
+            "text_feats",
+            "depth",
+            "semantic_mask",
+            "gt_matrix",
+            "attack_matrices",
+            "gt_params",
+        }:
             if isinstance(v, torch.Tensor):
                 sub_batch[k] = v[indices]
-        elif k not in {
-            "batch_idx",
-            "cls",
-            "bboxes",
-            "masks",
-            "keypoints",
-            "segments",
-            "obb",
-            "clean_batch_idx",
-            "clean_cls",
-            "clean_bboxes",
-            "pre_attack_batch_idx",
-            "pre_attack_cls",
-            "pre_attack_bboxes",
-        }:
+            elif isinstance(v, (list, tuple)):
+                sub_batch[k] = [v[i] for i in indices]
+            else:
+                sub_batch[k] = v
+        elif isinstance(v, torch.Tensor) and n_imgs is not None and v.shape[0] == n_imgs:
+            sub_batch[k] = v[indices]
+        elif isinstance(v, (list, tuple)) and n_imgs is not None and len(v) == n_imgs:
+            sub_batch[k] = [v[i] for i in indices]
+        else:
             sub_batch[k] = v
 
-    if "batch_idx" in batch and batch["batch_idx"] is not None:
-        batch_idx = batch["batch_idx"]
-        b_idx_1d = batch_idx.squeeze(-1) if batch_idx.dim() > 1 else batch_idx
-        start_idx = indices[0]
-        end_idx = indices[-1] + 1
-        if indices == list(range(start_idx, end_idx)):
-            mask = (b_idx_1d >= start_idx) & (b_idx_1d < end_idx)
-            new_b_idx = (b_idx_1d[mask] - start_idx).to(batch_idx.dtype)
-        else:
-            mask = torch.zeros(b_idx_1d.shape, dtype=torch.bool, device=batch_idx.device)
-            for idx in indices:
-                mask |= b_idx_1d == idx
-            idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
-            new_b_idx = torch.tensor(
-                [idx_map[int(x)] for x in b_idx_1d[mask].tolist()],
-                dtype=batch_idx.dtype,
-                device=batch_idx.device,
-            )
-        if batch_idx.dim() > 1:
-            new_b_idx = new_b_idx.unsqueeze(-1)
-        sub_batch["batch_idx"] = new_b_idx
+    # Slice each target group independently using its own batch_idx tensor
+    for bi_k, f_keys in target_groups:
+        if bi_k in batch and batch[bi_k] is not None:
+            batch_idx = batch[bi_k]
+            b_idx_1d = batch_idx.squeeze(-1) if batch_idx.dim() > 1 else batch_idx
+            start_idx = indices[0]
+            end_idx = indices[-1] + 1
+            if indices == list(range(start_idx, end_idx)):
+                mask = (b_idx_1d >= start_idx) & (b_idx_1d < end_idx)
+                new_b_idx = (b_idx_1d[mask] - start_idx).to(batch_idx.dtype)
+            else:
+                mask = torch.zeros(b_idx_1d.shape, dtype=torch.bool, device=batch_idx.device)
+                for idx in indices:
+                    mask |= b_idx_1d == idx
+                idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
+                new_b_idx = torch.tensor(
+                    [idx_map[int(x)] for x in b_idx_1d[mask].tolist()],
+                    dtype=batch_idx.dtype,
+                    device=batch_idx.device,
+                )
+            if batch_idx.dim() > 1:
+                new_b_idx = new_b_idx.unsqueeze(-1)
+            sub_batch[bi_k] = new_b_idx
 
-        for box_k in [
-            "cls",
-            "bboxes",
-            "masks",
-            "keypoints",
-            "segments",
-            "obb",
-            "clean_cls",
-            "clean_bboxes",
-            "pre_attack_cls",
-            "pre_attack_bboxes",
-        ]:
-            if box_k in batch and batch[box_k] is not None:
-                sub_batch[box_k] = batch[box_k][mask]
-
-        for bi_k in ["clean_batch_idx", "pre_attack_batch_idx"]:
-            if bi_k in batch and batch[bi_k] is not None:
-                sub_batch[bi_k] = new_b_idx
+            for box_k in f_keys:
+                if box_k in batch and batch[box_k] is not None:
+                    sub_batch[box_k] = batch[box_k][mask]
 
     return sub_batch
 
@@ -411,32 +415,26 @@ def run_attack_on_batch(
             is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(
                 getattr(attacker, "batch_aware", False)
             )
-            target_keys = (
-                [
-                    k
-                    for k in [
-                        "batch_idx",
-                        "cls",
-                        "bboxes",
-                        "masks",
-                        "keypoints",
-                        "segments",
-                        "obb",
-                        "clean_batch_idx",
-                        "clean_cls",
-                        "clean_bboxes",
-                        "pre_attack_batch_idx",
-                        "pre_attack_cls",
-                        "pre_attack_bboxes",
-                    ]
-                    if k in batch and batch[k] is not None
-                ]
-                if is_batch_aware
-                else []
-            )
-            collected_targets = {k: [] for k in target_keys}
+            possible_target_keys = [
+                "batch_idx",
+                "cls",
+                "bboxes",
+                "masks",
+                "keypoints",
+                "segments",
+                "obb",
+                "clean_batch_idx",
+                "clean_cls",
+                "clean_bboxes",
+                "pre_attack_batch_idx",
+                "pre_attack_cls",
+                "pre_attack_bboxes",
+            ]
+            collected_targets = {k: [] for k in possible_target_keys}
+            seen_target_keys = {k for k in possible_target_keys if k in batch and batch[k] is not None}
             collected_gt_matrices = []
             collected_gt_params = []
+            collected_attack_matrices = []
 
             for start_idx in range(0, bs, limit):
                 end_idx = min(start_idx + limit, bs)
@@ -459,19 +457,23 @@ def run_attack_on_batch(
                     collected_gt_params.append(sub_batch["gt_params"])
                 elif hasattr(attacker, "last_selected_params") and attacker.last_selected_params is not None:
                     collected_gt_params.append(attacker.last_selected_params)
+                if "attack_matrices" in sub_batch and sub_batch["attack_matrices"] is not None:
+                    collected_attack_matrices.append(sub_batch["attack_matrices"])
 
                 if is_batch_aware:
                     for bi_k in ["batch_idx", "clean_batch_idx", "pre_attack_batch_idx"]:
-                        if bi_k in target_keys and bi_k in sub_batch and sub_batch[bi_k] is not None:
+                        if bi_k in sub_batch and sub_batch[bi_k] is not None:
+                            seen_target_keys.add(bi_k)
                             sub_bi = sub_batch[bi_k]
                             if sub_bi.numel() > 0:
                                 collected_targets[bi_k].append(sub_bi + start_idx)
-                    for k in target_keys:
+                    for k in possible_target_keys:
                         if (
                             k not in {"batch_idx", "clean_batch_idx", "pre_attack_batch_idx"}
                             and k in sub_batch
                             and sub_batch[k] is not None
                         ):
+                            seen_target_keys.add(k)
                             collected_targets[k].append(sub_batch[k])
 
                 del sub_batch, adv_sub
@@ -479,10 +481,10 @@ def run_attack_on_batch(
                     torch.cuda.empty_cache()
 
             if is_batch_aware:
-                for k in target_keys:
+                for k in seen_target_keys:
                     if collected_targets[k]:
                         batch[k] = torch.cat(collected_targets[k], dim=0)
-                    else:
+                    elif k in batch:
                         batch[k] = batch[k][:0]
                 if collected_gt_matrices:
                     all_matrices = torch.cat(collected_gt_matrices, dim=0)
@@ -494,6 +496,8 @@ def run_attack_on_batch(
                     batch["gt_params"] = all_params
                     if hasattr(attacker, "last_selected_params"):
                         attacker.last_selected_params = all_params
+                if collected_attack_matrices:
+                    batch["attack_matrices"] = torch.cat(collected_attack_matrices, dim=0)
 
             return adv_imgs
 
@@ -581,7 +585,7 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
             from ultralytics.attacks.art_autoattack import ARTAutoAttack
 
             return ARTAutoAttack(model=model, **kwargs)
-        if normalized in {"worstk"}:
+        if normalized in {"worstk", "worst_of_k", "spatial_worst_of_k"}:
             from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 
             return SpatialWorstOfK(model=model, seed=seed, **kwargs)

@@ -318,3 +318,71 @@ def isolate_rng(
         torch.set_rng_state(torch_cpu_state)
         np.random.set_state(np_state)
         random.setstate(py_state)
+
+
+AFFECTED_ATTACK_KEYS = (
+    "img",
+    "batch_idx",
+    "cls",
+    "bboxes",
+    "masks",
+    "keypoints",
+    "segments",
+    "obb",
+    "gt_matrix",
+    "attack_matrices",
+    "gt_params",
+    "pre_attack_batch_idx",
+    "pre_attack_cls",
+    "pre_attack_bboxes",
+    "clean_batch_idx",
+    "clean_cls",
+    "clean_bboxes",
+    "adv_bboxes",
+    "attack_metadata",
+)
+
+
+def snapshot_batch_state(batch: dict) -> dict[str, Any]:
+    """Snapshot the mutable state of a batch dictionary before attack execution.
+
+    Only captures keys that can be modified or written by adversarial or spatial attacks,
+    avoiding expensive deepcopies of the entire model or immutable dataset fields.
+    """
+    backup = {}
+    for k in AFFECTED_ATTACK_KEYS:
+        if k in batch:
+            v = batch[k]
+            if isinstance(v, torch.Tensor):
+                backup[k] = v.clone()
+            elif isinstance(v, (list, tuple, dict)):
+                backup[k] = deepcopy(v)
+            else:
+                backup[k] = v
+    return backup
+
+
+def rollback_batch_state(batch: dict, backup: dict[str, Any], attacker: Any = None) -> None:
+    """Roll back a batch dictionary to its pre-attack snapshot on attack failure.
+
+    Deletes all newly added attack keys (such as gt_matrix, gt_params, pre_attack_*)
+    and restores the original values of pre-existing keys. Also resets any transient
+    attacker state attributes if an attacker instance is supplied.
+    """
+    # 1. Delete keys introduced by the failed attack
+    for k in AFFECTED_ATTACK_KEYS:
+        if k in batch and k not in backup:
+            del batch[k]
+
+    # 2. Restore pre-existing values
+    for k, v in backup.items():
+        batch[k] = v
+
+    # 3. Clean transient attacker attributes if present
+    if attacker is not None:
+        if hasattr(attacker, "last_selected_matrices"):
+            attacker.last_selected_matrices = None
+        if hasattr(attacker, "last_selected_params"):
+            attacker.last_selected_params = None
+        if hasattr(attacker, "last_metadata"):
+            attacker.last_metadata = None

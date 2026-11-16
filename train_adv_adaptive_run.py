@@ -1,28 +1,40 @@
 import argparse
+
 from ultralytics.models.yolo.detect.train_adv_adaptive import DetectionTrainer
 
 
 def main():
     parser = argparse.ArgumentParser(description="Dynamic Attack Ratio Adversarial Training")
-    parser.add_argument('--model', default='yolov8x.pt', help='Base model checkpoint or yaml')
-    parser.add_argument('--data', default=None, help='Dataset YAML path')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch', type=int, default=24, help='Batch size')
-    parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
-    parser.add_argument('--attack_name', nargs='+', default=None, help='Attack names (default: pgd bim mim worstk)')
-    parser.add_argument('--attack_ratio', nargs='+', default=None, help='Initial attack ratios (default: 0.10 0.10 0.40 0.15)')
-    parser.add_argument('--p_clean', type=float, default=0.25, help='Clean training ratio (default: 0.25)')
-    parser.add_argument('--tau', type=float, default=5.0, help='Softmax temperature tau for dynamic updates (default: 5.0)')
-    parser.add_argument('--update_interval', type=int, default=5, help='Epoch interval for ratio update (default: 5)')
-    parser.add_argument('--eval_weights', nargs='+', default=None, help='Fixed evaluation weights (default: 0.25 0.15 0.15 0.20)')
-    parser.add_argument('--device', default='0,1', help='Device string (e.g. 0 or 0,1)')
-    parser.add_argument('--imgsz', type=int, default=640, help='Image size')
-    parser.add_argument('--workers', type=int, default=None, help='DataLoader workers')
-    parser.add_argument('--project', default='runs/train_adv', help='Project directory')
-    parser.add_argument('--name', default='exp', help='Experiment name')
-    parser.add_argument('--resume', nargs='?', const=True, default=False, help='Resume training from last checkpoint')
-    parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices')
-    parser.add_argument('--cache', nargs='?', const=True, default=True, help='Cache dataset images in RAM (True/ram, disk, False)')
+    parser.add_argument("--model", default="yolov8x.pt", help="Base model checkpoint or yaml")
+    parser.add_argument("--data", default=None, help="Dataset YAML path")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
+    parser.add_argument("--batch", type=int, default=24, help="Batch size")
+    parser.add_argument("--attack_weights", default=None, help="Path to attack model weights")
+    parser.add_argument("--attack_name", nargs="+", default=None, help="Attack names (default: pgd bim mim worstk)")
+    parser.add_argument(
+        "--attack_ratio", nargs="+", default=None, help="Initial attack ratios (default: 0.10 0.10 0.40 0.15)"
+    )
+    parser.add_argument("--p_clean", type=float, default=0.25, help="Clean training ratio (default: 0.25)")
+    parser.add_argument(
+        "--tau", type=float, default=5.0, help="Softmax temperature tau for dynamic updates (default: 5.0)"
+    )
+    parser.add_argument("--update_interval", type=int, default=5, help="Epoch interval for ratio update (default: 5)")
+    parser.add_argument(
+        "--eval_weights", nargs="+", default=None, help="Fixed evaluation weights (default: 0.25 0.15 0.15 0.20)"
+    )
+    parser.add_argument("--device", default="0,1", help="Device string (e.g. 0 or 0,1)")
+    parser.add_argument("--imgsz", type=int, default=640, help="Image size")
+    parser.add_argument("--workers", type=int, default=None, help="DataLoader workers")
+    parser.add_argument("--project", default="runs/train_adv", help="Project directory")
+    parser.add_argument("--name", default="exp", help="Experiment name")
+    parser.add_argument("--resume", nargs="?", const=True, default=False, help="Resume training from last checkpoint")
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducibility (default: None, inherits default)"
+    )
+    parser.add_argument("--classes", type=int, nargs="+", default=None, help="Filter dataset by class indices")
+    parser.add_argument(
+        "--cache", nargs="?", const=True, default=True, help="Cache dataset images in RAM (True/ram, disk, False)"
+    )
     args = parser.parse_args()
 
     cache_val = args.cache
@@ -52,6 +64,8 @@ def main():
         overrides["data"] = args.data
     elif not args.resume:
         overrides["data"] = "coco128.yaml"
+    if args.seed is not None:
+        overrides["seed"] = int(args.seed)
     if args.attack_weights is not None:
         overrides["attack_weights"] = args.attack_weights
 
@@ -63,5 +77,5 @@ def main():
     trainer.train()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

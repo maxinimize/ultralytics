@@ -7,14 +7,13 @@ import csv
 import json
 from copy import copy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
-from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
+from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
     VALID_MODES,
@@ -461,7 +460,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
                 sel_attacks.append(canonicalize_attack(a))
             sel_attacks = list(dict.fromkeys(sel_attacks))
 
-        LOGGER.info(f"Starting Unified FGD + STN Defense Evaluation")
+        LOGGER.info("Starting Unified FGD + STN Defense Evaluation")
         LOGGER.info(f"Selected Preprocessing Modes: {sel_modes}")
         LOGGER.info(f"Selected Attacks: {sel_attacks}")
         LOGGER.info(f"Evaluation Seed: {seed}")
@@ -625,7 +624,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
         trainer=None,
         modes: Sequence[str] | str = "all",
         attacks: Sequence[str] | str = "all",
-        seed: int = 0,
+        seed: int | None = None,
     ) -> Dict[str, Any]:
         """Callable interface matching Ultralytics validator calling convention.
 
@@ -638,10 +637,18 @@ class UnifiedFGDSTNValidator(BaseValidator):
         Returns:
             Dict[str, Any]: Consolidated results summary.
         """
+        if seed is None:
+            if trainer is not None and getattr(getattr(trainer, "args", None), "seed", None) is not None:
+                seed = int(trainer.args.seed)
+            elif hasattr(self, "args") and getattr(self.args, "seed", None) is not None:
+                seed = int(self.args.seed)
+            else:
+                seed = 0
+
         if trainer is not None:
             self.device = trainer.device
             self.guidance_model = getattr(trainer, "guidance_model", trainer.model)
             self.dataloader = trainer.test_loader
             if hasattr(trainer, "data") and trainer.data:
                 self.data = trainer.data
-        return self.evaluate_all(modes=modes, attacks=attacks, seed=seed)
+        return self.evaluate_all(modes=modes, attacks=attacks, seed=int(seed))

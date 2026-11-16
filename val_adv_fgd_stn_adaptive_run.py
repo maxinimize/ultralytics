@@ -7,16 +7,13 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ultralytics.data.utils import check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import (
-    MODE_DESCRIPTIONS,
-    VALID_MODES,
-    build_fgd_stn_pipeline,
     canonicalize_mode,
 )
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
 )
+from ultralytics.utils import LOGGER
 
 
 def parse_bool(value: Any) -> bool:
@@ -91,8 +88,19 @@ def main():
     parser.add_argument(
         "--attack_through_preprocess",
         type=parse_bool,
-        default=True,
-        help="Whether attacks pass through defense preprocessing pipeline (default: true).",
+        default=False,
+        help="Whether attacks pass through defense preprocessing pipeline (default: false, attacks target pure YOLO).",
+    )
+    parser.add_argument(
+        "--attack_weights",
+        default=None,
+        help="Path to fixed surrogate weights (e.g. yolo12l.pt) or 'current'.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Reproducibility seed for validation and attacks (default: None, inherits default).",
     )
     parser.add_argument("--batch", type=int, default=8, help="Batch size (default: 8).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size (default: 640).")
@@ -109,6 +117,16 @@ def main():
 
     args = parser.parse_args()
     mode = canonicalize_mode(args.preprocess_mode)
+
+    if args.attack_through_preprocess:
+        LOGGER.info(
+            "Evaluation note: --attack_through_preprocess is set to TRUE. Attacks evaluate against the "
+            "entire defense pipeline (PreprocessDetectorWrapper -> YOLO). Project default protocol is FALSE (pure YOLO)."
+        )
+    else:
+        LOGGER.info(
+            "Evaluation protocol: Attacks target the pure YOLO detector directly (attack_through_preprocess=False)."
+        )
 
     save_dir = Path(args.project) / args.name
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +152,10 @@ def main():
         attack_name=args.attack_name,
         eval_weights=args.eval_weights,
     )
+    if args.attack_weights is not None:
+        validator_args["attack_weights"] = args.attack_weights
+    if args.seed is not None:
+        validator_args["seed"] = int(args.seed)
 
     validator = DetectionValidatorAdvFGDSTNAdaptive(
         save_dir=save_dir,
@@ -142,6 +164,7 @@ def main():
         fgd_weights=args.fgd_weights,
         stn_weights=args.stn_weights,
         attack_through_preprocess=args.attack_through_preprocess,
+        attack_weights=args.attack_weights,
     )
     validator()
 
