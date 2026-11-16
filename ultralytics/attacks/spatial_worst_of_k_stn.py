@@ -69,6 +69,9 @@ class SpatialWorstOfKWithMetadata(SpatialWorstOfK):
         batch["clean_batch_idx"] = batch_idx.clone()
         batch["clean_cls"] = cls.clone()
         batch["clean_bboxes"] = bboxes.clone()
+        batch["pre_attack_batch_idx"] = batch_idx.clone()
+        batch["pre_attack_cls"] = cls.clone()
+        batch["pre_attack_bboxes"] = bboxes.clone()
 
         targets = self._pack_targets(batch_idx, cls, bboxes, device=images.device)
         adv_images, adv_targets, metadata = self._attack_with_metadata(images.float(), targets)
@@ -122,9 +125,7 @@ class SpatialWorstOfKWithMetadata(SpatialWorstOfK):
         params = self._sample_params(batch_size, height, width, device=x.device, dtype=x.dtype)
         matrices = self._build_forward_matrices(params, height, width, dtype=x.dtype)  # [B, k, 3, 3]
 
-        expanded = x[:, None].expand(-1, self.k, -1, -1, -1).reshape(
-            batch_size * self.k, x.shape[1], height, width
-        )
+        expanded = x[:, None].expand(-1, self.k, -1, -1, -1).reshape(batch_size * self.k, x.shape[1], height, width)
         flat_matrices = matrices.reshape(batch_size * self.k, 3, 3)
         candidates = self._warp_images(expanded, flat_matrices)
 

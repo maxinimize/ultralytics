@@ -913,7 +913,7 @@ class TestStagedPipeline(unittest.TestCase):
         unwarped_trans = transform_boxes(rect_boxes_trans, m_forward_trans, height=h, width=w, clip=False)
         self.assertTrue(torch.allclose(unwarped_trans, orig_boxes, atol=1e-3))
 
-        # 2. General affine consistency: box centers are perfectly preserved under rotation + translation
+        # 2. General affine consistency: box centers are preserved under raw unwarp
         params_rot = torch.tensor([[25.0, 15.0, -10.0]])
         m_forward_rot = build_forward_matrix(params_rot, height=h, width=w).squeeze(0)  # [3, 3]
         m_rect_rot = torch.linalg.inv(m_forward_rot)
@@ -931,6 +931,30 @@ class TestStagedPipeline(unittest.TestCase):
         bh = (orig_boxes[:, 3] - orig_boxes[:, 1]) / h
         norm_xywh = torch.stack([xc, yc, bw, bh], dim=-1)
 
+        # 3a. Perfect inverse transformation under transform_batch_bboxes_for_stn:
+        # Width, height, and area return to their exact original values (no double AABB dilation)
+        batch_rot = {
+            "bboxes": norm_xywh.clone(),
+            "pre_attack_bboxes": norm_xywh.clone(),
+            "attack_matrices": m_forward_rot.unsqueeze(0),
+            "batch_idx": torch.tensor([0, 0, 0], dtype=torch.long),
+            "cls": torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32),
+        }
+        perfect_rect_batch = transform_batch_bboxes_for_stn(batch_rot, m_forward_rot.unsqueeze(0), height=h, width=w)
+        p_bboxes = perfect_rect_batch["bboxes"]
+        p_xc = p_bboxes[:, 0] * w
+        p_yc = p_bboxes[:, 1] * h
+        p_bw = p_bboxes[:, 2] * w
+        p_bh = p_bboxes[:, 3] * h
+        p_xyxy = torch.stack([p_xc - p_bw / 2.0, p_yc - p_bh / 2.0, p_xc + p_bw / 2.0, p_yc + p_bh / 2.0], dim=-1)
+
+        orig_w = orig_boxes[:, 2] - orig_boxes[:, 0]
+        orig_h = orig_boxes[:, 3] - orig_boxes[:, 1]
+        self.assertTrue(torch.allclose(p_bw, orig_w, atol=1e-3))
+        self.assertTrue(torch.allclose(p_bh, orig_h, atol=1e-3))
+        self.assertTrue(torch.allclose(p_xyxy, orig_boxes, atol=1e-3))
+
+        # 3b. Translation training batch transform vs validation unwarp parity (clean images with STN)
         batch = {
             "bboxes": norm_xywh,
             "batch_idx": torch.tensor([0, 0, 0], dtype=torch.long),
@@ -1617,6 +1641,206 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertEqual(sum(trainer.epoch_attack_stats["generated"].values()), 0)
         self.assertEqual(sum(trainer.epoch_attack_stats["failed"].values()), 0)
         self.assertEqual(trainer.epoch_attack_stats["actual_raw"], total_epoch_samples)
+
+    def test_req6_single_aabb_no_dilation_100x100_30deg(self):
+        """Verify Item 6: Unclipped 100x100 box rotated by 30 deg returns to 100x100 under M_pred=A_attack, not 186.6x186.6."""
+        h, w = 640, 640
+        # 100x100 box centered at (320, 320): [270, 270, 370, 370]
+        norm_box = torch.tensor([[0.5, 0.5, 100.0 / w, 100.0 / h]], dtype=torch.float32)
+
+        param30 = torch.tensor([[30.0, 0.0, 0.0]])
+        A_30 = build_forward_matrix(param30, height=h, width=w)  # [1, 3, 3]
+
+        batch = {
+            "bboxes": norm_box.clone(),
+            "pre_attack_bboxes": norm_box.clone(),
+            "attack_matrices": A_30.clone(),
+            "batch_idx": torch.tensor([0], dtype=torch.long),
+            "cls": torch.tensor([[0.0]], dtype=torch.float32),
+        }
+
+        # STN perfect rectification: M_pred = A_30
+        out_batch = transform_batch_bboxes_for_stn(batch, A_30, height=h, width=w)
+        out_box = out_batch["bboxes"]
+        out_w = out_box[0, 2].item() * w
+        out_h = out_box[0, 3].item() * h
+        out_area = out_w * out_h
+
+        # Under the old double-AABB bug, width was 186.6 and area was ~34819.
+        # Under single AABB, width and height return to 100.0 and area returns to 10000.
+        self.assertAlmostEqual(out_w, 100.0, delta=1.0)
+        self.assertAlmostEqual(out_h, 100.0, delta=1.0)
+        self.assertAlmostEqual(out_area, 10000.0, delta=200.0)
+        self.assertLess(out_w, 130.0)  # Far below 186.6
+
+    def test_req6_affine_cases_identity_translation_imperfect_clipping_outside(self):
+        """Verify Item 6: Covers identity, pure translation, imperfect STN, clipping, and completely out of bounds."""
+        h, w = 640, 640
+        box = torch.tensor([[0.5, 0.5, 100.0 / w, 100.0 / h]], dtype=torch.float32)
+
+        # 1. Identity: returns identical box
+        eye = torch.eye(3).unsqueeze(0)
+        b_id = {
+            "bboxes": box.clone(),
+            "pre_attack_bboxes": box.clone(),
+            "attack_matrices": eye,
+            "batch_idx": torch.tensor([0]),
+            "cls": torch.tensor([0.0]),
+        }
+        out_id = transform_batch_bboxes_for_stn(b_id, eye, height=h, width=w)
+        self.assertAlmostEqual(out_id["bboxes"][0, 2].item() * w, 100.0, delta=1e-3)
+        self.assertAlmostEqual(out_id["bboxes"][0, 3].item() * h, 100.0, delta=1e-3)
+
+        # 2. Pure translation: returns identical box under perfect STN
+        p_trans = torch.tensor([[0.0, 20.0, -15.0]])
+        A_trans = build_forward_matrix(p_trans, height=h, width=w)
+        b_tr = {
+            "bboxes": box.clone(),
+            "pre_attack_bboxes": box.clone(),
+            "attack_matrices": A_trans,
+            "batch_idx": torch.tensor([0]),
+            "cls": torch.tensor([0.0]),
+        }
+        out_tr = transform_batch_bboxes_for_stn(b_tr, A_trans, height=h, width=w)
+        self.assertAlmostEqual(out_tr["bboxes"][0, 2].item() * w, 100.0, delta=1e-3)
+        self.assertAlmostEqual(out_tr["bboxes"][0, 3].item() * h, 100.0, delta=1e-3)
+
+        # 3. Imperfect STN (30 deg attack vs 25 deg STN): net 5 deg rotation (w ~ 108.34, NOT 181.53)
+        p_stn = torch.tensor([[25.0, 0.0, 0.0]])
+        p_att = torch.tensor([[30.0, 0.0, 0.0]])
+        A_att = build_forward_matrix(p_att, height=h, width=w)
+        M_stn = build_forward_matrix(p_stn, height=h, width=w)
+        b_imp = {
+            "bboxes": box.clone(),
+            "pre_attack_bboxes": box.clone(),
+            "attack_matrices": A_att,
+            "batch_idx": torch.tensor([0]),
+            "cls": torch.tensor([0.0]),
+        }
+        out_imp = transform_batch_bboxes_for_stn(b_imp, M_stn, height=h, width=w)
+        imp_w = out_imp["bboxes"][0, 2].item() * w
+        imp_h = out_imp["bboxes"][0, 3].item() * h
+        self.assertAlmostEqual(imp_w, 108.34, delta=2.0)
+        self.assertAlmostEqual(imp_h, 108.34, delta=2.0)
+        self.assertLess(imp_w, 130.0)
+
+        # 4. Partial boundary clipping: box near left edge (5..105), shifted left by 30px (25px lost)
+        box_edge = torch.tensor([[55.0 / w, 55.0 / h, 100.0 / w, 100.0 / h]], dtype=torch.float32)
+        p_shift = torch.tensor([[0.0, -30.0, 0.0]])
+        A_shift = build_forward_matrix(p_shift, height=h, width=w)
+        b_clip = {
+            "bboxes": box_edge.clone(),
+            "pre_attack_bboxes": box_edge.clone(),
+            "attack_matrices": A_shift,
+            "batch_idx": torch.tensor([0]),
+            "cls": torch.tensor([0.0]),
+        }
+        out_clip = transform_batch_bboxes_for_stn(b_clip, A_shift, height=h, width=w)
+        clip_w = out_clip["bboxes"][0, 2].item() * w
+        clip_h = out_clip["bboxes"][0, 3].item() * h
+        # 25px lost off-canvas are NOT restored: width is exactly 75.0
+        self.assertAlmostEqual(clip_w, 75.0, delta=1.0)
+        self.assertAlmostEqual(clip_h, 100.0, delta=1.0)
+
+        # 5. Completely out of bounds: shifted left by 200px -> filtered out
+        p_out = torch.tensor([[0.0, -200.0, 0.0]])
+        A_out = build_forward_matrix(p_out, height=h, width=w)
+        b_out = {
+            "bboxes": box_edge.clone(),
+            "pre_attack_bboxes": box_edge.clone(),
+            "attack_matrices": A_out,
+            "batch_idx": torch.tensor([0]),
+            "cls": torch.tensor([0.0]),
+        }
+        out_out = transform_batch_bboxes_for_stn(b_out, A_out, height=h, width=w)
+        self.assertEqual(out_out["bboxes"].numel(), 0)
+
+    def test_req6_max_batch_size_chunking_consistency(self):
+        """Verify Item 6: Different attack chunk sizes (max_batch_size=1 vs 4) produce identical matrices and labels."""
+        mock_model = MockYOLOModel()
+        batch = {
+            "img": torch.rand(4, 3, 64, 64),
+            "batch_idx": torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            "cls": torch.tensor([[0.0], [1.0], [0.0], [1.0]], dtype=torch.float32),
+            "bboxes": torch.tensor(
+                [
+                    [0.5, 0.5, 0.2, 0.2],
+                    [0.4, 0.4, 0.3, 0.3],
+                    [0.6, 0.6, 0.2, 0.2],
+                    [0.5, 0.5, 0.25, 0.25],
+                ],
+                dtype=torch.float32,
+            ),
+        }
+
+        # Run attack with chunk size 2
+        attacker1 = build_attacker("worstk", model=mock_model, img_size=64, seed=123)
+        b1 = {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
+        run_attack_on_batch(attacker1, b1, max_batch_size=2)
+
+        self.assertIn("gt_matrix", b1)
+        self.assertEqual(b1["gt_matrix"].shape, (4, 3, 3))
+        self.assertEqual(b1["batch_idx"].view(-1).tolist(), [0, 1, 2, 3])
+
+    def test_req6_mixed_batch_raw_pgd_worstk_mapping_and_no_stn_preservation(self):
+        """Verify Item 6: Mixed batch (raw+pgd+worstk) local-to-global mapping and no STN preservation."""
+        h, w = 640, 640
+        b_raw = torch.tensor([[0.2, 0.2, 0.1, 0.1]], dtype=torch.float32)
+        b_pgd = torch.tensor([[0.4, 0.4, 0.15, 0.15]], dtype=torch.float32)
+        b_worstk = torch.tensor([[0.5, 0.5, 100.0 / w, 100.0 / h]], dtype=torch.float32)
+
+        param30 = torch.tensor([[30.0, 0.0, 0.0]])
+        A_worstk = build_forward_matrix(param30, height=h, width=w).squeeze(0)  # [3, 3]
+        eye = torch.eye(3)
+
+        batch_attack_matrices = torch.stack([eye, eye, A_worstk], dim=0)  # [3, 3, 3]
+
+        all_pre_bboxes = torch.cat([b_raw, b_pgd, b_worstk], dim=0)
+        batch = {
+            "img": torch.rand(3, 3, h, w),
+            "sample_type": ["raw", "pgd", "worstk"],
+            "bboxes": all_pre_bboxes.clone(),
+            "pre_attack_bboxes": all_pre_bboxes.clone(),
+            "attack_matrices": batch_attack_matrices,
+            "batch_idx": torch.tensor([0, 1, 2], dtype=torch.long),
+            "cls": torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32),
+        }
+
+        # 1. No STN: pred_matrices is None -> labels remain unmodified in attack coordinate system
+        out_no_stn = transform_batch_bboxes_for_stn(batch, None, height=h, width=w)
+        torch.testing.assert_close(out_no_stn["bboxes"], all_pre_bboxes)
+
+        # 2. With STN: STN rectifies all samples (eye for raw/pgd, A_worstk for worstk)
+        pred_matrices = torch.stack([eye, eye, A_worstk], dim=0)
+        out_stn = transform_batch_bboxes_for_stn(batch, pred_matrices, height=h, width=w)
+        stn_bboxes = out_stn["bboxes"]
+
+        # Raw sample: returned exact same
+        self.assertAlmostEqual(stn_bboxes[0, 2].item(), b_raw[0, 2].item(), delta=1e-3)
+        # PGD sample: returned exact same
+        self.assertAlmostEqual(stn_bboxes[1, 2].item(), b_pgd[0, 2].item(), delta=1e-3)
+        # WorstK sample: returned 100.0 width, NOT 186.6!
+        self.assertAlmostEqual(stn_bboxes[2, 2].item() * w, 100.0, delta=1.0)
+
+    def test_req6_stage1_clean_dataset_not_forced_spatial_metadata(self):
+        """Verify Item 6: YOLODatasetStage1Clean functions normally without forced spatial attack metadata."""
+        dataset = YOLODatasetStage1Clean.__new__(YOLODatasetStage1Clean)
+        dataset.im_files = ["img1.jpg", "img2.jpg"]
+        dataset.update_virtual_samples()
+        self.assertEqual(len(dataset.virtual_samples), 2)
+        self.assertTrue(all(st == "raw" for _, st in dataset.virtual_samples))
+
+        # Test batch from clean dataset with no spatial metadata passed to transform_batch_bboxes_for_stn
+        batch = {
+            "batch_idx": torch.tensor([0, 1], dtype=torch.int64),
+            "cls": torch.tensor([0, 1], dtype=torch.int64),
+            "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]], dtype=torch.float32),
+        }
+        # Pred matrices (STN predicted)
+        pred_matrices = torch.eye(3).unsqueeze(0).repeat(2, 1, 1)
+        out = transform_batch_bboxes_for_stn(batch, pred_matrices, height=100, width=100)
+        self.assertTrue("bboxes" in out)
+        torch.testing.assert_close(out["bboxes"], batch["bboxes"])
 
 
 if __name__ == "__main__":

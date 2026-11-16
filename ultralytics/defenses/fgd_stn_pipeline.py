@@ -258,6 +258,56 @@ def build_fgd_stn_pipeline(
     return pipeline, metadata
 
 
+def clip_polygon_to_rect(poly: list[tuple[float, float]], width: float, height: float) -> list[tuple[float, float]]:
+    """Clip a 2D convex polygon against an axis-aligned rectangle [0, width] x [0, height] via Sutherland-Hodgman."""
+    if not poly:
+        return []
+
+    def clip_edge(p_in, inside_fn, intersect_fn):
+        res = []
+        n = len(p_in)
+        if n == 0:
+            return res
+        for i in range(n):
+            cur = p_in[i]
+            prev = p_in[(i - 1) % n]
+            cur_in = inside_fn(cur)
+            prev_in = inside_fn(prev)
+            if cur_in:
+                if not prev_in:
+                    res.append(intersect_fn(prev, cur))
+                res.append(cur)
+            elif prev_in:
+                res.append(intersect_fn(prev, cur))
+        return res
+
+    # 1. x >= 0
+    p = clip_edge(
+        poly,
+        lambda pt: pt[0] >= 0.0,
+        lambda p1, p2: (0.0, p1[1] + (0.0 - p1[0]) * (p2[1] - p1[1]) / (p2[0] - p1[0] + 1e-9)),
+    )
+    # 2. x <= width
+    p = clip_edge(
+        p,
+        lambda pt: pt[0] <= width,
+        lambda p1, p2: (width, p1[1] + (width - p1[0]) * (p2[1] - p1[1]) / (p2[0] - p1[0] + 1e-9)),
+    )
+    # 3. y >= 0
+    p = clip_edge(
+        p,
+        lambda pt: pt[1] >= 0.0,
+        lambda p1, p2: (p1[0] + (0.0 - p1[1]) * (p2[0] - p1[0]) / (p2[1] - p1[1] + 1e-9), 0.0),
+    )
+    # 4. y <= height
+    p = clip_edge(
+        p,
+        lambda pt: pt[1] <= height,
+        lambda p1, p2: (p1[0] + (height - p1[1]) * (p2[0] - p1[0]) / (p2[1] - p1[1] + 1e-9), height),
+    )
+    return p
+
+
 def transform_batch_bboxes_for_stn(
     batch: dict,
     pred_matrices: Optional[torch.Tensor],
@@ -269,11 +319,19 @@ def transform_batch_bboxes_for_stn(
 
     Given forward matrices M_pred of shape [B, 3, 3] mapping rectified coordinates
     to input coordinates (p_in = M_pred @ p_rect), ground-truth bounding boxes
-    in input coordinates are mapped to rectified coordinates via M_rect = (M_pred)^(-1).
+    in pre-attack input coordinates are mapped to rectified coordinates via:
+        p_rect = (M_pred)^(-1) @ A_attack @ p_clean
+
+    For targets unclipped by the attack canvas, the combined affine transform is applied
+    directly to the 4 corners, computing the Axis-Aligned Bounding Box (AABB) once.
+    For targets clipped by the attack canvas boundary, the visible polygon is clipped
+    to the attack canvas, mapped by (M_pred)^(-1), clipped to the rectified canvas,
+    and enclosed in a single AABB, preventing lost areas from polluting supervision.
 
     Args:
         batch (dict): Batch dictionary containing 'bboxes' [M, 4] in normalized xywh format,
-            'batch_idx' [M] or [M, 1], 'cls' [M] or [M, 1], etc.
+            optional 'pre_attack_bboxes' / 'clean_bboxes' [M, 4], 'attack_matrices' [B, 3, 3],
+            'batch_idx' [M], 'cls' [M], etc.
         pred_matrices (torch.Tensor, optional): Forward transformation matrices of shape [B, 3, 3].
             If None, returns batch unmodified.
         height (int): Image canvas height in pixels.
@@ -287,9 +345,20 @@ def transform_batch_bboxes_for_stn(
     if pred_matrices is None:
         return batch
 
-    bboxes = batch.get("bboxes")
-    batch_idx = batch.get("batch_idx")
-    cls = batch.get("cls")
+    # Retrieve clean/pre-attack ground-truth targets if available
+    has_pre_attack = "pre_attack_bboxes" in batch and batch["pre_attack_bboxes"] is not None
+    if has_pre_attack:
+        bboxes = batch["pre_attack_bboxes"]
+        batch_idx = batch.get("pre_attack_batch_idx", batch.get("batch_idx"))
+        cls = batch.get("pre_attack_cls", batch.get("cls"))
+    elif "clean_bboxes" in batch and batch["clean_bboxes"] is not None:
+        bboxes = batch["clean_bboxes"]
+        batch_idx = batch.get("clean_batch_idx", batch.get("batch_idx"))
+        cls = batch.get("clean_cls", batch.get("cls"))
+    else:
+        bboxes = batch.get("bboxes")
+        batch_idx = batch.get("batch_idx")
+        cls = batch.get("cls")
 
     if bboxes is None or bboxes.numel() == 0 or batch_idx is None or batch_idx.numel() == 0:
         return batch
@@ -302,48 +371,136 @@ def transform_batch_bboxes_for_stn(
     flat_bi = batch_idx.view(-1).long()
     num_boxes = bboxes.shape[0]
 
-    # Compute inverse matrices mapping input -> rectified
+    # STN forward matrices [B, 3, 3] mapping rectified -> attack canvas
     if pred_matrices.ndim == 2:
-        m_rect = torch.linalg.inv(pred_matrices.float()).to(dtype=dtype).unsqueeze(0)
+        m_pred = pred_matrices.unsqueeze(0).to(device=device, dtype=torch.float32)
     else:
-        m_rect = torch.linalg.inv(pred_matrices.float()).to(dtype=dtype)
+        m_pred = pred_matrices.to(device=device, dtype=torch.float32)
+    b_size = m_pred.shape[0]
 
-    # Convert normalized xywh to pixel xyxy
-    xc = bboxes[:, 0] * float(width)
-    yc = bboxes[:, 1] * float(height)
-    bw = bboxes[:, 2] * float(width)
-    bh = bboxes[:, 3] * float(height)
+    # Compute inverse matrices mapping attack canvas -> rectified
+    m_rect = torch.linalg.inv(m_pred)  # [B, 3, 3]
+
+    # Retrieve attack forward matrices A_attack [B, 3, 3] mapping pre-attack -> attack canvas
+    attack_m = batch.get("attack_matrices", batch.get("gt_matrix", None))
+    if attack_m is None:
+        a_attack = torch.eye(3, device=device, dtype=torch.float32).unsqueeze(0).expand(b_size, 3, 3)
+    else:
+        attack_m = attack_m.to(device=device, dtype=torch.float32)
+        if attack_m.ndim == 2:
+            a_attack = attack_m.unsqueeze(0).expand(b_size, 3, 3)
+        elif attack_m.shape[0] != b_size and attack_m.shape[0] == 1:
+            a_attack = attack_m.expand(b_size, 3, 3)
+        else:
+            a_attack = attack_m
+
+    # Per-box matrices
+    clamped_bi = flat_bi.clamp(0, b_size - 1)
+    m_rect_box = m_rect[clamped_bi]  # [M, 3, 3]
+    a_attack_box = a_attack[clamped_bi]  # [M, 3, 3]
+    m_comb_box = torch.bmm(m_rect_box, a_attack_box)  # [M, 3, 3]
+
+    # Convert clean normalized xywh to pixel coordinates
+    xc = bboxes[:, 0].float() * float(width)
+    yc = bboxes[:, 1].float() * float(height)
+    bw = bboxes[:, 2].float() * float(width)
+    bh = bboxes[:, 3].float() * float(height)
     x1 = xc - bw / 2.0
     y1 = yc - bh / 2.0
     x2 = xc + bw / 2.0
     y2 = yc + bh / 2.0
-    boxes_xyxy = torch.stack((x1, y1, x2, y2), dim=-1)
+    ones = torch.ones_like(x1)
 
-    # Pick matrix for each box based on batch_idx
-    if m_rect.shape[0] == 1 and num_boxes > 1:
-        m_boxes = m_rect.expand(num_boxes, 3, 3)
-    else:
-        clamped_bi = flat_bi.clamp(0, m_rect.shape[0] - 1)
-        m_boxes = m_rect[clamped_bi]
+    # 4 corners in homogeneous coordinates: [M, 4, 3]
+    corners = torch.stack(
+        (
+            torch.stack((x1, y1, ones), dim=-1),
+            torch.stack((x2, y1, ones), dim=-1),
+            torch.stack((x2, y2, ones), dim=-1),
+            torch.stack((x1, y2, ones), dim=-1),
+        ),
+        dim=1,
+    )
 
-    # Transform boxes and clamp to canvas bounds
-    mapped_xyxy = transform_boxes(boxes_xyxy, m_boxes, height=height, width=width, clip=True)
+    # Transform corners to attack canvas by A_attack: [M, 4, 3]
+    q = torch.einsum("nij,npj->npi", a_attack_box, corners)
+    qx = q[..., 0]
+    qy = q[..., 1]
 
-    # Filter degenerate boxes
-    nw = mapped_xyxy[:, 2] - mapped_xyxy[:, 0]
-    nh = mapped_xyxy[:, 3] - mapped_xyxy[:, 1]
-    valid = (nw >= min_box_size) & (nh >= min_box_size)
+    # Check whether targets are completely contained within the attack canvas
+    eps = 1e-3
+    unclipped_mask = (
+        (qx >= -eps).all(dim=1)
+        & (qx <= float(width) + eps).all(dim=1)
+        & (qy >= -eps).all(dim=1)
+        & (qy <= float(height) + eps).all(dim=1)
+    )
 
-    if not valid.all():
-        mapped_xyxy = mapped_xyxy[valid]
-        flat_bi = flat_bi[valid]
+    mapped_xyxy = torch.zeros((num_boxes, 4), device=device, dtype=torch.float32)
+    valid_mask = torch.zeros(num_boxes, device=device, dtype=torch.bool)
+
+    # 1. Unclipped targets: single AABB from combined transform (M_pred)^(-1) @ A_attack
+    if unclipped_mask.any():
+        idx_unc = torch.where(unclipped_mask)[0]
+        r_unc = torch.einsum("nij,npj->npi", m_comb_box[idx_unc], corners[idx_unc])
+        rx1 = r_unc[..., 0].amin(dim=1).clamp(0.0, float(width))
+        ry1 = r_unc[..., 1].amin(dim=1).clamp(0.0, float(height))
+        rx2 = r_unc[..., 0].amax(dim=1).clamp(0.0, float(width))
+        ry2 = r_unc[..., 1].amax(dim=1).clamp(0.0, float(height))
+        val_unc = ((rx2 - rx1) >= min_box_size) & ((ry2 - ry1) >= min_box_size)
+        mapped_xyxy[idx_unc, 0] = rx1
+        mapped_xyxy[idx_unc, 1] = ry1
+        mapped_xyxy[idx_unc, 2] = rx2
+        mapped_xyxy[idx_unc, 3] = ry2
+        valid_mask[idx_unc] = val_unc
+
+    # 2. Clipped targets: polygon clipped to canvas, then mapped by (M_pred)^(-1) and clipped to rectified canvas
+    if (~unclipped_mask).any():
+        idx_clip = torch.where(~unclipped_mask)[0]
+        w_f, h_f = float(width), float(height)
+        for i in idx_clip:
+            poly_canvas = [(qx[i, k].item(), qy[i, k].item()) for k in range(4)]
+            clipped_canvas = clip_polygon_to_rect(poly_canvas, w_f, h_f)
+            if not clipped_canvas:
+                continue
+
+            # Map visible canvas polygon vertices to rectified coordinates
+            m_r = m_rect_box[i].cpu()
+            rect_poly = []
+            for pt in clipped_canvas:
+                v = torch.tensor([pt[0], pt[1], 1.0], dtype=torch.float32)
+                rv = m_r @ v
+                rect_poly.append((rv[0].item(), rv[1].item()))
+
+            clipped_rect = clip_polygon_to_rect(rect_poly, w_f, h_f)
+            if not clipped_rect:
+                continue
+
+            rx1 = max(0.0, min(pt[0] for pt in clipped_rect))
+            ry1 = max(0.0, min(pt[1] for pt in clipped_rect))
+            rx2 = min(w_f, max(pt[0] for pt in clipped_rect))
+            ry2 = min(h_f, max(pt[1] for pt in clipped_rect))
+
+            if (rx2 - rx1) >= min_box_size and (ry2 - ry1) >= min_box_size:
+                mapped_xyxy[i, 0] = rx1
+                mapped_xyxy[i, 1] = ry1
+                mapped_xyxy[i, 2] = rx2
+                mapped_xyxy[i, 3] = ry2
+                valid_mask[i] = True
+
+    mapped_xyxy = mapped_xyxy.to(dtype=dtype)
+
+    # Filter invalid / degenerate targets
+    if not valid_mask.all():
+        mapped_xyxy = mapped_xyxy[valid_mask]
+        flat_bi = flat_bi[valid_mask]
         if cls is not None:
-            cls = cls[valid]
+            cls = cls[valid_mask]
 
         # Filter other optional keys if aligned with targets
         for k in ("masks", "keypoints", "segments", "obb"):
             if k in batch and isinstance(batch[k], torch.Tensor) and batch[k].shape[0] == num_boxes:
-                batch[k] = batch[k][valid]
+                batch[k] = batch[k][valid_mask]
 
     if mapped_xyxy.shape[0] == 0:
         # Empty targets after filtering
@@ -490,7 +647,7 @@ __all__ = [
     "MODE_ALIASES",
     "build_fgd_stn_pipeline",
     "canonicalize_mode",
+    "clip_polygon_to_rect",
     "transform_batch_bboxes_for_stn",
     "PreprocessDetectorWrapper",
 ]
-

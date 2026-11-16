@@ -246,7 +246,9 @@ def build_detector_targets(batch: dict) -> Optional[torch.Tensor]:
     return torch.cat([batch_idx, cls, bboxes], dim=1)
 
 
-def build_single_labels_from_batch(batch: dict, policy: str = "largest_box") -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+def build_single_labels_from_batch(
+    batch: dict, policy: str = "largest_box"
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Convert a detection batch into one single-label class target per image.
 
@@ -317,7 +319,21 @@ def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
         elif k in {"visuals", "sem_masks", "text_feats", "depth", "semantic_mask"}:
             if isinstance(v, torch.Tensor):
                 sub_batch[k] = v[indices]
-        elif k not in {"batch_idx", "cls", "bboxes", "masks", "keypoints", "segments", "obb"}:
+        elif k not in {
+            "batch_idx",
+            "cls",
+            "bboxes",
+            "masks",
+            "keypoints",
+            "segments",
+            "obb",
+            "clean_batch_idx",
+            "clean_cls",
+            "clean_bboxes",
+            "pre_attack_batch_idx",
+            "pre_attack_cls",
+            "pre_attack_bboxes",
+        }:
             sub_batch[k] = v
 
     if "batch_idx" in batch and batch["batch_idx"] is not None:
@@ -331,7 +347,7 @@ def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
         else:
             mask = torch.zeros(b_idx_1d.shape, dtype=torch.bool, device=batch_idx.device)
             for idx in indices:
-                mask |= (b_idx_1d == idx)
+                mask |= b_idx_1d == idx
             idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(indices)}
             new_b_idx = torch.tensor(
                 [idx_map[int(x)] for x in b_idx_1d[mask].tolist()],
@@ -342,9 +358,24 @@ def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
             new_b_idx = new_b_idx.unsqueeze(-1)
         sub_batch["batch_idx"] = new_b_idx
 
-        for box_k in ["cls", "bboxes", "masks", "keypoints", "segments", "obb"]:
+        for box_k in [
+            "cls",
+            "bboxes",
+            "masks",
+            "keypoints",
+            "segments",
+            "obb",
+            "clean_cls",
+            "clean_bboxes",
+            "pre_attack_cls",
+            "pre_attack_bboxes",
+        ]:
             if box_k in batch and batch[box_k] is not None:
                 sub_batch[box_k] = batch[box_k][mask]
+
+        for bi_k in ["clean_batch_idx", "pre_attack_batch_idx"]:
+            if bi_k in batch and batch[bi_k] is not None:
+                sub_batch[bi_k] = new_b_idx
 
     return sub_batch
 
@@ -369,13 +400,35 @@ def run_attack_on_batch(
     limit = max_batch_size if max_batch_size is not None else getattr(attacker, "max_batch_size", None)
     if limit is not None and limit > 0 and bs > limit:
         adv_imgs = imgs.clone()
-        is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(getattr(attacker, "batch_aware", False))
+        is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(
+            getattr(attacker, "batch_aware", False)
+        )
         target_keys = (
-            [k for k in ["batch_idx", "cls", "bboxes", "masks", "keypoints", "segments", "obb"] if k in batch and batch[k] is not None]
+            [
+                k
+                for k in [
+                    "batch_idx",
+                    "cls",
+                    "bboxes",
+                    "masks",
+                    "keypoints",
+                    "segments",
+                    "obb",
+                    "clean_batch_idx",
+                    "clean_cls",
+                    "clean_bboxes",
+                    "pre_attack_batch_idx",
+                    "pre_attack_cls",
+                    "pre_attack_bboxes",
+                ]
+                if k in batch and batch[k] is not None
+            ]
             if is_batch_aware
             else []
         )
         collected_targets = {k: [] for k in target_keys}
+        collected_gt_matrices = []
+        collected_gt_params = []
 
         for start_idx in range(0, bs, limit):
             end_idx = min(start_idx + limit, bs)
@@ -390,13 +443,28 @@ def run_attack_on_batch(
             if adv_sub is not None:
                 adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
 
-            if is_batch_aware and "batch_idx" in sub_batch and sub_batch["batch_idx"] is not None:
-                sub_bi = sub_batch["batch_idx"]
-                if sub_bi.numel() > 0:
-                    collected_targets["batch_idx"].append(sub_bi + start_idx)
-                    for k in target_keys:
-                        if k != "batch_idx" and k in sub_batch and sub_batch[k] is not None:
-                            collected_targets[k].append(sub_batch[k])
+            if "gt_matrix" in sub_batch and sub_batch["gt_matrix"] is not None:
+                collected_gt_matrices.append(sub_batch["gt_matrix"])
+            elif hasattr(attacker, "last_selected_matrices") and attacker.last_selected_matrices is not None:
+                collected_gt_matrices.append(attacker.last_selected_matrices)
+            if "gt_params" in sub_batch and sub_batch["gt_params"] is not None:
+                collected_gt_params.append(sub_batch["gt_params"])
+            elif hasattr(attacker, "last_selected_params") and attacker.last_selected_params is not None:
+                collected_gt_params.append(attacker.last_selected_params)
+
+            if is_batch_aware:
+                for bi_k in ["batch_idx", "clean_batch_idx", "pre_attack_batch_idx"]:
+                    if bi_k in target_keys and bi_k in sub_batch and sub_batch[bi_k] is not None:
+                        sub_bi = sub_batch[bi_k]
+                        if sub_bi.numel() > 0:
+                            collected_targets[bi_k].append(sub_bi + start_idx)
+                for k in target_keys:
+                    if (
+                        k not in {"batch_idx", "clean_batch_idx", "pre_attack_batch_idx"}
+                        and k in sub_batch
+                        and sub_batch[k] is not None
+                    ):
+                        collected_targets[k].append(sub_batch[k])
 
             del sub_batch, adv_sub
             if torch.cuda.is_available():
@@ -408,6 +476,16 @@ def run_attack_on_batch(
                     batch[k] = torch.cat(collected_targets[k], dim=0)
                 else:
                     batch[k] = batch[k][:0]
+            if collected_gt_matrices:
+                all_matrices = torch.cat(collected_gt_matrices, dim=0)
+                batch["gt_matrix"] = all_matrices
+                if hasattr(attacker, "last_selected_matrices"):
+                    attacker.last_selected_matrices = all_matrices
+            if collected_gt_params:
+                all_params = torch.cat(collected_gt_params, dim=0)
+                batch["gt_params"] = all_params
+                if hasattr(attacker, "last_selected_params"):
+                    attacker.last_selected_params = all_params
 
         return adv_imgs
 
@@ -452,36 +530,47 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
 
     if normalized in {"fgsm"}:
         from ultralytics.attacks.art_fgsm import ARTFGSM
+
         return ARTFGSM(model=model, **kwargs)
     if normalized in {"pgd"}:
         from ultralytics.attacks.art_pgd import ARTPGD
+
         return ARTPGD(model=model, **kwargs)
     if normalized in {"dpatch"}:
         from ultralytics.attacks.art_dpatch import ARTDPatch
+
         return ARTDPatch(model=model, **kwargs)
     if normalized in {"mim"}:
         from ultralytics.attacks.art_mim import ARTMIM
+
         return ARTMIM(model=model, **kwargs)
     if normalized in {"cw"}:
         from ultralytics.attacks.art_cw import ARTCW
+
         return ARTCW(model=model, **kwargs)
     if normalized in {"bim"}:
         from ultralytics.attacks.art_bim import ARTBIM
+
         return ARTBIM(model=model, **kwargs)
     if normalized in {"deepfool"}:
         from ultralytics.attacks.art_deepfool import ARTDeepFool
+
         return ARTDeepFool(model=model, **kwargs)
     if normalized in {"jsma"}:
         from ultralytics.attacks.art_jsma import ARTJSMA
+
         return ARTJSMA(model=model, **kwargs)
     if normalized in {"uap"}:
         from ultralytics.attacks.art_uap import ARTUAP
+
         return ARTUAP(model=model, **kwargs)
     if normalized in {"autoattack"}:
         from ultralytics.attacks.art_autoattack import ARTAutoAttack
+
         return ARTAutoAttack(model=model, **kwargs)
     if normalized in {"worstk"}:
         from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
+
         return SpatialWorstOfK(model=model, **kwargs)
 
     raise ValueError(f"Unsupported attack name: {name}")

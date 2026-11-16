@@ -227,6 +227,13 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = (batch["img"].half() if self.args.quantize == 16 else batch["img"].float()) / 255.0
 
+        if "bboxes" in batch and batch["bboxes"] is not None:
+            batch["pre_attack_bboxes"] = batch["bboxes"].clone()
+        if "cls" in batch and batch["cls"] is not None:
+            batch["pre_attack_cls"] = batch["cls"].clone()
+        if "batch_idx" in batch and batch["batch_idx"] is not None:
+            batch["pre_attack_batch_idx"] = batch["batch_idx"].clone()
+
         attack_name = getattr(self, "current_attack", None) or getattr(self, "attack_name", None)
         if attack_name and attack_name.lower().strip() not in {"raw", "none", "clean"}:
             attacker = None
@@ -299,6 +306,14 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
 
         _, _, h, w = batch["img"].shape
         self._current_hw = (h, w)
+
+        b_size = batch["img"].shape[0]
+        if "gt_matrix" in batch and batch["gt_matrix"] is not None:
+            batch["attack_matrices"] = batch["gt_matrix"]
+        else:
+            batch["attack_matrices"] = (
+                torch.eye(3, device=self.device, dtype=torch.float32).unsqueeze(0).expand(b_size, 3, 3)
+            )
 
         # Apply defense preprocessing pipeline according to configured mode
         if self.pipeline is not None:

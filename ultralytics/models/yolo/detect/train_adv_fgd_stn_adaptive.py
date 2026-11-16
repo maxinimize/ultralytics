@@ -703,6 +703,13 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                         if st in self.epoch_counts:
                             self.epoch_counts[st] += 1
 
+                    if "bboxes" in batch and batch["bboxes"] is not None:
+                        batch["pre_attack_bboxes"] = batch["bboxes"].clone()
+                    if "cls" in batch and batch["cls"] is not None:
+                        batch["pre_attack_cls"] = batch["cls"].clone()
+                    if "batch_idx" in batch and batch["batch_idx"] is not None:
+                        batch["pre_attack_batch_idx"] = batch["batch_idx"].clone()
+
                     sub_batches = self.split_batch_by_type(batch)
                     if "raw" in sub_batches:
                         self.epoch_attack_stats["actual_raw"] += len(sub_batches["raw"]["img"])
@@ -912,6 +919,22 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                             batch["batch_idx"] = torch.zeros(0, dtype=torch.long, device=dev)
                             batch["cls"] = torch.zeros((0, 1), dtype=torch.float32, device=dev)
                             batch["bboxes"] = torch.zeros((0, 4), dtype=torch.float32, device=dev)
+
+                    # Build per-image attack forward matrices [B, 3, 3] (identity for non-spatial attacks)
+                    b_size = batch["img"].shape[0]
+                    batch_attack_matrices = (
+                        torch.eye(3, device=batch["img"].device, dtype=torch.float32)
+                        .unsqueeze(0)
+                        .expand(b_size, 3, 3)
+                        .clone()
+                    )
+                    for t, sub_b in sub_batches.items():
+                        indices = [idx for idx, st in enumerate(batch["sample_type"]) if st == t]
+                        if indices and "gt_matrix" in sub_b and sub_b["gt_matrix"] is not None:
+                            batch_attack_matrices[indices] = sub_b["gt_matrix"].to(
+                                device=batch["img"].device, dtype=torch.float32
+                            )
+                    batch["attack_matrices"] = batch_attack_matrices
 
                     # 3. Apply configured Defense Preprocessing Pipeline for YOLO detector
                     _, _, h, w = batch["img"].shape

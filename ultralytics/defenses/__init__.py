@@ -5,6 +5,7 @@ from .fgd_stn_pipeline import (
     PreprocessDetectorWrapper,
     build_fgd_stn_pipeline,
     canonicalize_mode,
+    clip_polygon_to_rect,
     transform_batch_bboxes_for_stn,
 )
 
@@ -15,6 +16,7 @@ __all__ = [
     "VALID_MODES",
     "build_fgd_stn_pipeline",
     "canonicalize_mode",
+    "clip_polygon_to_rect",
     "transform_batch_bboxes_for_stn",
     "PreprocessDetectorWrapper",
 ]

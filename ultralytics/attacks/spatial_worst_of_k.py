@@ -145,6 +145,8 @@ class SpatialWorstOfK(Attacker):
         self.last_scores: torch.Tensor | None = None  # [B, k]
         self.last_best_indices: torch.Tensor | None = None  # [B], values 0..k-1
         self.last_params: torch.Tensor | None = None  # [B, k, 3] -> angle, tx, ty
+        self.last_selected_matrices: torch.Tensor | None = None  # [B, 3, 3]
+        self.last_selected_params: torch.Tensor | None = None  # [B, 3]
 
     # ------------------------------------------------------------------
     # Public attack entry points
@@ -170,12 +172,28 @@ class SpatialWorstOfK(Attacker):
         if batch_idx is None or cls is None or bboxes is None:
             raise ValueError("SpatialWorstOfK requires batch_idx, cls and bboxes")
 
+        # Safely preserve clean pre-attack annotations before any transform
+        clean_img = images.clone()
+        clean_bi = batch_idx.clone()
+        clean_c = cls.clone()
+        clean_b = bboxes.clone()
+        batch["clean_img"] = clean_img
+        batch["clean_batch_idx"] = clean_bi
+        batch["clean_cls"] = clean_c
+        batch["clean_bboxes"] = clean_b
+        batch["pre_attack_batch_idx"] = clean_bi
+        batch["pre_attack_cls"] = clean_c
+        batch["pre_attack_bboxes"] = clean_b
+
         targets = self._pack_targets(batch_idx, cls, bboxes, device=images.device)
         adv_images, adv_targets = self._attack(images.float(), targets)
 
         # Preserve the original batch tensor dtypes/shapes expected by Ultralytics.
         batch["img"] = adv_images.to(dtype=images.dtype)
+        batch["gt_matrix"] = getattr(self, "last_selected_matrices", None)
+        batch["gt_params"] = getattr(self, "last_selected_params", None)
         self._write_targets_back(batch, adv_targets, batch_idx, cls, bboxes)
+        batch["adv_bboxes"] = batch["bboxes"].clone()
         return batch["img"]
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -228,9 +246,15 @@ class SpatialWorstOfK(Attacker):
         adv_images = candidates.index_select(0, best_flat)
         adv_targets = self._select_targets(candidate_targets, best_flat, batch_size)
 
+        batch_indices = torch.arange(batch_size, device=x.device)
+        selected_matrices = matrices[batch_indices, best_j]
+        selected_params = params[batch_indices, best_j]
+
         self.last_scores = scores_2d.detach().cpu()
         self.last_best_indices = best_j.detach().cpu()
         self.last_params = params.detach().cpu()
+        self.last_selected_matrices = selected_matrices
+        self.last_selected_params = selected_params
 
         return adv_images, adv_targets
 

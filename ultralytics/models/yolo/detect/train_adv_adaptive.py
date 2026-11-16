@@ -915,6 +915,18 @@ class DetectionTrainer(BaseTrainer):
                 )
                 sub_batch["batch_idx"] = new_batch_idx
 
+                for pre_k in ["clean_cls", "clean_bboxes", "pre_attack_cls", "pre_attack_bboxes"]:
+                    if pre_k in batch and batch[pre_k] is not None:
+                        sub_batch[pre_k] = batch[pre_k][mask]
+                for pre_bi in ["clean_batch_idx", "pre_attack_batch_idx"]:
+                    if pre_bi in batch and batch[pre_bi] is not None:
+                        old_pbi = batch[pre_bi][mask]
+                        sub_batch[pre_bi] = torch.tensor(
+                            [idx_map[int(x)] for x in old_pbi],
+                            dtype=old_pbi.dtype,
+                            device=old_pbi.device,
+                        )
+
             for k in ["masks", "keypoints", "segments", "obb", "visuals", "sem_masks"]:
                 if k in batch and batch[k] is not None:
                     if k in {"visuals", "sem_masks"}:
@@ -1328,7 +1340,7 @@ class DetectionTrainer(BaseTrainer):
                     f"  Planned:  "
                     + ", ".join(f"{t}: {r:.3f} ({self.epoch_counts[t]})" for t, r in planned_ratios.items())
                     + "\n"
-                    "  Actual:   "
+                    f"  Actual:   "
                     + ", ".join(f"{t}: {r:.3f} ({actual_counts[t]})" for t, r in actual_ratios.items())
                     + "\n"
                     f"  Details:  attempted={self.epoch_attack_stats['attempted']}, generated={self.epoch_attack_stats['generated']}, "
