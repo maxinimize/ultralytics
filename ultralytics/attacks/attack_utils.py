@@ -1,4 +1,5 @@
 from copy import deepcopy
+from typing import Any
 
 import torch
 
@@ -108,3 +109,45 @@ class BatchContainer:
 
     def __copy__(self):
         return BatchContainer(**self._data.copy())
+
+
+def extract_detection_model(model: Any) -> torch.nn.Module:
+    """Extract full DetectionModel from AutoBackend or training model without stripping to nn.Sequential.
+
+    Args:
+        model (Any): An AutoBackend instance, DetectionModel, or nn.Module.
+
+    Returns:
+        (torch.nn.Module): The unwrapped complete detection model.
+
+    Raises:
+        ValueError: If model is an AutoBackend with an unsupported non-PyTorch backend.
+        TypeError: If the extracted model is nn.Sequential or missing loss/forward capabilities.
+    """
+    from ultralytics.nn.autobackend import AutoBackend
+    from ultralytics.utils.torch_utils import unwrap_model
+
+    if isinstance(model, AutoBackend):
+        fmt = getattr(model, "format", None)
+        if fmt != "pt":
+            raise ValueError(
+                f"Adversarial surrogate extraction only supports native PyTorch models ('pt'), "
+                f"but received AutoBackend format='{fmt}'."
+            )
+        backend = getattr(model, "backend", None)
+        if backend is not None and hasattr(backend, "model"):
+            detector = unwrap_model(backend.model)
+        else:
+            detector = unwrap_model(getattr(model, "model", model))
+    else:
+        detector = unwrap_model(model)
+
+    if isinstance(detector, torch.nn.Sequential):
+        raise TypeError("Extracted detector is an nn.Sequential instance, not a complete DetectionModel.")
+
+    if not hasattr(detector, "loss") or not callable(getattr(detector, "loss", None)):
+        raise TypeError(
+            f"Extracted detector of type '{type(detector).__name__}' does not have a callable 'loss' method."
+        )
+
+    return detector

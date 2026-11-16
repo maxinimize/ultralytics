@@ -10,9 +10,9 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch import nn
 
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_utils import extract_detection_model
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
@@ -29,7 +29,7 @@ from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
 )
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, RANK, TQDM, IterableSimpleNamespace, callbacks, ops
+from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, RANK, TQDM, IterableSimpleNamespace, callbacks, ops
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
 
@@ -446,17 +446,25 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 target_surrogate = trainer.attack_model
             else:
                 # White-box AT / final evaluation: Attack the evaluated model (live/EMA during training, or best.pt during final_eval)
-                raw_detector = (
-                    model.model
-                    if hasattr(model, "model") and isinstance(model.model, nn.Module)
-                    else unwrap_model(model)
+                source_model = (
+                    ((getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None)) or trainer.model)
+                    if trainer is not None
+                    else model
                 )
+                raw_detector = extract_detection_model(source_model)
                 eval_surrogate = deepcopy(raw_detector).float()
                 if hasattr(eval_surrogate, "args") and isinstance(eval_surrogate.args, dict):
                     eval_surrogate.args = IterableSimpleNamespace(**eval_surrogate.args)
+                elif not hasattr(eval_surrogate, "args") or eval_surrogate.args is None:
+                    eval_surrogate.args = IterableSimpleNamespace(**DEFAULT_CFG_DICT)
                 for p in eval_surrogate.parameters():
                     p.requires_grad_(False)
                 eval_surrogate.eval()
+                if hasattr(eval_surrogate, "init_criterion") and getattr(eval_surrogate, "criterion", None) is None:
+                    try:
+                        eval_surrogate.criterion = eval_surrogate.init_criterion()
+                    except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+                        LOGGER.warning(f"Could not pre-initialize criterion on surrogate: {e}")
                 target_surrogate = eval_surrogate
 
             if self.attack_through_preprocess and self.preprocess_mode != "none":

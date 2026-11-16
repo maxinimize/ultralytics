@@ -14,6 +14,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_utils import extract_detection_model
 from ultralytics.cfg import get_cfg
 from ultralytics.defenses.fgd_stn_pipeline import (
     FGDSTNPipeline,
@@ -41,8 +43,11 @@ from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_staged import (
     DetectionValidatorAdvFGDSTNStaged,
 )
+from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.nn.modules.head import Detect
-from ultralytics.utils import DEFAULT_CFG
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_DICT, IterableSimpleNamespace
+from ultralytics.utils.torch_utils import ModelEMA
 
 
 class DummyBackboneBlock(nn.Module):
@@ -413,21 +418,90 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertFalse(has_targets)
 
     def test_autobackend_surrogate_extraction(self):
-        """Verify that AutoBackend wrappers extract the underlying nn.Module detector for attackers."""
+        """Verify DetectionModel is extracted as a full detector rather than stripped to internal Sequential."""
+        # 1. Real small DetectionModel counterexample: demonstrate the bug in the previous implementation
+        m = DetectionModel("yolo11n.yaml", ch=3, nc=10, verbose=False)
+        old_buggy_detector = m.model if hasattr(m, "model") and isinstance(m.model, nn.Module) else m
+        self.assertIsInstance(old_buggy_detector, nn.Sequential)
+        self.assertFalse(hasattr(old_buggy_detector, "loss"))
+        with self.assertRaises(TypeError):
+            old_buggy_detector(torch.zeros(1, 3, 64, 64), augment=False)
 
-        class MockAutoBackend:
-            def __init__(self, inner):
-                self.model = inner
+        # 2. Extract from complete DetectionModel: keeps full DetectionModel with loss and YOLO routing
+        d1 = extract_detection_model(m)
+        self.assertIs(d1, m)
+        self.assertFalse(isinstance(d1, nn.Sequential))
+        self.assertTrue(hasattr(d1, "loss") and callable(d1.loss))
+        out1 = d1(torch.zeros(1, 3, 64, 64), augment=False)
+        self.assertIsNotNone(out1)
 
-            def parameters(self):
-                return iter([])
+        # 3. Extract from training EMA model
+        ema = ModelEMA(m)
+        d2 = extract_detection_model(ema.ema)
+        self.assertIs(d2, ema.ema)
+        self.assertTrue(hasattr(d2, "loss") and callable(d2.loss))
+        out2 = d2(torch.zeros(1, 3, 64, 64), augment=False)
+        self.assertIsNotNone(out2)
 
-        inner_detector = MockYOLOModel()
-        wrapped = MockAutoBackend(inner_detector)
-        raw_detector = wrapped.model if hasattr(wrapped, "model") and isinstance(wrapped.model, nn.Module) else wrapped
-        self.assertEqual(raw_detector, inner_detector)
-        params = list(raw_detector.parameters())
-        self.assertTrue(len(params) > 0)
+        # 4. Extract from real AutoBackend (PyTorch)
+        ab = AutoBackend(model=m, device=torch.device("cpu"), verbose=False)
+        d3 = extract_detection_model(ab)
+        self.assertFalse(isinstance(d3, nn.Sequential))
+        self.assertTrue(hasattr(d3, "loss") and callable(d3.loss))
+        out3 = d3(torch.zeros(1, 3, 64, 64), augment=False)
+        self.assertIsNotNone(out3)
+
+        # 5. Unsupported export backends raise explicit ValueError
+        class UnsupportedAutoBackend(AutoBackend):
+            def __init__(self):
+                super(nn.Module, self).__init__()
+                self.format = "onnx"
+
+        with self.assertRaises(ValueError):
+            extract_detection_model(UnsupportedAutoBackend())
+
+        # 6. Bare nn.Sequential or model lacking loss raises TypeError
+        with self.assertRaises(TypeError):
+            extract_detection_model(m.model)
+        with self.assertRaises(TypeError):
+            extract_detection_model(nn.Linear(10, 10))
+
+        # 7. Real PGD and WorstK construction and mini-batch execution
+        target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        eval_surrogate = copy.deepcopy(d1).float().to(target_device)
+        for p in eval_surrogate.parameters():
+            p.requires_grad_(False)
+        eval_surrogate.eval()
+        eval_surrogate.args = IterableSimpleNamespace(**DEFAULT_CFG_DICT)
+        if hasattr(eval_surrogate, "init_criterion"):
+            eval_surrogate.criterion = eval_surrogate.init_criterion()
+
+        worstk = build_attacker("worstk", model=eval_surrogate, img_size=64)
+        pgd = build_attacker("pgd", model=eval_surrogate, img_size=64)
+
+        mini_batch = {
+            "img": torch.rand(2, 3, 64, 64, device=target_device),
+            "batch_idx": torch.tensor([0, 1], dtype=torch.long, device=target_device),
+            "cls": torch.tensor([[0.0], [1.0]], dtype=torch.float32, device=target_device),
+            "bboxes": torch.tensor(
+                [[0.5, 0.5, 0.2, 0.2], [0.3, 0.3, 0.1, 0.1]], dtype=torch.float32, device=target_device
+            ),
+        }
+        # Neither PGD nor WorstK should raise Sequential missing loss or augment errors
+        worstk.forward_batch(copy.deepcopy(mini_batch))
+        adv_pgd = run_attack_on_batch(pgd, copy.deepcopy(mini_batch), label_policy="largest_box", max_batch_size=2)
+        self.assertEqual(adv_pgd.shape, (2, 3, 64, 64))
+
+        # 8. Model selection fallback in validator: trainer without EMA falls back to trainer.model
+        trainer_no_ema = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer_no_ema.model = m
+        trainer_no_ema.ema = None
+        trainer_no_ema.attack_model = None
+        source_no_ema = (
+            getattr(trainer_no_ema, "ema", None) and getattr(trainer_no_ema.ema, "ema", None)
+        ) or trainer_no_ema.model
+        self.assertIs(source_no_ema, m)
+        self.assertIs(extract_detection_model(source_no_ema), m)
 
     # 14. The new implementation does not alter the behavior of existing experiment scripts
     def test_req14_existing_scripts_unaltered(self):
