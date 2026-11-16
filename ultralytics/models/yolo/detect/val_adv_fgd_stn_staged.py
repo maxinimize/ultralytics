@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from copy import copy, deepcopy
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,7 +20,6 @@ from ultralytics.defenses.fgd_stn_pipeline import (
     PreprocessDetectorWrapper,
     build_fgd_stn_pipeline,
     canonicalize_mode,
-    transform_batch_bboxes_for_stn,
 )
 from ultralytics.models.yolo.detect.val_adv_adaptive import (
     parse_list_arg,
@@ -60,7 +59,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         preprocess_mode: str = "stn_fgd",
         fgd_weights: str | Path | None = None,
         stn_weights: str | Path | None = None,
-        attack_through_preprocess: bool = True,
+        attack_through_preprocess: bool = False,
         stage: int = 1,
         eval_weights: Sequence[float] | dict[str, float] | None = None,
         strict_attacks: bool = True,
@@ -203,6 +202,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch: move to device, generate online attack, and apply defense pipeline."""
+        self.current_pred_matrix = None
+        self._current_hw = None
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
@@ -293,8 +294,6 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 self.fgd_weights = trainer.fgd_weights
             if hasattr(trainer, "stn_weights"):
                 self.stn_weights = trainer.stn_weights
-            if hasattr(trainer, "attack_through_preprocess"):
-                self.attack_through_preprocess = trainer.attack_through_preprocess
             if hasattr(trainer, "pipeline") and trainer.pipeline is not None:
                 self.pipeline = trainer.pipeline
             if hasattr(trainer, "strict_attacks"):
@@ -468,12 +467,16 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 target_surrogate = eval_surrogate
 
             if self.attack_through_preprocess and self.preprocess_mode != "none":
+                LOGGER.info(
+                    f"Validation attacks configured to pass through defense preprocessing (mode='{self.preprocess_mode}')."
+                )
                 val_attack_target = PreprocessDetectorWrapper(
                     pipeline=self.pipeline,
                     detector=target_surrogate,
                     mode=self.preprocess_mode,
                 )
             else:
+                LOGGER.info("Validation attacks target YOLO detector directly (defense applied only during inference).")
                 val_attack_target = target_surrogate
 
             val_attackers = {}
@@ -484,22 +487,6 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         else:
             self.attackers = {}
             self.attacker = None
-
-        ema = getattr(trainer, "ema", None)
-        target_model = (getattr(ema, "ema", None) or trainer.model) if trainer is not None else model
-        orig_loss = None
-        if trainer is not None and target_model is not None and hasattr(target_model, "loss"):
-            orig_loss = target_model.loss
-
-            def loss_with_stn(batch_in, preds_in=None):
-                if self.current_pred_matrix is not None:
-                    h, w = self._current_hw
-                    batch_loss = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch_in.items()}
-                    batch_loss = transform_batch_bboxes_for_stn(batch_loss, self.current_pred_matrix, height=h, width=w)
-                    return orig_loss(batch_loss, preds_in)
-                return orig_loss(batch_in, preds_in)
-
-            target_model.loss = loss_with_stn
 
         all_results = {}
         all_losses = {}
@@ -544,9 +531,10 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                                 preds = model(batch["img"], augment=augment)
 
                         with dt[2]:
-                            if self.training:
-                                for k, v in model.loss(batch, preds)[1].items():
-                                    self.loss[k] += v
+                            if self.training and hasattr(self, "loss") and self.loss is not None:
+                                for k, v in self.compute_validation_loss(batch, preds, model)[1].items():
+                                    if k in self.loss:
+                                        self.loss[k] += v
 
                     with dt[3]:
                         preds = self.postprocess(preds)
@@ -591,8 +579,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                         all_losses[run] = {k: v.cpu() / len(self.dataloader) for k, v in loss.items()}
 
         finally:
-            if orig_loss is not None and target_model is not None:
-                target_model.loss = orig_loss
+            self.current_pred_matrix = None
+            self._current_hw = None
 
         if RANK > 0:
             return {}

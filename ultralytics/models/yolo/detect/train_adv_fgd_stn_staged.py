@@ -801,7 +801,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             preprocess_mode=self.preprocess_mode,
             fgd_weights=self.fgd_weights,
             stn_weights=self.stn_weights,
-            attack_through_preprocess=getattr(self, "attack_through_preprocess", True),
+            attack_through_preprocess=getattr(self.args, "val_attack_through_preprocess", False),
             stage=self.stage,
             eval_weights=self.eval_weights,
             strict_attacks=self.strict_attacks,
@@ -925,6 +925,14 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         Evaluates the base detector with frozen STN->FGD defense on the validation set without
         initializing the optimizer, scheduler, or adversarial attackers.
         """
+        if getattr(self, "stage", 1) != 1:
+            msg = (
+                f"run_epoch0_eval is only supported for Stage 1 clean baseline evaluation (got stage={self.stage}). "
+                "Stage 2 adversarial baseline evaluation is not structurally supported in epoch 0 / eval-only mode."
+            )
+            LOGGER.error(msg)
+            raise NotImplementedError(msg)
+
         if not isinstance(self.model, nn.Module):
             self.setup_model()
             self.model = self.model.to(self.device)
@@ -997,6 +1005,13 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
 
     def eval_only(self) -> dict[str, Any]:
         """Run standalone evaluation without training."""
+        if getattr(self, "stage", 1) != 1:
+            msg = (
+                f"eval_only mode is only supported for Stage 1 clean baseline evaluation (got stage={self.stage}). "
+                "Stage 2 adversarial evaluation requires an active training context and is not structurally supported in eval-only mode."
+            )
+            LOGGER.error(msg)
+            raise NotImplementedError(msg)
         LOGGER.info("Running in --eval_only mode (no optimizer, scheduler, or adversarial attackers).")
         return self.run_epoch0_eval(save_results=True)
 
@@ -1036,6 +1051,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             LOGGER.info("Evaluating Epoch 0 baseline before commencing Stage 1 training...")
             self.run_epoch0_eval(save_results=True)
             self.best_fitness = None
+        elif self.stage != 1 and getattr(self, "eval_epoch0", False):
+            LOGGER.warning(
+                f"eval_epoch0 is ignored for stage={self.stage}; Epoch 0 baseline evaluation is only supported for Stage 1."
+            )
 
         while True:
             self.epoch = epoch

@@ -382,7 +382,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             preprocess_mode=self.preprocess_mode,
             fgd_weights=self.fgd_weights,
             stn_weights=self.stn_weights,
-            attack_through_preprocess=self.attack_through_preprocess,
+            attack_through_preprocess=getattr(self.args, "val_attack_through_preprocess", False),
         )
         validator.attacker = getattr(self, "attacker", None)
         validator.attackers = getattr(self, "attackers", {})

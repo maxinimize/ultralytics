@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
-from copy import copy, deepcopy
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
-
-import json
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.engine.validator import BaseValidator
@@ -22,7 +22,6 @@ from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
 from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 
 
 def parse_list_arg(val, type_conv=str):
@@ -40,8 +39,8 @@ def parse_list_arg(val, type_conv=str):
     if not val:
         return []
     # If it contains commas, split by comma; otherwise split by whitespace
-    if ',' in val:
-        parts = val.split(',')
+    if "," in val:
+        parts = val.split(",")
     else:
         parts = val.split()
     return [type_conv(p.strip()) for p in parts if p.strip()]
@@ -149,15 +148,28 @@ class DetectionValidator(BaseValidator):
             self.device = trainer.device
             self.data = trainer.data
             # Force FP16 val during training
-            self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
-            model = trainer.ema.ema or trainer.model
-            if trainer.args.compile and hasattr(model, "_orig_mod"):
+            self.args.quantize = 16 if (self.device.type != "cpu" and getattr(trainer, "amp", False)) else None
+            model = (
+                (getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None))
+                or getattr(trainer, "model", None)
+                or model
+            )
+            if getattr(trainer.args, "compile", False) and hasattr(model, "_orig_mod"):
                 model = model._orig_mod  # validate non-compiled original model to avoid issues
             # Keep training validation read-only: inputs may be fp16, but EMA/model weights stay fp32 under autocast.
-            model = model.float()
-            self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
-            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
-            model.eval()
+            if model is not None:
+                model = model.float()
+            loss_items = getattr(trainer, "loss_items", None)
+            if loss_items:
+                self.loss = {k: torch.zeros_like(v) for k, v in loss_items.items()}
+            else:
+                self.loss = {}
+            possible_stop = getattr(getattr(trainer, "stopper", None), "possible_stop", False)
+            trainer_epoch = getattr(trainer, "epoch", 0)
+            trainer_epochs = getattr(trainer, "epochs", 1)
+            self.args.plots &= possible_stop or (trainer_epoch == trainer_epochs - 1)
+            if model is not None:
+                model.eval()
         else:
             if str(self.args.model).endswith(".yaml") and model is None:
                 LOGGER.warning("validating an untrained model YAML will result in 0 mAP.")
@@ -263,7 +275,9 @@ class DetectionValidator(BaseValidator):
 
         for run in unique_runs:
             if run != "raw":
-                LOGGER.info(f"Running validation for attack: {run} (Eval Weight: {norm_eval_weights.get(run, 0.0):.4f})")
+                LOGGER.info(
+                    f"Running validation for attack: {run} (Eval Weight: {norm_eval_weights.get(run, 0.0):.4f})"
+                )
             else:
                 LOGGER.info("Running validation for raw images (Eval Weight: 0.0000 [Clean])")
 
@@ -302,9 +316,10 @@ class DetectionValidator(BaseValidator):
 
                     # Loss
                     with dt[2]:
-                        if self.training:
-                            for k, v in model.loss(batch, preds)[1].items():
-                                self.loss[k] += v
+                        if self.training and hasattr(self, "loss") and self.loss is not None:
+                            for k, v in self.compute_validation_loss(batch, preds, model)[1].items():
+                                if k in self.loss:
+                                    self.loss[k] += v
 
                 # Postprocess
                 with dt[3]:
@@ -337,9 +352,9 @@ class DetectionValidator(BaseValidator):
                     "ap_class_index": self.metrics.box.ap_class_index,
                 }
 
-                if self.training:
+                if self.training and hasattr(self, "loss") and self.loss is not None:
                     loss = {k: v.clone().detach() for k, v in self.loss.items()}
-                    if trainer.world_size > 1:
+                    if getattr(trainer, "world_size", 1) > 1:
                         for v in loss.values():
                             dist.reduce(v, dst=0, op=dist.ReduceOp.AVG)
                     all_losses[run] = {k: v.cpu() / len(self.dataloader) for k, v in loss.items()}
@@ -376,7 +391,11 @@ class DetectionValidator(BaseValidator):
             for run in unique_runs:
                 m50_95 = all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0)
                 m50 = all_results.get(run, {}).get("metrics/mAP50(B)", 0.0)
-                w_str = f"(Eval Weight: {norm_eval_weights.get(run, 0.0):.4f})" if run != "raw" else "(Eval Weight: 0.0000 [Clean])"
+                w_str = (
+                    f"(Eval Weight: {norm_eval_weights.get(run, 0.0):.4f})"
+                    if run != "raw"
+                    else "(Eval Weight: 0.0000 [Clean])"
+                )
                 LOGGER.info(f"  {run:10s} -> mAP50-95: {m50_95:.5f}, mAP50: {m50:.5f}  {w_str}")
 
             self.run_callbacks("on_val_end")
@@ -385,7 +404,10 @@ class DetectionValidator(BaseValidator):
             stats = self.metrics.results_dict
 
             # Fitness is computed strictly from fixed evaluation weights on attack mAP50-95 (Clean weight=0)
-            fitness = sum(norm_eval_weights.get(a, 0.0) * all_results.get(a, {}).get("metrics/mAP50-95(B)", 0.0) for a in eval_attacks)
+            fitness = sum(
+                norm_eval_weights.get(a, 0.0) * all_results.get(a, {}).get("metrics/mAP50-95(B)", 0.0)
+                for a in eval_attacks
+            )
             stats["fitness"] = float(fitness)
             LOGGER.info(f"fitness (fixed weighted attack mAP50-95, Clean weight=0): {stats['fitness']:.5f}\n")
 
@@ -421,6 +443,27 @@ class DetectionValidator(BaseValidator):
                 if self.args.plots or self.args.save_json:
                     LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
                 return stats
+
+    def compute_validation_loss(
+        self,
+        batch: dict[str, Any],
+        preds: Any,
+        model: torch.nn.Module | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute validation loss for the current batch and predictions.
+
+        Args:
+            batch (dict): Batch dictionary containing input images and ground truth annotations.
+            preds (Any): Model forward predictions.
+            model (nn.Module, optional): Model instance to compute loss with. Defaults to self.model.
+
+        Returns:
+            (tuple[torch.Tensor, dict[str, torch.Tensor]]): Tuple of (loss, loss_items) as returned by model.loss.
+        """
+        target = model if model is not None else getattr(self, "model", None)
+        if target is None:
+            raise ValueError("No model provided or available on validator to compute validation loss.")
+        return target.loss(batch, preds)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation."""
@@ -469,7 +512,9 @@ class DetectionValidator(BaseValidator):
                 except Exception as e:
                     self.attack_failures = getattr(self, "attack_failures", set())
                     self.attack_failures.add(attack_name)
-                    LOGGER.error(f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch.")
+                    LOGGER.error(
+                        f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch."
+                    )
                     if getattr(self.args, "strict_attacks", False):
                         raise
 

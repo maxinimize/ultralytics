@@ -97,6 +97,19 @@ class MockYOLOModel(nn.Module):
         return loss, loss_items
 
 
+class LossTrackingDetector(MockYOLOModel):
+    """Mock detector tracking received bboxes in loss calls."""
+
+    def __init__(self, nc: int = 10, ch: int = 16):
+        super().__init__(nc=nc, ch=ch)
+        self.received_bboxes: list[torch.Tensor] = []
+
+    def loss(self, batch: dict, preds: Any = None):
+        if "bboxes" in batch and batch["bboxes"] is not None:
+            self.received_bboxes.append(batch["bboxes"].clone())
+        return super().loss(batch, preds)
+
+
 class TestStagedPipeline(unittest.TestCase):
     """Test suite covering the 14 verification requirements for the staged pipeline."""
 
@@ -1013,6 +1026,172 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertTrue(torch.allclose(out_deg[0]["conf"], torch.tensor([0.9])))
         self.assertTrue(torch.allclose(out_deg[0]["cls"], torch.tensor([0.0])))
         self.assertTrue(torch.allclose(out_deg[0]["extra"], torch.tensor([[100.0]])))
+
+    def test_clean_validation_loss_two_batches_and_no_monkeypatch(self):
+        """Verify Item 3: STN loss closure monkeypatch is removed and validation loss transforms labels cleanly."""
+        pipeline = FGDSTNPipeline(denoiser=self.fgd, stn=self.stn)
+        h, w = 640, 640
+
+        # +10 pixel horizontal shift forward matrix: [B, 3, 3]
+        params_shift = torch.tensor([[0.0, 10.0, 0.0]])
+        m_shift = build_forward_matrix(params_shift, h, w)
+        # Identity forward matrix: [B, 3, 3]
+        params_id = torch.tensor([[0.0, 0.0, 0.0]])
+        m_id = build_forward_matrix(params_id, h, w)
+
+        for val_cls in [DetectionValidatorAdvFGDSTNAdaptive, DetectionValidatorAdvFGDSTNStaged]:
+            detector = LossTrackingDetector()
+            orig_loss_func = detector.loss.__func__
+
+            val = val_cls.__new__(val_cls)
+            val.pipeline = pipeline
+            val.preprocess_mode = "stn_fgd"
+            val.current_pred_matrix = None
+            val._current_hw = (h, w)
+            val.device = self.device
+            val.model = detector
+            val.training = True
+            val.stage = 1
+
+            # Batch 1: with +10 px shift
+            orig_bboxes1 = torch.tensor([[0.5, 0.5, 0.2, 0.2]], dtype=torch.float32)
+            batch1 = {
+                "img": torch.rand(1, 3, h, w),
+                "bboxes": orig_bboxes1.clone(),
+                "batch_idx": torch.tensor([0], dtype=torch.long),
+                "cls": torch.tensor([[0.0]], dtype=torch.float32),
+            }
+            val.current_pred_matrix = m_shift
+            preds1 = detector(batch1["img"])
+            val.compute_validation_loss(batch1, preds1, detector)
+
+            # Verification 1: batch1["bboxes"] is NOT mutated in-place
+            self.assertTrue(torch.allclose(batch1["bboxes"], orig_bboxes1))
+            # Verification 2: detector.loss received rectified bboxes (which differ from orig_bboxes1)
+            loss1_bboxes = detector.received_bboxes[-1]
+            self.assertFalse(torch.allclose(loss1_bboxes, orig_bboxes1))
+
+            # Batch 2: with identity matrix
+            orig_bboxes2 = torch.tensor([[0.4, 0.4, 0.1, 0.1]], dtype=torch.float32)
+            batch2 = {
+                "img": torch.rand(1, 3, h, w),
+                "bboxes": orig_bboxes2.clone(),
+                "batch_idx": torch.tensor([0], dtype=torch.long),
+                "cls": torch.tensor([[1.0]], dtype=torch.float32),
+            }
+            val.current_pred_matrix = m_id
+            preds2 = detector(batch2["img"])
+            val.compute_validation_loss(batch2, preds2, detector)
+
+            # Verification 3: batch2["bboxes"] is NOT mutated in-place
+            self.assertTrue(torch.allclose(batch2["bboxes"], orig_bboxes2))
+            # Verification 4: detector.loss received untransformed bboxes for identity matrix
+            loss2_bboxes = detector.received_bboxes[-1]
+            self.assertTrue(torch.allclose(loss2_bboxes, orig_bboxes2, atol=1e-4))
+
+            # Verification 5: detector.loss was never monkey-patched
+            self.assertNotIn("loss", detector.__dict__)
+            self.assertIs(detector.loss.__func__, orig_loss_func)
+
+    def test_validation_loss_across_defense_modes(self):
+        """Verify validation loss applies coordinate transformation only when STN is present."""
+        pipeline = FGDSTNPipeline(denoiser=self.fgd, stn=self.stn)
+        h, w = 640, 640
+
+        params_shift = torch.tensor([[0.0, 10.0, 0.0]])
+        m_shift = build_forward_matrix(params_shift, h, w)
+
+        modes = ["none", "fgd", "stn", "fgd_stn", "stn_fgd"]
+        for mode in modes:
+            detector = LossTrackingDetector()
+            val = DetectionValidatorAdvFGDSTNStaged.__new__(DetectionValidatorAdvFGDSTNStaged)
+            val.pipeline = pipeline
+            val.preprocess_mode = mode
+            val._current_hw = (h, w)
+            val.device = self.device
+            val.model = detector
+            val.training = True
+            val.stage = 1
+
+            # For modes with STN, pipeline forward produces m_shift; for none/fgd, pred_matrix is None
+            if mode in {"stn", "fgd_stn", "stn_fgd"}:
+                val.current_pred_matrix = m_shift
+            else:
+                val.current_pred_matrix = None
+
+            orig_bboxes = torch.tensor([[0.5, 0.5, 0.2, 0.2]], dtype=torch.float32)
+            batch = {
+                "img": torch.rand(1, 3, h, w),
+                "bboxes": orig_bboxes.clone(),
+                "batch_idx": torch.tensor([0], dtype=torch.long),
+                "cls": torch.tensor([[0.0]], dtype=torch.float32),
+            }
+            preds = detector(batch["img"])
+            val.compute_validation_loss(batch, preds, detector)
+
+            received = detector.received_bboxes[-1]
+            if mode in {"stn", "fgd_stn", "stn_fgd"}:
+                # Transformed
+                self.assertFalse(torch.allclose(received, orig_bboxes))
+            else:
+                # Untransformed
+                self.assertTrue(torch.allclose(received, orig_bboxes))
+
+    def test_validation_does_not_inherit_train_attack_through_preprocess(self):
+        """Verify validator does not automatically inherit trainer.attack_through_preprocess=True."""
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 1
+        trainer.attack_names = []
+        trainer.attackers = {}
+        trainer.attacker = None
+        trainer.attack_model = None
+        trainer.device = self.device
+        trainer.preprocess_mode = "stn_fgd"
+        trainer.fgd_weights = str(self.fgd_path)
+        trainer.stn_weights = str(self.stn_path)
+        trainer.attack_through_preprocess = True  # Training uses attack_through_preprocess=True
+        trainer.save_dir = self.temp_dir / "val_att_test"
+        trainer.save_dir.mkdir(parents=True, exist_ok=True)
+        trainer.eval_weights = [1.0]
+        trainer.strict_attacks = True
+        trainer.train_head_only = True
+        trainer.freeze_all_bn = True
+        trainer.callbacks = {}
+
+        data = {"nc": 10, "names": {i: f"cls_{i}" for i in range(10)}, "val": "val_dummy", "split": "val"}
+        args = get_cfg(DEFAULT_CFG)
+        args.imgsz = 640
+        args.attack_weights = "current"
+        args.model = "yolo12l.pt"
+        args.split = "val"
+        args.task = "detect"
+        args.batch = 2
+        args.augment = False
+        args.quantize = None
+        args.plots = False
+        args.compile = False
+        trainer.data = data
+        trainer.args = args
+        trainer.model = MockYOLOModel()
+        trainer.set_model_attributes()
+
+        val = trainer.get_validator()
+        # Default validator attack_through_preprocess must be False even if trainer has True
+        self.assertFalse(val.attack_through_preprocess)
+
+    def test_epoch0_and_eval_only_stage2_raises_not_implemented(self):
+        """Verify Stage 2 run_epoch0_eval and eval_only raise structural NotImplementedError early."""
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 2
+        trainer.device = self.device
+
+        with self.assertRaises(NotImplementedError) as ctx1:
+            trainer.run_epoch0_eval()
+        self.assertIn("only supported for Stage 1", str(ctx1.exception))
+
+        with self.assertRaises(NotImplementedError) as ctx2:
+            trainer.eval_only()
+        self.assertIn("only supported for Stage 1", str(ctx2.exception))
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         preprocess_mode: str = "none",
         fgd_weights: str | Path | None = None,
         stn_weights: str | Path | None = None,
-        attack_through_preprocess: bool = True,
+        attack_through_preprocess: bool = False,
         eval_weights: Sequence[float] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -116,8 +116,6 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                 self.fgd_weights = trainer.fgd_weights
             if hasattr(trainer, "stn_weights"):
                 self.stn_weights = trainer.stn_weights
-            if hasattr(trainer, "attack_through_preprocess"):
-                self.attack_through_preprocess = trainer.attack_through_preprocess
             if hasattr(trainer, "pipeline") and trainer.pipeline is not None:
                 self.pipeline = trainer.pipeline
 
@@ -126,35 +124,51 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self._setup_pipeline(target_device)
 
+        if self.attack_through_preprocess and self.preprocess_mode != "none":
+            att_desc = "Validation attacks configured to pass through defense preprocessing"
+        else:
+            att_desc = "Validation attacks target YOLO detector directly (attack_through_preprocess=False)"
         LOGGER.info(
             f"Unified FGD+STN Adaptive Validator running with mode: '{self.preprocess_mode}' "
-            f"({MODE_DESCRIPTIONS.get(self.preprocess_mode, self.preprocess_mode)}) | "
-            f"attack_through_preprocess={self.attack_through_preprocess}"
+            f"({MODE_DESCRIPTIONS.get(self.preprocess_mode, self.preprocess_mode)}) | {att_desc}"
         )
-
-        target_model = (trainer.ema.ema or trainer.model) if trainer is not None else model
-        orig_loss = None
-        if trainer is not None and target_model is not None and hasattr(target_model, "loss"):
-            orig_loss = target_model.loss
-
-            def loss_with_stn(batch_in, preds_in=None):
-                if self.current_pred_matrix is not None:
-                    h, w = self._current_hw
-                    batch_loss = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch_in.items()}
-                    batch_loss = transform_batch_bboxes_for_stn(batch_loss, self.current_pred_matrix, height=h, width=w)
-                    return orig_loss(batch_loss, preds_in)
-                return orig_loss(batch_in, preds_in)
-
-            target_model.loss = loss_with_stn
 
         try:
             return super().__call__(trainer=trainer, model=model)
         finally:
-            if orig_loss is not None and target_model is not None:
-                target_model.loss = orig_loss
+            self.current_pred_matrix = None
+            self._current_hw = None
+
+    def compute_validation_loss(
+        self,
+        batch: dict[str, Any],
+        preds: Any,
+        model: torch.nn.Module | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute validation loss, transforming ground truth bboxes to rectified coordinates if STN was applied.
+
+        Args:
+            batch (dict[str, Any]): Batch dictionary containing annotations and input images.
+            preds (Any): Model predictions for the batch.
+            model (nn.Module, optional): Model instance to compute loss with. Defaults to self.model.
+
+        Returns:
+            (tuple[torch.Tensor, dict[str, torch.Tensor]]): Tuple of (loss, loss_items).
+        """
+        target = model if model is not None else getattr(self, "model", None)
+        if target is None:
+            raise ValueError("No model provided or available on validator to compute validation loss.")
+        if self.current_pred_matrix is not None and getattr(self, "pipeline", None) is not None:
+            h, w = self._current_hw if self._current_hw is not None else (batch["img"].shape[2], batch["img"].shape[3])
+            batch_loss = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch.items()}
+            batch_loss = transform_batch_bboxes_for_stn(batch_loss, self.current_pred_matrix, height=h, width=w)
+            return target.loss(batch_loss, preds)
+        return target.loss(batch, preds)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch: move to device, generate online attack, and apply defense pipeline."""
+        self.current_pred_matrix = None
+        self._current_hw = None
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
