@@ -7,7 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ultralytics.attacks.attack_utils import BatchContainer
+from ultralytics.attacks.attack_utils import (
+    BatchContainer,
+    capture_module_training_states,
+    restore_module_training_states,
+)
 from ultralytics.attacks.attacker import Attacker
 from ultralytics.utils.torch_utils import unwrap_model
 
@@ -139,7 +143,11 @@ class SpatialWorstOfK(Attacker):
         # Candidate scoring does not need gradients. The model is temporarily
         # switched to train mode inside _score_candidates only because YOLO's
         # detection loss expects training-head outputs.
-        self.model.eval()
+        saved_states = capture_module_training_states(self.model)
+        try:
+            self.model.eval()
+        finally:
+            restore_module_training_states(saved_states)
 
         # Useful for logging/debugging after each call.
         self.last_scores: torch.Tensor | None = None  # [B, k]
@@ -162,39 +170,43 @@ class SpatialWorstOfK(Attacker):
 
         ``batch_idx``, ``cls`` and ``bboxes`` are already synchronized here.
         """
-        images = batch.get("img")
-        batch_idx = batch.get("batch_idx")
-        cls = batch.get("cls")
-        bboxes = batch.get("bboxes")
+        saved_states = capture_module_training_states(self.model)
+        try:
+            images = batch.get("img")
+            batch_idx = batch.get("batch_idx")
+            cls = batch.get("cls")
+            bboxes = batch.get("bboxes")
 
-        if images is None:
-            raise ValueError("Detection batch is missing batch['img']")
-        if batch_idx is None or cls is None or bboxes is None:
-            raise ValueError("SpatialWorstOfK requires batch_idx, cls and bboxes")
+            if images is None:
+                raise ValueError("Detection batch is missing batch['img']")
+            if batch_idx is None or cls is None or bboxes is None:
+                raise ValueError("SpatialWorstOfK requires batch_idx, cls and bboxes")
 
-        # Safely preserve clean pre-attack annotations before any transform
-        clean_img = images.clone()
-        clean_bi = batch_idx.clone()
-        clean_c = cls.clone()
-        clean_b = bboxes.clone()
-        batch["clean_img"] = clean_img
-        batch["clean_batch_idx"] = clean_bi
-        batch["clean_cls"] = clean_c
-        batch["clean_bboxes"] = clean_b
-        batch["pre_attack_batch_idx"] = clean_bi
-        batch["pre_attack_cls"] = clean_c
-        batch["pre_attack_bboxes"] = clean_b
+            # Safely preserve clean pre-attack annotations before any transform
+            clean_img = images.clone()
+            clean_bi = batch_idx.clone()
+            clean_c = cls.clone()
+            clean_b = bboxes.clone()
+            batch["clean_img"] = clean_img
+            batch["clean_batch_idx"] = clean_bi
+            batch["clean_cls"] = clean_c
+            batch["clean_bboxes"] = clean_b
+            batch["pre_attack_batch_idx"] = clean_bi
+            batch["pre_attack_cls"] = clean_c
+            batch["pre_attack_bboxes"] = clean_b
 
-        targets = self._pack_targets(batch_idx, cls, bboxes, device=images.device)
-        adv_images, adv_targets = self._attack(images.float(), targets)
+            targets = self._pack_targets(batch_idx, cls, bboxes, device=images.device)
+            adv_images, adv_targets = self._attack(images.float(), targets)
 
-        # Preserve the original batch tensor dtypes/shapes expected by Ultralytics.
-        batch["img"] = adv_images.to(dtype=images.dtype)
-        batch["gt_matrix"] = getattr(self, "last_selected_matrices", None)
-        batch["gt_params"] = getattr(self, "last_selected_params", None)
-        self._write_targets_back(batch, adv_targets, batch_idx, cls, bboxes)
-        batch["adv_bboxes"] = batch["bboxes"].clone()
-        return batch["img"]
+            # Preserve the original batch tensor dtypes/shapes expected by Ultralytics.
+            batch["img"] = adv_images.to(dtype=images.dtype)
+            batch["gt_matrix"] = getattr(self, "last_selected_matrices", None)
+            batch["gt_params"] = getattr(self, "last_selected_params", None)
+            self._write_targets_back(batch, adv_targets, batch_idx, cls, bboxes)
+            batch["adv_bboxes"] = batch["bboxes"].clone()
+            return batch["img"]
+        finally:
+            restore_module_training_states(saved_states)
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Image-only compatibility method.
@@ -203,9 +215,13 @@ class SpatialWorstOfK(Attacker):
         transform changes the ground-truth boxes. ``run_attack_on_batch`` should
         call ``forward_batch`` instead so labels remain synchronized.
         """
-        adv_images, adv_targets = self._attack(x.float(), targets)
-        self.last_transformed_targets = adv_targets
-        return adv_images.to(dtype=x.dtype)
+        saved_states = capture_module_training_states(self.model)
+        try:
+            adv_images, adv_targets = self._attack(x.float(), targets)
+            self.last_transformed_targets = adv_targets
+            return adv_images.to(dtype=x.dtype)
+        finally:
+            restore_module_training_states(saved_states)
 
     # ------------------------------------------------------------------
     # Core Worst-of-k logic
@@ -437,14 +453,25 @@ class SpatialWorstOfK(Attacker):
         total = candidates.shape[0]
         scores = candidates.new_empty((total,), dtype=torch.float32)
 
-        original_training = self.model.training
+        saved_states = capture_module_training_states(self.model)
         try:
             # Training mode is needed to obtain detection-head feature maps used
             # by Ultralytics' training loss. Keep BN/Dropout deterministic.
             self.model.train()
             for module in self.model.modules():
-                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.Dropout)):
+                if isinstance(
+                    module,
+                    (
+                        nn.BatchNorm1d,
+                        nn.BatchNorm2d,
+                        nn.BatchNorm3d,
+                        nn.SyncBatchNorm,
+                        nn.Dropout,
+                    ),
+                ):
                     module.eval()
+            if hasattr(self.model, "pipeline") and self.model.pipeline is not None:
+                self.model.pipeline.eval()
 
             chunk_size = eval_batch_size or getattr(self, "eval_batch_size", 4)
             for start in range(0, total, chunk_size):
@@ -479,7 +506,7 @@ class SpatialWorstOfK(Attacker):
                     scores[idx] = loss.detach().float().sum()
 
         finally:
-            self.model.train(original_training)
+            restore_module_training_states(saved_states)
 
         return scores
 

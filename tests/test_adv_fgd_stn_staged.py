@@ -16,8 +16,18 @@ import numpy as np
 import torch
 from torch import nn
 
+from ultralytics.attacks.art_bim import ARTBIM
+from ultralytics.attacks.art_fgsm import ARTFGSM
+from ultralytics.attacks.art_mim import ARTMIM
+from ultralytics.attacks.art_pgd import ARTPGD
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
-from ultralytics.attacks.attack_utils import extract_detection_model
+from ultralytics.attacks.attack_utils import (
+    capture_module_training_states,
+    extract_detection_model,
+    preserve_module_training_states,
+    restore_module_training_states,
+)
+from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 from ultralytics.cfg import get_cfg
 from ultralytics.defenses.fgd_stn_pipeline import (
     FGDSTNPipeline,
@@ -1985,6 +1995,7 @@ class TestStagedPipeline(unittest.TestCase):
         # Class 2: (0.5*0.60 + 0.5*0.40) = 0.50
         self.assertAlmostEqual(val.metrics.box.all_ap[0, :].mean(), 0.55, places=4)
         self.assertAlmostEqual(val.metrics.box.all_ap[1, :].mean(), 0.50, places=4)
+        self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], 0.525, places=4)
 
     def test_req8_empty_run_and_gt_without_predictions(self):
         """Verify Item 8: Handles entirely empty runs, zero-weight runs, and distinguishes GT-without-preds (AP=0) from absent GT."""
@@ -2037,6 +2048,7 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertAlmostEqual(val.metrics.box.all_ap[0, :].mean(), 0.80, places=4)
         # Class 1: evaluated by A with GT and AP=0.0 -> included in evaluation with 0.0
         self.assertAlmostEqual(val.metrics.box.all_ap[1, :].mean(), 0.00, places=4)
+        self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], 0.24, places=4)
 
         # Completely empty evaluation across all runs
         stats_empty = val.aggregate_multirun_metrics(
@@ -2254,6 +2266,199 @@ class TestStagedPipeline(unittest.TestCase):
         self.assertAlmostEqual(stats_diff["metrics/mAP50-95(B)"], expected_scalar)
         self.assertNotAlmostEqual(stats_diff["metrics/mAP50-95(B)"], row_mean)
         self.assertAlmostEqual(val.metrics.results_dict["metrics/mAP50-95(B)"], expected_scalar)
+
+    def test_req9_module_training_state_preservation_utilities(self):
+        """Verify Item 9: State capture, restore, and preserve utilities operate without recursive side-effects."""
+        self.assertEqual(capture_module_training_states(None), {})
+        restore_module_training_states({})  # No-op without exception
+
+        model = MockYOLOModel(ch=16)
+        model.train()
+        model.model[0].bn.eval()
+        model.model[1].bn.eval()
+        model.model[2].bn.train()
+
+        states = capture_module_training_states(model)
+        self.assertFalse(states[model.model[0].bn])
+        self.assertFalse(states[model.model[1].bn])
+        self.assertTrue(states[model.model[2].bn])
+        self.assertTrue(states[model.model[3]])
+
+        # Simulate recursive train() that would unfreeze modules
+        model.train(True)
+        self.assertTrue(model.model[0].bn.training)
+        self.assertTrue(model.model[1].bn.training)
+
+        # Restore
+        restore_module_training_states(states)
+        self.assertFalse(model.model[0].bn.training)
+        self.assertFalse(model.model[1].bn.training)
+        self.assertTrue(model.model[2].bn.training)
+
+        # Test context manager normal exit
+        with preserve_module_training_states(model):
+            model.train(True)
+            self.assertTrue(model.model[0].bn.training)
+        self.assertFalse(model.model[0].bn.training)
+        self.assertFalse(model.model[1].bn.training)
+        self.assertTrue(model.model[2].bn.training)
+
+        # Test context manager exception exit
+        try:
+            with preserve_module_training_states(model):
+                model.train(True)
+                raise RuntimeError("simulated error")
+        except RuntimeError:
+            pass
+        self.assertFalse(model.model[0].bn.training)
+        self.assertFalse(model.model[1].bn.training)
+        self.assertTrue(model.model[2].bn.training)
+
+    def test_req9_attacker_construction_preserves_mixed_submodule_modes(self):
+        """Verify Item 9: Constructing attackers does not permanently alter mixed training/eval modes."""
+        detector = MockYOLOModel(ch=16)
+        detector.train()
+        detector.model[0].bn.eval()
+        detector.model[1].bn.eval()
+        detector.model[2].bn.train()
+
+        pipeline = FGDSTNPipeline(freeze_modules=True)
+        pipeline.eval()
+        wrapper = PreprocessDetectorWrapper(detector=detector, pipeline=pipeline)
+
+        pre_snap = {m: m.training for m in wrapper.modules()}
+        self.assertFalse(detector.model[0].bn.training)
+        self.assertFalse(detector.model[1].bn.training)
+        self.assertTrue(detector.model[2].bn.training)
+        self.assertFalse(pipeline.training)
+        self.assertTrue(wrapper.training)
+
+        attackers = [
+            build_attacker("worstk", wrapper),
+            build_attacker("pgd", wrapper, img_size=64),
+            build_attacker("bim", wrapper, img_size=64),
+            build_attacker("mim", wrapper, img_size=64),
+            build_attacker("fgsm", wrapper, img_size=64),
+            SpatialWorstOfK(model=wrapper),
+            ARTPGD(model=wrapper, img_size=64),
+            ARTBIM(model=wrapper, img_size=64),
+            ARTMIM(model=wrapper, img_size=64),
+            ARTFGSM(model=wrapper, img_size=64),
+        ]
+
+        for atk in attackers:
+            for m, expected in pre_snap.items():
+                self.assertEqual(
+                    m.training,
+                    expected,
+                    f"Submodule {type(m).__name__} training state changed to {m.training} after constructing {type(atk).__name__}!",
+                )
+
+    def test_req9_attack_execution_preserves_mixed_submodule_modes(self):
+        """Verify Item 9: Executing attacks preserves mixed submodule training states."""
+        detector = MockYOLOModel(ch=16)
+        detector.train()
+        detector.model[0].bn.eval()
+        detector.model[1].bn.eval()
+        detector.model[2].bn.train()
+
+        pipeline = FGDSTNPipeline(freeze_modules=True)
+        pipeline.eval()
+        wrapper = PreprocessDetectorWrapper(detector=detector, pipeline=pipeline)
+
+        pre_snap = {m: m.training for m in wrapper.modules()}
+
+        # Build attacks
+        pgd = build_attacker("pgd", wrapper, img_size=64, epoch=1)
+        bim = build_attacker("bim", wrapper, img_size=64, epoch=1)
+        mim = build_attacker("mim", wrapper, img_size=64, epoch=1)
+        worstk = build_attacker("worstk", wrapper, k=2)
+
+        device = next(wrapper.parameters()).device
+
+        def make_batch():
+            return {
+                "img": torch.rand(2, 3, 64, 64, device=device),
+                "batch_idx": torch.tensor([0, 1], device=device),
+                "cls": torch.tensor([[0.0], [1.0]], device=device),
+                "bboxes": torch.tensor([[0.1, 0.1, 0.3, 0.3], [0.2, 0.2, 0.4, 0.4]], device=device),
+            }
+
+        # Run PGD
+        adv_pgd = run_attack_on_batch(pgd, make_batch())
+        self.assertIsNotNone(adv_pgd)
+        for m, expected in pre_snap.items():
+            self.assertEqual(m.training, expected, f"Submodule {type(m).__name__} mode corrupted after PGD attack!")
+
+        # Run BIM
+        adv_bim = run_attack_on_batch(bim, make_batch())
+        self.assertIsNotNone(adv_bim)
+        for m, expected in pre_snap.items():
+            self.assertEqual(m.training, expected, f"Submodule {type(m).__name__} mode corrupted after BIM attack!")
+
+        # Run MIM
+        adv_mim = run_attack_on_batch(mim, make_batch())
+        self.assertIsNotNone(adv_mim)
+        for m, expected in pre_snap.items():
+            self.assertEqual(m.training, expected, f"Submodule {type(m).__name__} mode corrupted after MIM attack!")
+
+        # Run WorstK
+        adv_worstk = run_attack_on_batch(worstk, make_batch())
+        self.assertIsNotNone(adv_worstk)
+        for m, expected in pre_snap.items():
+            self.assertEqual(m.training, expected, f"Submodule {type(m).__name__} mode corrupted after WorstK attack!")
+
+    def test_req9_frozen_bn_statistics_and_invariants_preserved(self):
+        """Verify Item 9: Stage 2 frozen BN running statistics remain invariant through attack and training steps."""
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 2
+        trainer.freeze_all_bn = False
+        trainer.freeze_bn = True
+        trainer.freeze_layer_names = ["model.0."]
+        trainer.pipeline = None
+        trainer.args = type("Args", (), {"freeze": [], "imgsz": 64})()
+
+        model = MockYOLOModel(ch=16)
+        trainer.model = model
+        trainer._model_train()
+
+        # Build attacker
+        pgd = build_attacker("pgd", model, img_size=64, epoch=1)
+
+        # model.0.bn is frozen in eval, model.1.bn and model.2.bn are active
+        self.assertFalse(model.model[0].bn.training)
+        self.assertTrue(model.model[1].bn.training)
+        self.assertTrue(model.model[2].bn.training)
+
+        trainer._take_frozen_snapshots()
+        trainer.check_frozen_invariants("init")
+
+        # Run attack on batch
+        device = next(model.parameters()).device
+        batch = {
+            "img": torch.rand(2, 3, 64, 64, device=device),
+            "batch_idx": torch.tensor([0, 1], device=device),
+            "cls": torch.tensor([[0.0], [1.0]], device=device),
+            "bboxes": torch.tensor([[0.1, 0.1, 0.3, 0.3], [0.2, 0.2, 0.4, 0.4]], device=device),
+        }
+        adv = run_attack_on_batch(pgd, batch)
+        self.assertIsNotNone(adv)
+
+        # Frozen BN must remain eval, active BNs must remain train
+        self.assertFalse(model.model[0].bn.training)
+        self.assertTrue(model.model[1].bn.training)
+        self.assertTrue(model.model[2].bn.training)
+
+        # Invariants check after attack
+        trainer.check_frozen_invariants("post_attack")
+
+        # Run training forward and backward
+        out = model(adv)
+        loss, _ = model.loss(batch, out)
+        loss.backward()
+
+        # Invariants check after training step
+        trainer.check_frozen_invariants("post_train_step")
 
 
 if __name__ == "__main__":

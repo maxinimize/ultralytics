@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import contextlib
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -169,3 +172,51 @@ def extract_detection_model(model: Any) -> torch.nn.Module:
         )
 
     return detector
+
+
+def capture_module_training_states(model: torch.nn.Module | None) -> dict[torch.nn.Module, bool]:
+    """Capture training mode of every submodule in model without recursive side effects.
+
+    Args:
+        model (Optional[torch.nn.Module]): Target module whose submodule training modes should be recorded.
+
+    Returns:
+        dict[torch.nn.Module, bool]: Mapping of each submodule to its boolean training state.
+    """
+    if model is None or not isinstance(model, torch.nn.Module):
+        return {}
+    states = {m: m.training for m in model.modules()}
+    for attr in ("detector", "pipeline", "model"):
+        sub = getattr(model, attr, None)
+        if isinstance(sub, torch.nn.Module):
+            for m in sub.modules():
+                if m not in states:
+                    states[m] = m.training
+    return states
+
+
+def restore_module_training_states(states: dict[torch.nn.Module, bool]) -> None:
+    """Restore training mode of every submodule from snapshot without recursive train() side effects.
+
+    Args:
+        states (dict[torch.nn.Module, bool]): Mapping from submodules to their saved training states.
+    """
+    if not states:
+        return
+    for m, mode in states.items():
+        m.training = mode
+
+
+@contextlib.contextmanager
+def preserve_module_training_states(*models: torch.nn.Module | None):
+    """Context manager to preserve and restore submodule training states across operations or exceptions.
+
+    Args:
+        *models: One or more PyTorch modules to snapshot and restore.
+    """
+    snapshots = [capture_module_training_states(m) for m in models]
+    try:
+        yield
+    finally:
+        for snap in snapshots:
+            restore_module_training_states(snap)

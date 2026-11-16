@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
-import numpy as np
 import torch
 import torch.distributed as dist
 

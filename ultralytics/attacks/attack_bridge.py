@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ultralytics.attacks.attack_utils import (
+    capture_module_training_states,
+    restore_module_training_states,
+)
+
 try:
     from art.estimators.classification import PyTorchClassifier
 except (ImportError, AttributeError):
@@ -394,130 +399,135 @@ def run_attack_on_batch(
     images and detection targets. Existing detector/classifier attacks keep the
     original image-only return path unchanged.
     """
-    imgs = batch["img"]
-    bs = imgs.shape[0]
+    target_model = getattr(attacker, "model", None)
+    saved_states = capture_module_training_states(target_model)
+    try:
+        imgs = batch["img"]
+        bs = imgs.shape[0]
 
-    limit = max_batch_size if max_batch_size is not None else getattr(attacker, "max_batch_size", None)
-    if limit is not None and limit > 0 and bs > limit:
-        adv_imgs = imgs.clone()
-        is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(
-            getattr(attacker, "batch_aware", False)
-        )
-        target_keys = (
-            [
-                k
-                for k in [
-                    "batch_idx",
-                    "cls",
-                    "bboxes",
-                    "masks",
-                    "keypoints",
-                    "segments",
-                    "obb",
-                    "clean_batch_idx",
-                    "clean_cls",
-                    "clean_bboxes",
-                    "pre_attack_batch_idx",
-                    "pre_attack_cls",
-                    "pre_attack_bboxes",
+        limit = max_batch_size if max_batch_size is not None else getattr(attacker, "max_batch_size", None)
+        if limit is not None and limit > 0 and bs > limit:
+            adv_imgs = imgs.clone()
+            is_batch_aware = callable(getattr(attacker, "forward_batch", None)) and bool(
+                getattr(attacker, "batch_aware", False)
+            )
+            target_keys = (
+                [
+                    k
+                    for k in [
+                        "batch_idx",
+                        "cls",
+                        "bboxes",
+                        "masks",
+                        "keypoints",
+                        "segments",
+                        "obb",
+                        "clean_batch_idx",
+                        "clean_cls",
+                        "clean_bboxes",
+                        "pre_attack_batch_idx",
+                        "pre_attack_cls",
+                        "pre_attack_bboxes",
+                    ]
+                    if k in batch and batch[k] is not None
                 ]
-                if k in batch and batch[k] is not None
-            ]
-            if is_batch_aware
-            else []
-        )
-        collected_targets = {k: [] for k in target_keys}
-        collected_gt_matrices = []
-        collected_gt_params = []
+                if is_batch_aware
+                else []
+            )
+            collected_targets = {k: [] for k in target_keys}
+            collected_gt_matrices = []
+            collected_gt_params = []
 
-        for start_idx in range(0, bs, limit):
-            end_idx = min(start_idx + limit, bs)
-            indices = list(range(start_idx, end_idx))
-            sub_batch = slice_batch_indices(batch, indices)
-            im_files = sub_batch.get("im_file", [])
-            if hasattr(attacker, "proxy_model"):
-                attacker.proxy_model.current_paths = im_files
-            if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                attacker.estimator.model.current_paths = im_files
-            adv_sub = run_attack_on_batch(attacker, sub_batch, label_policy=label_policy, max_batch_size=None)
-            if adv_sub is not None:
-                adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
+            for start_idx in range(0, bs, limit):
+                end_idx = min(start_idx + limit, bs)
+                indices = list(range(start_idx, end_idx))
+                sub_batch = slice_batch_indices(batch, indices)
+                im_files = sub_batch.get("im_file", [])
+                if hasattr(attacker, "proxy_model"):
+                    attacker.proxy_model.current_paths = im_files
+                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                    attacker.estimator.model.current_paths = im_files
+                adv_sub = run_attack_on_batch(attacker, sub_batch, label_policy=label_policy, max_batch_size=None)
+                if adv_sub is not None:
+                    adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
 
-            if "gt_matrix" in sub_batch and sub_batch["gt_matrix"] is not None:
-                collected_gt_matrices.append(sub_batch["gt_matrix"])
-            elif hasattr(attacker, "last_selected_matrices") and attacker.last_selected_matrices is not None:
-                collected_gt_matrices.append(attacker.last_selected_matrices)
-            if "gt_params" in sub_batch and sub_batch["gt_params"] is not None:
-                collected_gt_params.append(sub_batch["gt_params"])
-            elif hasattr(attacker, "last_selected_params") and attacker.last_selected_params is not None:
-                collected_gt_params.append(attacker.last_selected_params)
+                if "gt_matrix" in sub_batch and sub_batch["gt_matrix"] is not None:
+                    collected_gt_matrices.append(sub_batch["gt_matrix"])
+                elif hasattr(attacker, "last_selected_matrices") and attacker.last_selected_matrices is not None:
+                    collected_gt_matrices.append(attacker.last_selected_matrices)
+                if "gt_params" in sub_batch and sub_batch["gt_params"] is not None:
+                    collected_gt_params.append(sub_batch["gt_params"])
+                elif hasattr(attacker, "last_selected_params") and attacker.last_selected_params is not None:
+                    collected_gt_params.append(attacker.last_selected_params)
+
+                if is_batch_aware:
+                    for bi_k in ["batch_idx", "clean_batch_idx", "pre_attack_batch_idx"]:
+                        if bi_k in target_keys and bi_k in sub_batch and sub_batch[bi_k] is not None:
+                            sub_bi = sub_batch[bi_k]
+                            if sub_bi.numel() > 0:
+                                collected_targets[bi_k].append(sub_bi + start_idx)
+                    for k in target_keys:
+                        if (
+                            k not in {"batch_idx", "clean_batch_idx", "pre_attack_batch_idx"}
+                            and k in sub_batch
+                            and sub_batch[k] is not None
+                        ):
+                            collected_targets[k].append(sub_batch[k])
+
+                del sub_batch, adv_sub
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if is_batch_aware:
-                for bi_k in ["batch_idx", "clean_batch_idx", "pre_attack_batch_idx"]:
-                    if bi_k in target_keys and bi_k in sub_batch and sub_batch[bi_k] is not None:
-                        sub_bi = sub_batch[bi_k]
-                        if sub_bi.numel() > 0:
-                            collected_targets[bi_k].append(sub_bi + start_idx)
                 for k in target_keys:
-                    if (
-                        k not in {"batch_idx", "clean_batch_idx", "pre_attack_batch_idx"}
-                        and k in sub_batch
-                        and sub_batch[k] is not None
-                    ):
-                        collected_targets[k].append(sub_batch[k])
+                    if collected_targets[k]:
+                        batch[k] = torch.cat(collected_targets[k], dim=0)
+                    else:
+                        batch[k] = batch[k][:0]
+                if collected_gt_matrices:
+                    all_matrices = torch.cat(collected_gt_matrices, dim=0)
+                    batch["gt_matrix"] = all_matrices
+                    if hasattr(attacker, "last_selected_matrices"):
+                        attacker.last_selected_matrices = all_matrices
+                if collected_gt_params:
+                    all_params = torch.cat(collected_gt_params, dim=0)
+                    batch["gt_params"] = all_params
+                    if hasattr(attacker, "last_selected_params"):
+                        attacker.last_selected_params = all_params
 
-            del sub_batch, adv_sub
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            return adv_imgs
 
-        if is_batch_aware:
-            for k in target_keys:
-                if collected_targets[k]:
-                    batch[k] = torch.cat(collected_targets[k], dim=0)
-                else:
-                    batch[k] = batch[k][:0]
-            if collected_gt_matrices:
-                all_matrices = torch.cat(collected_gt_matrices, dim=0)
-                batch["gt_matrix"] = all_matrices
-                if hasattr(attacker, "last_selected_matrices"):
-                    attacker.last_selected_matrices = all_matrices
-            if collected_gt_params:
-                all_params = torch.cat(collected_gt_params, dim=0)
-                batch["gt_params"] = all_params
-                if hasattr(attacker, "last_selected_params"):
-                    attacker.last_selected_params = all_params
+        # Spatial attacks such as Worst-of-k must transform GT boxes together with
+        # the image. forward_batch() updates batch_idx/cls/bboxes in-place and still
+        # returns an image tensor, preserving the existing caller contract.
+        forward_batch = getattr(attacker, "forward_batch", None)
+        if callable(forward_batch) and bool(getattr(attacker, "batch_aware", False)):
+            adv = forward_batch(batch)
+            return adv.to(imgs.dtype)
 
-        return adv_imgs
+        mode = infer_attack_mode(attacker)
 
-    # Spatial attacks such as Worst-of-k must transform GT boxes together with
-    # the image. forward_batch() updates batch_idx/cls/bboxes in-place and still
-    # returns an image tensor, preserving the existing caller contract.
-    forward_batch = getattr(attacker, "forward_batch", None)
-    if callable(forward_batch) and bool(getattr(attacker, "batch_aware", False)):
-        adv = forward_batch(batch)
-        return adv.to(imgs.dtype)
+        if mode == "detector":
+            targets = build_detector_targets(batch)
+            if targets is None or targets.numel() == 0:
+                return None
+            adv = attacker.forward(imgs.float(), targets)
+            del targets
+            res_adv = adv.to(imgs.dtype)
+            del adv
+            return res_adv
 
-    mode = infer_attack_mode(attacker)
-
-    if mode == "detector":
-        targets = build_detector_targets(batch)
-        if targets is None or targets.numel() == 0:
+        labels, attacked_idx = build_single_labels_from_batch(batch, policy=label_policy)
+        if labels is None or attacked_idx is None or attacked_idx.numel() == 0:
             return None
-        adv = attacker.forward(imgs.float(), targets)
-        del targets
-        res_adv = adv.to(imgs.dtype)
-        del adv
-        return res_adv
 
-    labels, attacked_idx = build_single_labels_from_batch(batch, policy=label_policy)
-    if labels is None or attacked_idx is None or attacked_idx.numel() == 0:
-        return None
-
-    adv_imgs = imgs.clone()
-    adv_subset = attacker.forward(imgs[attacked_idx].float(), labels)
-    adv_imgs[attacked_idx] = adv_subset.to(imgs.dtype)
-    del adv_subset, labels, attacked_idx
-    return adv_imgs
+        adv_imgs = imgs.clone()
+        adv_subset = attacker.forward(imgs[attacked_idx].float(), labels)
+        adv_imgs[attacked_idx] = adv_subset.to(imgs.dtype)
+        del adv_subset, labels, attacked_idx
+        return adv_imgs
+    finally:
+        restore_module_training_states(saved_states)
 
 
 def build_attacker(name: str, model: nn.Module, **kwargs):
@@ -526,51 +536,55 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
 
     Using one factory avoids training and validation silently using different attacks.
     """
-    normalized = name.lower().strip()
+    saved_states = capture_module_training_states(model)
+    try:
+        normalized = name.lower().strip()
 
-    if normalized in {"fgsm"}:
-        from ultralytics.attacks.art_fgsm import ARTFGSM
+        if normalized in {"fgsm"}:
+            from ultralytics.attacks.art_fgsm import ARTFGSM
 
-        return ARTFGSM(model=model, **kwargs)
-    if normalized in {"pgd"}:
-        from ultralytics.attacks.art_pgd import ARTPGD
+            return ARTFGSM(model=model, **kwargs)
+        if normalized in {"pgd"}:
+            from ultralytics.attacks.art_pgd import ARTPGD
 
-        return ARTPGD(model=model, **kwargs)
-    if normalized in {"dpatch"}:
-        from ultralytics.attacks.art_dpatch import ARTDPatch
+            return ARTPGD(model=model, **kwargs)
+        if normalized in {"dpatch"}:
+            from ultralytics.attacks.art_dpatch import ARTDPatch
 
-        return ARTDPatch(model=model, **kwargs)
-    if normalized in {"mim"}:
-        from ultralytics.attacks.art_mim import ARTMIM
+            return ARTDPatch(model=model, **kwargs)
+        if normalized in {"mim"}:
+            from ultralytics.attacks.art_mim import ARTMIM
 
-        return ARTMIM(model=model, **kwargs)
-    if normalized in {"cw"}:
-        from ultralytics.attacks.art_cw import ARTCW
+            return ARTMIM(model=model, **kwargs)
+        if normalized in {"cw"}:
+            from ultralytics.attacks.art_cw import ARTCW
 
-        return ARTCW(model=model, **kwargs)
-    if normalized in {"bim"}:
-        from ultralytics.attacks.art_bim import ARTBIM
+            return ARTCW(model=model, **kwargs)
+        if normalized in {"bim"}:
+            from ultralytics.attacks.art_bim import ARTBIM
 
-        return ARTBIM(model=model, **kwargs)
-    if normalized in {"deepfool"}:
-        from ultralytics.attacks.art_deepfool import ARTDeepFool
+            return ARTBIM(model=model, **kwargs)
+        if normalized in {"deepfool"}:
+            from ultralytics.attacks.art_deepfool import ARTDeepFool
 
-        return ARTDeepFool(model=model, **kwargs)
-    if normalized in {"jsma"}:
-        from ultralytics.attacks.art_jsma import ARTJSMA
+            return ARTDeepFool(model=model, **kwargs)
+        if normalized in {"jsma"}:
+            from ultralytics.attacks.art_jsma import ARTJSMA
 
-        return ARTJSMA(model=model, **kwargs)
-    if normalized in {"uap"}:
-        from ultralytics.attacks.art_uap import ARTUAP
+            return ARTJSMA(model=model, **kwargs)
+        if normalized in {"uap"}:
+            from ultralytics.attacks.art_uap import ARTUAP
 
-        return ARTUAP(model=model, **kwargs)
-    if normalized in {"autoattack"}:
-        from ultralytics.attacks.art_autoattack import ARTAutoAttack
+            return ARTUAP(model=model, **kwargs)
+        if normalized in {"autoattack"}:
+            from ultralytics.attacks.art_autoattack import ARTAutoAttack
 
-        return ARTAutoAttack(model=model, **kwargs)
-    if normalized in {"worstk"}:
-        from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
+            return ARTAutoAttack(model=model, **kwargs)
+        if normalized in {"worstk"}:
+            from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 
-        return SpatialWorstOfK(model=model, **kwargs)
+            return SpatialWorstOfK(model=model, **kwargs)
 
-    raise ValueError(f"Unsupported attack name: {name}")
+        raise ValueError(f"Unsupported attack name: {name}")
+    finally:
+        restore_module_training_states(saved_states)
