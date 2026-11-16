@@ -48,7 +48,8 @@ CACHE="${CACHE:-ram}"
 AMP="${AMP:-bf16}"
 PROJECT="${PROJECT:-runs/train_fgd_stn_joint}"
 RESUME="${RESUME:-}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 
 # Generate unique experiment name
 MODEL_TAG="${MODEL##*/}"
@@ -166,11 +167,14 @@ TRAIN_ARGS=(
   --workers "$WORKERS"
   --cache "$CACHE"
   --amp "$AMP"
-  --seed "$SEED"
   --val_interval "$VAL_INTERVAL"
   --project "$PROJECT"
   --name "$NAME"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  ARGS+=(--seed "$SEED")
+fi
 
 if [[ "$INIT" == "pretrained" ]]; then
   TRAIN_ARGS+=(--fgd_weights "$FGD_WEIGHTS" --stn_weights "$STN_WEIGHTS")

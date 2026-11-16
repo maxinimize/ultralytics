@@ -20,7 +20,7 @@ from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import select_device
 
 
-def parse_args():
+def parse_args(args=None):
     """Parse STN validation CLI options."""
     parser = argparse.ArgumentParser(description="Evaluate STN Defense under Worst-of-k Attacks")
     parser.add_argument("--weights", default="yolo12l.pt", help="YOLO detector weights")
@@ -39,7 +39,9 @@ def parse_args():
     )
     parser.add_argument("--worstk_k", type=int, default=10, help="Worst-of-k candidate count (default: 10)")
     parser.add_argument("--degrees", type=float, default=30.0, help="Worst-of-k max rotation degrees (default: 30.0)")
-    parser.add_argument("--translate", type=float, default=0.10, help="Worst-of-k max translation ratio (default: 0.10)")
+    parser.add_argument(
+        "--translate", type=float, default=0.10, help="Worst-of-k max translation ratio (default: 0.10)"
+    )
     parser.add_argument(
         "--attack_weights",
         default=None,
@@ -50,10 +52,15 @@ def parse_args():
     parser.add_argument("--device", default="0", help="CUDA device (e.g. 0) or 'cpu'")
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers")
     parser.add_argument("--classes", nargs="+", type=int, default=None, help="Filter dataset by class indices")
-    parser.add_argument("--seed", type=int, default=0, help="Reproducibility seed for attack candidate generation")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Reproducibility seed for attack candidate generation (default: inherited from cfg/default.yaml)",
+    )
     parser.add_argument("--project", default="runs/val_stn", help="Output project directory")
     parser.add_argument("--name", default="exp", help="Experiment name")
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def main():
@@ -85,13 +92,14 @@ def main():
         attack_model = guidance_model
 
     # 4. Instantiate Worst-of-k attacker
+    effective_seed = int(DEFAULT_CFG.seed) if args.seed is None else int(args.seed)
     attacker = SpatialWorstOfKWithMetadata(
         model=attack_model,
         k=args.worstk_k,
         degrees=args.degrees,
         translate=args.translate,
         img_size=args.imgsz,
-        seed=args.seed,
+        seed=effective_seed,
     )
 
     # 5. Build validation dataloader
@@ -129,7 +137,7 @@ def main():
     validator.attacker = attacker
 
     LOGGER.info(f"Starting STN validation across modes: {args.modes}")
-    results = validator(modes=args.modes, seed=args.seed)
+    results = validator(modes=args.modes, seed=effective_seed)
 
     LOGGER.info("=" * 60)
     LOGGER.info("STN Defense Validation Summary:")

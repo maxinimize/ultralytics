@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import random
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ultralytics.nn.tasks import DetectionModel
@@ -220,3 +222,99 @@ def preserve_module_training_states(*models: torch.nn.Module | None):
     finally:
         for snap in snapshots:
             restore_module_training_states(snap)
+
+
+@contextlib.contextmanager
+def isolate_rng(
+    seed: int | None = None,
+    *,
+    attackers: Any = None,
+    dataloader: Any = None,
+):
+    """Context manager to isolate RNG states during validation, evaluation, or attacks.
+
+    Captures:
+      - Python random state
+      - NumPy random state
+      - PyTorch CPU RNG state
+      - PyTorch CUDA RNG states (all devices) if CUDA is available
+      - Private generator state of attackers (e.g. SpatialWorstOfK)
+      - DataLoader generator state (if present)
+
+    Sets `seed` if provided (for Python, NumPy, PyTorch CPU, PyTorch CUDA, and attackers via reset_seed).
+    Guarantees restoration of all captured states in `finally`.
+    """
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    # Capture attacker states
+    atk_list = []
+    if attackers is not None:
+        if isinstance(attackers, dict):
+            atk_list = list(attackers.values())
+        elif isinstance(attackers, (list, tuple, set)):
+            atk_list = list(attackers)
+        else:
+            atk_list = [attackers]
+    saved_atk_states = []
+    for atk in atk_list:
+        if hasattr(atk, "state_dict"):
+            state = None
+            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                state = atk.state_dict()
+            saved_atk_states.append((atk, state))
+        elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
+            saved_atk_states.append((atk, {"generator_state": atk._generator.get_state().clone()}))
+        else:
+            saved_atk_states.append((atk, None))
+
+    # Capture DataLoader generator state
+    saved_dl_gen_state = None
+    if dataloader is not None and hasattr(dataloader, "generator") and dataloader.generator is not None:
+        with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+            saved_dl_gen_state = dataloader.generator.get_state().clone()
+
+    # Apply isolated seed if specified
+    if seed is not None:
+        int_seed = int(seed)
+        random.seed(int_seed)
+        np.random.seed(int_seed)
+        torch.manual_seed(int_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int_seed)
+        for atk, _ in saved_atk_states:
+            if hasattr(atk, "reset_seed"):
+                atk.reset_seed(int_seed)
+            elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
+                atk._generator.manual_seed(int_seed)
+
+    try:
+        yield
+    finally:
+        # Restore all states unconditionally
+        for atk, state in saved_atk_states:
+            if state is not None:
+                if hasattr(atk, "load_state_dict"):
+                    with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                        atk.load_state_dict(state)
+                elif hasattr(atk, "_generator") and "generator_state" in state:
+                    with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                        atk._generator.set_state(state["generator_state"])
+
+        if (
+            saved_dl_gen_state is not None
+            and dataloader is not None
+            and getattr(dataloader, "generator", None) is not None
+        ):
+            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                dataloader.generator.set_state(saved_dl_gen_state)
+
+        if cuda_states is not None and torch.cuda.is_available():
+            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+                torch.cuda.set_rng_state_all(cuda_states)
+
+        torch.set_rng_state(torch_cpu_state)
+        np.random.set_state(np_state)
+        random.setstate(py_state)

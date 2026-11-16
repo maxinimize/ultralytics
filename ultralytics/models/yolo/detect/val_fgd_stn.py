@@ -277,11 +277,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
             Dict[str, float]: Metric dictionary including mAP50 and mAP50-95.
         """
         stats = {
-            k: (
-                torch.cat(v, 0).cpu().numpy()
-                if len(v)
-                else (np.zeros((0, self.niou)) if k == "tp" else np.zeros(0))
-            )
+            k: (torch.cat(v, 0).cpu().numpy() if len(v) else (np.zeros((0, self.niou)) if k == "tp" else np.zeros(0)))
             for k, v in self.mode_stats[mode].items()
         }
 
@@ -352,7 +348,9 @@ class UnifiedFGDSTNValidator(BaseValidator):
 
         if attack == "worstk" and "worstk" in self.attackers:
             wk_att = self.attackers["worstk"]
-            if hasattr(wk_att, "_generator"):
+            if hasattr(wk_att, "reset_seed"):
+                wk_att.reset_seed(int(seed))
+            elif hasattr(wk_att, "_generator"):
                 wk_att._generator.manual_seed(int(seed))
 
         self._reset_mode_stats(modes)
@@ -389,9 +387,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
 
                     # Unwarp bounding boxes if STN rectification was applied
                     if pred_matrix is not None:
-                        preds = self.pipeline.unwarp_predictions(
-                            preds, pred_matrix, height=h, width=w, clip=True
-                        )
+                        preds = self.pipeline.unwarp_predictions(preds, pred_matrix, height=h, width=w, clip=True)
 
                         # Record STN geometry diagnostics if Worst-of-K ground-truth matrix is present
                         if gt_matrix is not None:
@@ -479,7 +475,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
 
         raw_results: Dict[str, Dict[str, Dict[str, float]]] = {}
         for attack in sel_attacks:
-            LOGGER.info(f"\n{'='*70}\nRunning Attack Suite: {attack.upper()}\n{'='*70}")
+            LOGGER.info(f"\n{'=' * 70}\nRunning Attack Suite: {attack.upper()}\n{'=' * 70}")
             att_res = self.run_eval_for_attack(attack, sel_modes, seed=seed)
             raw_results[attack] = att_res
 

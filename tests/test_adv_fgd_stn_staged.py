@@ -2460,6 +2460,277 @@ class TestStagedPipeline(unittest.TestCase):
         # Invariants check after training step
         trainer.check_frozen_invariants("post_train_step")
 
+    def test_req12_seed_source_inheritance_and_legal_zero(self):
+        """Verify Item 12: Entrypoints inherit from default config without override, preserve legal 0, and don't force 42."""
+
+        # 1. Staged runner: default is None (not hardcoded 42 or 0)
+        from train_adv_fgd_stn_staged_run import parse_args as parse_staged_args
+
+        args_empty = parse_staged_args([])
+        self.assertIsNone(args_empty.seed, "Staged runner should default --seed to None to allow config inheritance")
+
+        args_zero = parse_staged_args(["--seed", "0"])
+        self.assertEqual(args_zero.seed, 0, "Explicit --seed 0 must be preserved as 0")
+
+        args_17 = parse_staged_args(["--seed", "17"])
+        self.assertEqual(args_17.seed, 17)
+
+        # 2. Joint runner: default is None
+        from train_fgd_stn_joint_run import parse_args as parse_joint_args
+
+        args_joint_empty = parse_joint_args([])
+        self.assertIsNone(args_joint_empty.seed)
+        args_joint_zero = parse_joint_args(["--seed", "0"])
+        self.assertEqual(args_joint_zero.seed, 0)
+
+        # 3. STN runner: default is suppressed
+        from train_stn_run import build_parser as build_stn_parser
+
+        parser_stn = build_stn_parser()
+        parsed = vars(parser_stn.parse_args([]))
+        self.assertNotIn("seed", parsed)
+        parsed_zero = vars(parser_stn.parse_args(["--seed", "0"]))
+        self.assertEqual(parsed_zero.get("seed"), 0)
+
+        # 4. FGD runner: default is suppressed
+        from train_fgd_run import build_parser as build_fgd_parser
+
+        parser_fgd = build_fgd_parser()
+        parsed_f = vars(parser_fgd.parse_args([]))
+        self.assertNotIn("seed", parsed_f)
+        parsed_f_zero = vars(parser_fgd.parse_args(["--seed", "0"]))
+        self.assertEqual(parsed_f_zero.get("seed"), 0)
+
+        # 5. Validation runners: preserve legal 0 and fall back to DEFAULT_CFG.seed
+        from val_fgd_stn_run import parse_args as parse_val_fgd_args
+
+        val_args_empty = parse_val_fgd_args(["--data", "coco8.yaml"])
+        self.assertIsNone(val_args_empty.seed)
+        val_args_zero = parse_val_fgd_args(["--data", "coco8.yaml", "--seed", "0"])
+        self.assertEqual(val_args_zero.seed, 0)
+
+        from val_stn_run import parse_args as parse_val_stn_args
+
+        val_stn_args_empty = parse_val_stn_args(["--data", "coco8.yaml"])
+        self.assertIsNone(val_stn_args_empty.seed)
+        val_stn_args_zero = parse_val_stn_args(["--data", "coco8.yaml", "--seed", "0"])
+        self.assertEqual(val_stn_args_zero.seed, 0)
+
+    def test_req12_adaptive_virtual_samples_determinism_and_epoch_grouping(self):
+        """Verify Item 12: Adaptive virtual samples have reproducible grouping for (seed, epoch), re-randomize across epochs, and preserve ratios."""
+        from ultralytics.models.yolo.detect.train_adv_adaptive import YOLODatasetAdvAdaptive
+
+        # Create dummy mock dataset container
+        dataset = YOLODatasetAdvAdaptive.__new__(YOLODatasetAdvAdaptive)
+        dataset.im_files = [f"img_{i}.jpg" for i in range(100)]
+        dataset.attack_names = ["pgd", "bim", "worstk"]
+        dataset.p_clean = 0.25
+        dataset.attack_ratios = [0.25, 0.25, 0.25]
+        dataset.cfg = type("Cfg", (), {"seed": 0})()
+
+        # Run allocation for seed 0, epoch 0
+        dataset.update_virtual_samples(seed=0 + 0)
+        samples_s0_e0 = list(dataset.virtual_samples)
+
+        # Run again with same seed 0, epoch 0 -> must be identical
+        dataset.update_virtual_samples(seed=0 + 0)
+        self.assertEqual(samples_s0_e0, list(dataset.virtual_samples))
+
+        # Run with seed 0, epoch 1 -> must differ from epoch 0
+        dataset.update_virtual_samples(seed=0 + 1)
+        samples_s0_e1 = list(dataset.virtual_samples)
+        self.assertNotEqual(samples_s0_e0, samples_s0_e1)
+
+        # Run with seed 42, epoch 0 -> must differ from seed 0, epoch 0 (legal 0 is not 42)
+        dataset.update_virtual_samples(seed=42 + 0)
+        samples_s42_e0 = list(dataset.virtual_samples)
+        self.assertNotEqual(samples_s0_e0, samples_s42_e0)
+
+        # Check whole-epoch guarantee: each image index appears exactly once
+        for samples in [samples_s0_e0, samples_s0_e1, samples_s42_e0]:
+            indices = [idx for idx, _ in samples]
+            self.assertEqual(len(indices), 100)
+            self.assertEqual(len(set(indices)), 100)
+            # Check categories follow ratios: each category gets ~25 samples
+            counts = {}
+            for _, cat in samples:
+                counts[cat] = counts.get(cat, 0) + 1
+            for cat in ["raw", "pgd", "bim", "worstk"]:
+                self.assertEqual(counts.get(cat, 0), 25)
+
+    def test_req12_worstk_seed_binding_and_state_dict(self):
+        """Verify Item 12: SpatialWorstOfK binds seed, produces deterministic candidates, and state_dict resumes generator sequence."""
+        model = MockYOLOModel(ch=16)
+
+        # 1. build_attacker passes seed to WorstK, and strips seed for other attacks without error
+        worstk_att = build_attacker("worstk", model, img_size=64, k=5, seed=123)
+        self.assertEqual(worstk_att.seed, 123)
+
+        # Calling build_attacker with seed on PGD must not raise unexpected keyword argument
+        pgd_att = build_attacker("pgd", model, img_size=64, epoch=1, seed=123)
+        self.assertIsNotNone(pgd_att)
+
+        # 2. Candidate reproducibility with explicit seed
+        device = next(model.parameters()).device
+        dummy_batch = {
+            "img": torch.rand(2, 3, 64, 64, device=device),
+            "batch_idx": torch.tensor([0, 1], device=device),
+            "cls": torch.tensor([[0.0], [1.0]], device=device),
+            "bboxes": torch.tensor([[0.1, 0.1, 0.3, 0.3], [0.2, 0.2, 0.4, 0.4]], device=device),
+        }
+
+        atk_a = build_attacker("worstk", model, img_size=64, k=4, seed=0)
+        run_attack_on_batch(atk_a, dummy_batch)
+        params_a = atk_a.last_params.clone()
+
+        atk_b = build_attacker("worstk", model, img_size=64, k=4, seed=0)
+        run_attack_on_batch(atk_b, dummy_batch)
+        params_b = atk_b.last_params.clone()
+        self.assertTrue(
+            torch.allclose(params_a, params_b), "WorstK with same seed 0 must generate identical candidates"
+        )
+
+        # WorstK with seed 42 must differ from seed 0
+        atk_c = build_attacker("worstk", model, img_size=64, k=4, seed=42)
+        run_attack_on_batch(atk_c, dummy_batch)
+        params_c = atk_c.last_params.clone()
+        self.assertFalse(torch.allclose(params_a, params_c), "WorstK with seed 0 must differ from seed 42")
+
+        # 3. state_dict and load_state_dict reproducibility
+        atk_stream = build_attacker("worstk", model, img_size=64, k=4, seed=777)
+        run_attack_on_batch(atk_stream, dummy_batch)  # batch 1
+        saved_state = atk_stream.state_dict()
+
+        run_attack_on_batch(atk_stream, dummy_batch)  # batch 2
+        params_batch2 = atk_stream.last_params.clone()
+
+        # Restore saved state and rerun batch 2
+        atk_stream.load_state_dict(saved_state)
+        run_attack_on_batch(atk_stream, dummy_batch)
+        params_batch2_restored = atk_stream.last_params.clone()
+        self.assertTrue(
+            torch.allclose(params_batch2, params_batch2_restored),
+            "Restoring WorstK state_dict must yield exact continuation sequence",
+        )
+
+        # 4. reset_seed
+        atk_stream.reset_seed(777)
+        run_attack_on_batch(atk_stream, dummy_batch)
+        params_batch1_reset = atk_stream.last_params.clone()
+        # Since atk_stream started at 777, resetting to 777 yields the exact batch 1 candidates
+        atk_fresh = build_attacker("worstk", model, img_size=64, k=4, seed=777)
+        run_attack_on_batch(atk_fresh, dummy_batch)
+        self.assertTrue(torch.allclose(params_batch1_reset, atk_fresh.last_params))
+
+    def test_req12_validation_rng_isolation_and_epoch0_invariance(self):
+        """Verify Item 12: Validation inside isolate_rng does not consume subsequent training RNG sequence, and eval_epoch0 is invariant."""
+        import random
+
+        import numpy as np
+
+        from ultralytics.attacks.attack_utils import isolate_rng
+
+        model = MockYOLOModel(ch=16)
+        device = next(model.parameters()).device
+        dummy_batch = {
+            "img": torch.rand(2, 3, 64, 64, device=device),
+            "batch_idx": torch.tensor([0, 1], device=device),
+            "cls": torch.tensor([[0.0], [1.0]], device=device),
+            "bboxes": torch.tensor([[0.1, 0.1, 0.3, 0.3], [0.2, 0.2, 0.4, 0.4]], device=device),
+        }
+
+        # Sequence Control: consecutive steps without validation
+        random.seed(100)
+        np.random.seed(100)
+        torch.manual_seed(100)
+        ctrl_atk = build_attacker("worstk", model, img_size=64, k=4, seed=50)
+
+        run_attack_on_batch(ctrl_atk, dummy_batch)  # train step 1
+        ctrl_py_1 = random.random()
+        ctrl_np_1 = np.random.rand()
+        ctrl_th_1 = torch.rand(3)
+
+        run_attack_on_batch(ctrl_atk, dummy_batch)  # train step 2
+        ctrl_params_step2 = ctrl_atk.last_params.clone()
+        ctrl_py_2 = random.random()
+        ctrl_np_2 = np.random.rand()
+        ctrl_th_2 = torch.rand(3)
+
+        # Sequence Test: insert validation between step 1 and step 2
+        random.seed(100)
+        np.random.seed(100)
+        torch.manual_seed(100)
+        test_atk = build_attacker("worstk", model, img_size=64, k=4, seed=50)
+
+        run_attack_on_batch(test_atk, dummy_batch)  # train step 1
+        self.assertEqual(ctrl_py_1, random.random())
+        self.assertEqual(ctrl_np_1, np.random.rand())
+        self.assertTrue(torch.allclose(ctrl_th_1, torch.rand(3)))
+
+        # Insert validation with heavy RNG consumption inside isolate_rng
+        with isolate_rng(seed=999, attackers=test_atk):
+            # Advance python, numpy, torch, and attacker
+            _ = [random.random() for _ in range(50)]
+            _ = np.random.rand(50)
+            _ = torch.rand(50, 50)
+            run_attack_on_batch(test_atk, dummy_batch)
+
+        # Train step 2 after validation: must be identical to control step 2!
+        run_attack_on_batch(test_atk, dummy_batch)
+        self.assertTrue(
+            torch.allclose(ctrl_params_step2, test_atk.last_params),
+            "Training attacker parameters after validation must match control (not advanced by validation)",
+        )
+        self.assertEqual(ctrl_py_2, random.random())
+        self.assertEqual(ctrl_np_2, np.random.rand())
+        self.assertTrue(torch.allclose(ctrl_th_2, torch.rand(3)))
+
+        # Test exception safety: isolate_rng restores states even on exception
+        pre_py_state = random.getstate()
+        pre_torch_state = torch.get_rng_state()
+        try:
+            with isolate_rng(seed=555, attackers=test_atk):
+                _ = torch.rand(100)
+                _ = random.random()
+                raise RuntimeError("simulated validation failure")
+        except RuntimeError:
+            pass
+
+        # Python and Torch RNG states must be exactly restored even on exception
+        self.assertEqual(random.getstate(), pre_py_state)
+        self.assertTrue(torch.equal(torch.get_rng_state(), pre_torch_state))
+
+    def test_req12_resume_seed_conflict_policy(self):
+        """Verify Item 12: Resuming rejects conflicting explicit seed with ValueError, and preserves saved seed when omitted."""
+        from ultralytics.engine.trainer import BaseTrainer
+
+        # Create dummy trainer subclass to test check_resume
+        trainer = BaseTrainer.__new__(BaseTrainer)
+        trainer.args = type("Args", (), {"resume": str(self.temp_dir / "last.pt"), "data": None, "seed": 42})()
+
+        # Mock load_checkpoint returning ckpt_args with seed=42
+        ckpt_mock = type("Ckpt", (), {"args": {"seed": 42, "model": "yolo.pt", "data": "coco.yaml"}})()
+        import ultralytics.engine.trainer as trainer_mod
+
+        orig_load = trainer_mod.load_checkpoint
+        try:
+            trainer_mod.load_checkpoint = lambda p: (ckpt_mock, None)
+
+            # 1. Resuming without seed override: succeeds, retains 42
+            trainer.check_resume(overrides={"resume": str(self.temp_dir / "last.pt")})
+            self.assertEqual(trainer.args.seed, 42)
+
+            # 2. Resuming with matching seed 42: succeeds
+            trainer.check_resume(overrides={"resume": str(self.temp_dir / "last.pt"), "seed": 42})
+            self.assertEqual(trainer.args.seed, 42)
+
+            # 3. Resuming with conflicting seed 99: raises ValueError
+            with self.assertRaises(ValueError) as cm:
+                trainer.check_resume(overrides={"resume": str(self.temp_dir / "last.pt"), "seed": 99})
+            self.assertIn("Cannot change seed from 42 to 99", str(cm.exception))
+        finally:
+            trainer_mod.load_checkpoint = orig_load
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -322,7 +322,9 @@ class YOLODatasetAdvAdaptive(YOLODataset):
             **kwargs,
         )
 
-        self.update_virtual_samples()
+        seed_val = getattr(self.cfg, "seed", None)
+        init_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+        self.update_virtual_samples(seed=init_seed)
         self.transforms_raw = self.build_transforms(self.cfg)
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
@@ -383,7 +385,12 @@ class YOLODatasetAdvAdaptive(YOLODataset):
         if splits:
             splits[-1] = n_raw
 
-        rng = random.Random(seed) if seed is not None else random
+        if seed is not None:
+            rng = random.Random(int(seed))
+        else:
+            seed_val = getattr(self.cfg, "seed", None)
+            init_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+            rng = random.Random(init_seed)
         all_indices = list(range(n_raw))
         rng.shuffle(all_indices)
 
@@ -406,7 +413,9 @@ class YOLODatasetAdvAdaptive(YOLODataset):
 
     def build_virtual_samples(self):
         """Backward-compatible alias for update_virtual_samples."""
-        self.update_virtual_samples()
+        seed_val = getattr(self.cfg, "seed", None)
+        init_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+        self.update_virtual_samples(seed=init_seed)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         orig_idx, sample_type = self.virtual_samples[index]
@@ -674,6 +683,8 @@ class DetectionTrainer(BaseTrainer):
                     if att not in self.attackers or self.attackers[att] is None:
                         if self.strict_attacks:
                             raise RuntimeError(f"Attacker '{att}' failed to initialize.")
+
+            self._restore_resume_rng_and_attackers()
         except Exception as e:
             if getattr(self, "strict_attacks", True):
                 raise
@@ -685,9 +696,10 @@ class DetectionTrainer(BaseTrainer):
             self.attacker = None
             self.attackers = {}
 
-    def build_attacker(self, name, model, imgsz):
+    def build_attacker(self, name, model, imgsz, seed=None):
         """Build the online attack."""
-        return build_attacker(name, model=model, img_size=imgsz)
+        seed_val = getattr(self.args, "seed", None) if seed is None else seed
+        return build_attacker(name, model=model, img_size=imgsz, seed=seed_val)
 
     def preprocess_for_detector(self, images):
         return images
@@ -700,6 +712,10 @@ class DetectionTrainer(BaseTrainer):
 
     def setup_model(self):
         ckpt = super().setup_model()
+        if ckpt and "random_state" in ckpt:
+            self._resume_random_state = ckpt["random_state"]
+        if ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
+            self._resume_attacker_state = ckpt.get("attacker_state", ckpt.get("attackers_state"))
         if self.resume and ckpt and ckpt.get("model") is not None:
             live_model = ckpt["model"]
             try:
@@ -726,6 +742,10 @@ class DetectionTrainer(BaseTrainer):
                 f"Restored adaptive_state from checkpoint: current ratios = {self.adaptive_controller.current_train_ratios}, "
                 f"last_updated_epoch = {self.adaptive_controller.last_updated_epoch}"
             )
+        if ckpt and "random_state" in ckpt:
+            self._resume_random_state = ckpt["random_state"]
+        if ckpt and ("attacker_state" in ckpt or "attackers_state" in ckpt):
+            self._resume_attacker_state = ckpt.get("attacker_state", ckpt.get("attackers_state"))
         if self.resume and ckpt and ckpt.get("model") is not None:
             live_model = ckpt["model"]
             try:
@@ -736,6 +756,35 @@ class DetectionTrainer(BaseTrainer):
                 LOGGER.info("Verified/Restored live training model weights in _load_checkpoint_state.")
             except Exception as e:
                 LOGGER.warning(f"Failed to restore live model in _load_checkpoint_state: {e}")
+
+    def _restore_resume_rng_and_attackers(self):
+        """Restore training RNG states and attacker generator states on resume after attackers are built."""
+        if getattr(self, "_resume_attacker_state", None):
+            atk_st = self._resume_attacker_state
+            if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+                for att_name, st in atk_st.items():
+                    if att_name in self.attackers and hasattr(self.attackers[att_name], "load_state_dict"):
+                        self.attackers[att_name].load_state_dict(st)
+            if hasattr(self, "attacker") and self.attacker is not None and "attacker" in atk_st:
+                if hasattr(self.attacker, "load_state_dict"):
+                    self.attacker.load_state_dict(atk_st["attacker"])
+            self._resume_attacker_state = None
+
+        if getattr(self, "_resume_random_state", None):
+            rnd = self._resume_random_state
+            if "torch" in rnd and rnd["torch"] is not None:
+                torch.set_rng_state(rnd["torch"])
+            if torch.cuda.is_available() and rnd.get("cuda") is not None:
+                torch.cuda.set_rng_state_all(rnd["cuda"])
+            if "numpy" in rnd and rnd["numpy"] is not None:
+                np.random.set_state(rnd["numpy"])
+            if "python" in rnd and rnd["python"] is not None:
+                random.setstate(rnd["python"])
+            if "dataloader" in rnd and rnd["dataloader"] is not None:
+                if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None:
+                    self.train_loader.generator.set_state(rnd["dataloader"])
+            self._resume_random_state = None
+            LOGGER.info("Restored training random state and attacker states from checkpoint.")
 
     def save_model(self):
         """Save model training checkpoints with live model weights and adaptive_state preserved."""
@@ -763,6 +812,26 @@ class DetectionTrainer(BaseTrainer):
                 torch.nan_to_num_(v)
         strip_qat(live_model)
 
+        attacker_states = {}
+        if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+            for att_name, att_obj in self.attackers.items():
+                if hasattr(att_obj, "state_dict"):
+                    attacker_states[att_name] = att_obj.state_dict()
+        elif hasattr(self, "attacker") and self.attacker is not None and hasattr(self.attacker, "state_dict"):
+            attacker_states["attacker"] = self.attacker.state_dict()
+
+        random_state = {
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "dataloader": (
+                self.train_loader.generator.get_state().clone()
+                if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None
+                else None
+            ),
+        }
+
         buffer = io.BytesIO()
         torch.save(
             {
@@ -778,6 +847,8 @@ class DetectionTrainer(BaseTrainer):
                 "train_metrics": {**self.metrics, "fitness": self.fitness},
                 "train_results": self.read_results_csv(),
                 "adaptive_state": self.adaptive_controller.state_dict(),
+                "attacker_state": attacker_states,
+                "random_state": random_state,
                 "strict_attacks": getattr(self, "strict_attacks", True),
                 "date": datetime.now().astimezone().isoformat(),
                 "version": __version__,
@@ -951,10 +1022,15 @@ class DetectionTrainer(BaseTrainer):
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         self.run_callbacks("on_train_start")
+        seed_val = getattr(self.args, "seed", None)
+        base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+        seed_source = "checkpoint" if self.resume else ("cli/override" if seed_val is not None else "default_cfg")
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
+            f"Experimental Seed: {base_seed} (source: {seed_source}), "
+            f"Validation Seed: {base_seed}, Allocation Rule: epoch_seed = seed + epoch\n"
             f"Starting dynamic attack ratio adversarial training for {self.epochs} epochs..."
         )
         if self.args.close_mosaic:
@@ -973,7 +1049,8 @@ class DetectionTrainer(BaseTrainer):
 
             # Dynamic attack ratio allocation update per epoch
             # Re-randomize image assignment and apply current training ratios
-            base_seed = getattr(self.args, "seed", 0) or 42
+            seed_val = getattr(self.args, "seed", None)
+            base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
             needs_reset = False
             if epoch == self.start_epoch and self.resume:

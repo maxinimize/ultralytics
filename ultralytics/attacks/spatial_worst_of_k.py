@@ -134,11 +134,12 @@ class SpatialWorstOfK(Attacker):
 
         # Use an isolated CPU RNG so reproducibility does not depend on CUDA RNG
         # state or the training dataloader's generator.
+        self.seed = None if seed is None else int(seed)
         self._generator = torch.Generator(device="cpu")
-        if seed is None:
+        if self.seed is None:
             self._generator.seed()
         else:
-            self._generator.manual_seed(int(seed))
+            self._generator.manual_seed(self.seed)
 
         # Candidate scoring does not need gradients. The model is temporarily
         # switched to train mode inside _score_candidates only because YOLO's
@@ -155,6 +156,34 @@ class SpatialWorstOfK(Attacker):
         self.last_params: torch.Tensor | None = None  # [B, k, 3] -> angle, tx, ty
         self.last_selected_matrices: torch.Tensor | None = None  # [B, 3, 3]
         self.last_selected_params: torch.Tensor | None = None  # [B, 3]
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return lightweight state dict containing generator state and seed."""
+        return {
+            "generator_state": self._generator.get_state().clone(),
+            "seed": self.seed,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore generator state from state dict."""
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"state_dict must be a dict, got {type(state_dict)}")
+        if "generator_state" in state_dict:
+            gen_state = state_dict["generator_state"]
+            if isinstance(gen_state, torch.Tensor):
+                self._generator.set_state(gen_state.cpu())
+            elif isinstance(gen_state, (bytes, bytearray)):
+                self._generator.set_state(torch.tensor(list(gen_state), dtype=torch.uint8))
+        if "seed" in state_dict:
+            self.seed = state_dict["seed"]
+
+    def reset_seed(self, seed: int | None = None) -> None:
+        """Reset internal generator to a known seed (e.g. at the start of validation)."""
+        target_seed = self.seed if seed is None else seed
+        if target_seed is None:
+            self._generator.seed()
+        else:
+            self._generator.manual_seed(int(target_seed))
 
     # ------------------------------------------------------------------
     # Public attack entry points

@@ -35,7 +35,8 @@ IMGSZ="${IMGSZ:-640}"
 DEVICE="${DEVICE:-0}"
 WORKERS="${WORKERS:-4}"
 LR0="${LR0:-0.0001}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 MULTI_SCALE="${MULTI_SCALE:-0.0}"
 SAVE_PERIOD="${SAVE_PERIOD:--1}"
 PROJECT="${PROJECT:-$ROOT/runs}"
@@ -116,11 +117,14 @@ ARGS=(
   --name "$NAME"
   --imgsz "$IMGSZ"
   --lr0 "$LR0"
-  --seed "$SEED"
   --multi_scale "$MULTI_SCALE"
   --save_period "$SAVE_PERIOD"
   --attack_name "${ATTACK_NAMES[@]}"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  ARGS+=(--seed "$SEED")
+fi
 
 if [[ -n "$CACHE" && "$CACHE" != "none" && "$CACHE" != "None" ]]; then
   ARGS+=(--cache "$CACHE")

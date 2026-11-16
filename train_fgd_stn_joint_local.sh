@@ -50,7 +50,8 @@ VAL_INTERVAL="${VAL_INTERVAL:-5}"
 PROJECT="${PROJECT:-$ROOT/runs/train_fgd_stn_joint}"
 JOB_NAME="${JOB_NAME:-local_fgd_stn_joint}"
 RESUME="${RESUME:-}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 
 # Thread and GPU memory environment variables
 export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
@@ -133,11 +134,14 @@ ARGS=(
   --workers "$WORKERS"
   --cache "$CACHE"
   --amp "$AMP"
-  --seed "$SEED"
   --val_interval "$VAL_INTERVAL"
   --project "$PROJECT"
   --name "$NAME"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  ARGS+=(--seed "$SEED")
+fi
 
 if [[ "$INIT" == "pretrained" ]]; then
   ARGS+=(--fgd_weights "$FGD_WEIGHTS" --stn_weights "$STN_WEIGHTS")

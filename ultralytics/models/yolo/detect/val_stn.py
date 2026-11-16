@@ -152,7 +152,10 @@ class STNDetectionValidator(BaseValidator):
 
         # Ensure reproducible attack sampling across baseline and defended evaluations
         if use_attack and self.attacker is not None:
-            self.attacker._generator.manual_seed(int(seed))
+            if hasattr(self.attacker, "reset_seed"):
+                self.attacker.reset_seed(int(seed))
+            elif hasattr(self.attacker, "_generator"):
+                self.attacker._generator.manual_seed(int(seed))
 
         bar = TQDM(self.dataloader, desc=f"Evaluating {mode}", total=len(self.dataloader))
 

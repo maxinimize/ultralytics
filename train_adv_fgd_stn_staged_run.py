@@ -27,8 +27,8 @@ def parse_bool(value: Any) -> bool:
     raise argparse.ArgumentTypeError(f"Expected true or false, got {value!r}")
 
 
-def main():
-    """Parse CLI arguments and run Staged Adaptive Adversarial Training."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for Staged Adaptive Adversarial Training."""
     parser = argparse.ArgumentParser(
         description="Staged Adaptive Adversarial Training with Frozen FGD and STN for YOLO12l."
     )
@@ -187,7 +187,12 @@ def main():
     parser.add_argument("--warmup_bias_lr", type=float, default=0.0, help="Warmup bias learning rate (default: 0.0).")
     parser.add_argument("--device", default="0", help="CUDA device index or 'cpu' (default: 0).")
     parser.add_argument("--workers", type=int, default=None, help="DataLoader worker processes.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (default: 42).")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: inherited from cfg/default.yaml).",
+    )
     parser.add_argument(
         "--project",
         default="runs/train_adv_fgd_stn_staged",
@@ -246,8 +251,17 @@ def main():
         default=None,
         help="Save checkpoint every X epochs (default: 1 for stage 1, -1 for stage 2).",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    return build_parser().parse_args(args)
+
+
+def main():
+    """Parse CLI arguments and run Staged Adaptive Adversarial Training."""
+    args = parse_args()
 
     # Normalize cache argument
     cache_val = args.cache
@@ -376,7 +390,6 @@ def main():
         "copy_paste": copy_paste,
         "close_mosaic": close_mosaic,
         "save_period": save_period,
-        "seed": args.seed,
         "project": args.project,
         "name": exp_name,
         "resume": args.resume,
@@ -402,6 +415,8 @@ def main():
         overrides["workers"] = args.workers
     if args.classes is not None:
         overrides["classes"] = args.classes
+    if args.seed is not None:
+        overrides["seed"] = int(args.seed)
 
     trainer = DetectionTrainerAdvFGDSTNStaged(overrides=overrides, attack_weights=args.attack_weights)
     if args.eval_only:

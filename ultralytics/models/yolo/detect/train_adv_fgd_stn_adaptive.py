@@ -382,6 +382,8 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                     if att not in self.attackers or self.attackers[att] is None:
                         if self.strict_attacks:
                             raise RuntimeError(f"Attacker '{att}' failed to initialize.")
+
+            self._restore_resume_rng_and_attackers()
         except Exception as e:
             if getattr(self, "strict_attacks", True):
                 raise
@@ -545,6 +547,26 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                 torch.nan_to_num_(v)
         strip_qat(live_model)
 
+        attacker_states = {}
+        if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+            for att_name, att_obj in self.attackers.items():
+                if hasattr(att_obj, "state_dict"):
+                    attacker_states[att_name] = att_obj.state_dict()
+        elif hasattr(self, "attacker") and self.attacker is not None and hasattr(self.attacker, "state_dict"):
+            attacker_states["attacker"] = self.attacker.state_dict()
+
+        random_state = {
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "dataloader": (
+                self.train_loader.generator.get_state().clone()
+                if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None
+                else None
+            ),
+        }
+
         buffer = io.BytesIO()
         torch.save(
             {
@@ -560,6 +582,8 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                 "train_metrics": {**self.metrics, "fitness": self.fitness},
                 "train_results": self.read_results_csv(),
                 "adaptive_state": self.adaptive_controller.state_dict(),
+                "attacker_state": attacker_states,
+                "random_state": random_state,
                 "strict_attacks": getattr(self, "strict_attacks", True),
                 "preprocess_mode": self.preprocess_mode,
                 "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
@@ -603,10 +627,15 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         self.run_callbacks("on_train_start")
+        seed_val = getattr(self.args, "seed", None)
+        base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+        seed_source = "checkpoint" if self.resume else ("cli/override" if seed_val is not None else "default_cfg")
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
+            f"Experimental Seed: {base_seed} (source: {seed_source}), "
+            f"Validation Seed: {base_seed}, Allocation Rule: epoch_seed = seed + epoch\n"
             f"Starting FGD+STN Adaptive Adversarial Training for {self.epochs} epochs "
             f"(mode='{self.preprocess_mode}', adaptive={self.adaptive_ratio})..."
         )
@@ -626,7 +655,8 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             self._model_train()
 
             # Dynamic attack ratio allocation update per epoch
-            base_seed = getattr(self.args, "seed", 0) or 42
+            seed_val = getattr(self.args, "seed", None)
+            base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
             needs_reset = False
             if epoch == self.start_epoch and self.resume:

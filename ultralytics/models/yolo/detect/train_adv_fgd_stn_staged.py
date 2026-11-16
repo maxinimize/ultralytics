@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import math
+import random
 import time
 import warnings
 from copy import copy, deepcopy
@@ -21,7 +22,7 @@ from torch import nn
 
 from ultralytics import __version__
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
-from ultralytics.attacks.attack_utils import setup_attack_model
+from ultralytics.attacks.attack_utils import isolate_rng, setup_attack_model
 from ultralytics.data.augment import Compose, Format, LetterBox, v8_transforms
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.defenses.fgd_stn_pipeline import (
@@ -243,6 +244,14 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                         saved_args = yaml.safe_load(f) or {}
                 except (OSError, yaml.YAMLError) as e:
                     LOGGER.warning(f"Could not load saved configuration from {args_yaml}: {e}")
+
+        if resume and "seed" in overrides and overrides["seed"] is not None:
+            saved_seed = saved_args.get("seed", None)
+            if saved_seed is not None and int(overrides["seed"]) != int(saved_seed):
+                raise ValueError(
+                    f"Cannot change seed from {saved_seed} to {overrides['seed']} when resuming training. "
+                    "Start a new run to change seed."
+                )
 
         # Stage configuration
         raw_stage = overrides.pop("stage", saved_args.get("stage", 1))
@@ -510,6 +519,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 LOGGER.info(f"Attacker initialized: {att}")
 
         self.attacker = self.attackers.get(self.attack_names[0], None) if self.attackers else None
+        self._restore_resume_rng_and_attackers()
 
     def _setup_train(self):
         """Freeze non-head parameters and verify parameter isolation before training."""
@@ -911,6 +921,28 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         if self.adaptive_controller is not None:
             ckpt_data["adaptive_state"] = self.adaptive_controller.state_dict()
 
+        attacker_states = {}
+        if hasattr(self, "attackers") and isinstance(self.attackers, dict):
+            for att_name, att_obj in self.attackers.items():
+                if hasattr(att_obj, "state_dict"):
+                    attacker_states[att_name] = att_obj.state_dict()
+        elif hasattr(self, "attacker") and self.attacker is not None and hasattr(self.attacker, "state_dict"):
+            attacker_states["attacker"] = self.attacker.state_dict()
+        if attacker_states:
+            ckpt_data["attacker_state"] = attacker_states
+
+        ckpt_data["random_state"] = {
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "dataloader": (
+                self.train_loader.generator.get_state().clone()
+                if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None
+                else None
+            ),
+        }
+
         buffer = io.BytesIO()
         torch.save(ckpt_data, buffer)
         serialized_ckpt = buffer.getvalue()
@@ -941,40 +973,47 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             LOGGER.error(msg)
             raise NotImplementedError(msg)
 
-        if not isinstance(self.model, nn.Module):
-            self.setup_model()
-            self.model = self.model.to(self.device)
-            gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)
-            self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
-            self.stride = gs
-            self.set_model_attributes()
+        val_seed = int(getattr(self.args, "seed", 0))
+        attackers = getattr(self, "attackers", getattr(self, "attacker", None))
+        dl = getattr(self, "train_loader", None)
+        with isolate_rng(seed=val_seed, attackers=attackers, dataloader=dl):
+            if not isinstance(self.model, nn.Module):
+                self.setup_model()
+                self.model = self.model.to(self.device)
+                gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)
+                self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+                self.stride = gs
+                self.set_model_attributes()
 
-        if getattr(self, "test_loader", None) is None:
-            self.test_loader = self.get_dataloader(
-                self.data[self.args.split],
-                batch_size=self.batch_size if self.args.task in {"obb", "semantic", "depth"} else self.batch_size * 2,
-                rank=-1,
-                mode="val",
-            )
+            if getattr(self, "test_loader", None) is None:
+                self.test_loader = self.get_dataloader(
+                    self.data[self.args.split],
+                    batch_size=self.batch_size
+                    if self.args.task in {"obb", "semantic", "depth"}
+                    else self.batch_size * 2,
+                    rank=-1,
+                    mode="val",
+                )
 
-        validator = self.get_validator()
-        validator.dataloader = self.test_loader
+            validator = self.get_validator()
+            validator.dataloader = self.test_loader
 
-        if not hasattr(self, "loss_items") or self.loss_items is None:
-            self.loss_items = {
-                "box_loss": torch.tensor(0.0, device=self.device),
-                "cls_loss": torch.tensor(0.0, device=self.device),
-                "dfl_loss": torch.tensor(0.0, device=self.device),
-            }
+            if not hasattr(self, "loss_items") or self.loss_items is None:
+                self.loss_items = {
+                    "box_loss": torch.tensor(0.0, device=self.device),
+                    "cls_loss": torch.tensor(0.0, device=self.device),
+                    "dfl_loss": torch.tensor(0.0, device=self.device),
+                }
 
-        prev_epoch = getattr(self, "epoch", 0)
-        self.epoch = 0
+            prev_epoch = getattr(self, "epoch", 0)
+            self.epoch = 0
 
-        LOGGER.info("\n" + "=" * 60)
-        LOGGER.info(f"Starting Epoch 0 Baseline Validation (Stage {self.stage}, Mode: '{self.preprocess_mode}')...")
-        LOGGER.info("=" * 60)
+            LOGGER.info("\n" + "=" * 60)
+            LOGGER.info(f"Starting Epoch 0 Baseline Validation (Stage {self.stage}, Mode: '{self.preprocess_mode}')...")
+            LOGGER.info("=" * 60)
 
-        stats = validator(self)
+            stats = validator(self)
+            self.epoch = prev_epoch
 
         clean_map50 = float(stats.get("metrics/mAP50(B)", 0.0))
         clean_map50_95 = float(stats.get("metrics/mAP50-95(B)", 0.0))
@@ -1042,10 +1081,15 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         self.epoch_time_start = time.time()
         self.train_time_start = time.time()
         self.run_callbacks("on_train_start")
+        seed_val = getattr(self.args, "seed", None)
+        base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
+        seed_source = "checkpoint" if self.resume else ("cli/override" if seed_val is not None else "default_cfg")
         LOGGER.info(
             f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
             f"Using {self.train_loader.num_workers * (self.world_size or 1)} dataloader workers\n"
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
+            f"Experimental Seed: {base_seed} (source: {seed_source}), "
+            f"Validation Seed: {base_seed}, Allocation Rule: epoch_seed = seed + epoch\n"
             f"Starting Stage {self.stage} Training for {self.epochs} epochs "
             f"(mode='{self.preprocess_mode}', head_only={self.train_head_only})..."
         )
@@ -1074,7 +1118,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             self._model_train()
 
             # Dynamic attack ratio allocation update for Stage 2
-            base_seed = getattr(self.args, "seed", 0) or 42
+            seed_val = getattr(self.args, "seed", None)
+            base_seed = int(DEFAULT_CFG.seed if seed_val is None else seed_val)
             epoch_seed = base_seed + epoch
             needs_reset = False
             if (

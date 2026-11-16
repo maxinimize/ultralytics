@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
+
 from ultralytics.models.yolo.detect.train_stn import STNTrainer
 
 
-def main():
-    """Parse STN training arguments and launch trainer."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build argument parser for STN training."""
     parser = argparse.ArgumentParser(description="Spatial Transformer Network (STN) Defense Training")
     parser.add_argument("--model", default="yolo12l.pt", help="Frozen guidance detector weights (default: yolo12l.pt)")
     parser.add_argument("--data", default="coco128.yaml", help="Dataset configuration YAML")
@@ -27,18 +28,34 @@ def main():
     parser.add_argument("--lr0", type=float, default=1e-3, help="Initial Adam learning rate (default: 1e-3)")
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay (default: 1e-5)")
     parser.add_argument("--degrees", type=float, default=30.0, help="Worst-of-k max rotation degrees (default: 30.0)")
-    parser.add_argument("--translate", type=float, default=0.10, help="Worst-of-k max translation ratio (default: 0.10)")
+    parser.add_argument(
+        "--translate", type=float, default=0.10, help="Worst-of-k max translation ratio (default: 0.10)"
+    )
     parser.add_argument("--worstk_k", type=int, default=10, help="Number of spatial candidate transforms (default: 10)")
     parser.add_argument("--loss_geom_weight", type=float, default=1.0, help="Weight for geometry loss (default: 1.0)")
-    parser.add_argument("--loss_recon_weight", type=float, default=1.0, help="Weight for masked recon loss (default: 1.0)")
-    parser.add_argument("--loss_det_weight", type=float, default=0.0, help="Weight for frozen-YOLO det loss (default: 0.0)")
+    parser.add_argument(
+        "--loss_recon_weight", type=float, default=1.0, help="Weight for masked recon loss (default: 1.0)"
+    )
+    parser.add_argument(
+        "--loss_det_weight", type=float, default=0.0, help="Weight for frozen-YOLO det loss (default: 0.0)"
+    )
     parser.add_argument("--val_interval", type=int, default=1, help="Validation interval in epochs (default: 1)")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility (default: 0)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Random seed for reproducibility (default: inherited from cfg/default.yaml)",
+    )
     parser.add_argument("--project", default="runs/train_stn", help="Results directory (default: runs/train_stn)")
     parser.add_argument("--name", default="exp", help="Experiment name (default: exp)")
     parser.add_argument("--save_period", type=int, default=-1, help="Periodic checkpoint save interval")
     parser.add_argument("--resume", default=False, help="Resume from checkpoint path (weights/last.pt)")
+    return parser
 
+
+def main():
+    """Parse STN training arguments and launch trainer."""
+    parser = build_parser()
     args = parser.parse_args()
 
     cache_val = args.cache

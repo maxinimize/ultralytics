@@ -5,8 +5,8 @@ import argparse
 from ultralytics.models.yolo.detect.train_fgd import FGDTrainer
 
 
-def main():
-    """Parse the independent research CLI without extending global YOLO arguments."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build argument parser for FGD training."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="yolo12l.pt", help="Frozen guidance checkpoint")
     parser.add_argument("--data", default="coco128.yaml")
@@ -25,12 +25,23 @@ def main():
     parser.add_argument("--device", default="0", help="Single CUDA device or cpu")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr0", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Random seed for reproducibility (default: inherited from cfg/default.yaml)",
+    )
     parser.add_argument("--multi_scale", type=float, default=0.0)
     parser.add_argument("--project", default="runs/fgd")
     parser.add_argument("--name", default="exp")
     parser.add_argument("--save_period", type=int, default=-1)
     parser.add_argument("--resume", default=False, help="FGD weights/last.pt; restores saved experiment settings")
+    return parser
+
+
+def main():
+    """Parse the independent research CLI without extending global YOLO arguments."""
+    parser = build_parser()
     FGDTrainer(overrides=vars(parser.parse_args())).train()
 
 

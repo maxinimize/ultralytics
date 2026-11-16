@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.cfg import get_cfg
 from ultralytics.data import build_yolo_dataset
@@ -374,9 +375,13 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         if not self.resume and self.init_mode == "pretrained":
             if not self.fgd_weights or not Path(self.fgd_weights).is_file():
-                raise FileNotFoundError(f"Pretrained fine-tuning mode requires valid --fgd_weights path, got: {self.fgd_weights}")
+                raise FileNotFoundError(
+                    f"Pretrained fine-tuning mode requires valid --fgd_weights path, got: {self.fgd_weights}"
+                )
             if not self.stn_weights or not Path(self.stn_weights).is_file():
-                raise FileNotFoundError(f"Pretrained fine-tuning mode requires valid --stn_weights path, got: {self.stn_weights}")
+                raise FileNotFoundError(
+                    f"Pretrained fine-tuning mode requires valid --stn_weights path, got: {self.stn_weights}"
+                )
 
         total_ratio = sum(self.attack_ratios) + self.p_clean
         if abs(total_ratio - 1.0) > 1e-3:
@@ -424,6 +429,13 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
             self.joint_checkpoint = torch_load(resume_path, map_location="cpu")
             saved = self.joint_checkpoint.get("train_args", {}).copy()
+            if "seed" in overrides and overrides["seed"] is not None:
+                saved_seed = saved.get("seed", None)
+                if saved_seed is not None and int(overrides["seed"]) != int(saved_seed):
+                    raise ValueError(
+                        f"Cannot change seed from {saved_seed} to {overrides['seed']} when resuming training. "
+                        "Start a new run to change seed."
+                    )
             saved.update({k: overrides[k] for k in ("device", "workers", "epochs", "batch") if k in overrides})
             saved.update(resume=str(resume_path), exist_ok=True)
             self.args = get_cfg(DEFAULT_CFG, saved)
@@ -438,7 +450,9 @@ class JointFGDSTNTrainer(DetectionTrainer):
             self.guidance_model.args = IterableSimpleNamespace(**self.guidance_model.args)
 
         if self.guidance_model.names != self.data["names"]:
-            raise ValueError("Guidance model class names do not match dataset class names; please use matching weights.")
+            raise ValueError(
+                "Guidance model class names do not match dataset class names; please use matching weights."
+            )
 
         self.stride = max(int(self.guidance_model.stride.max()), 32)
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=self.stride, floor=self.stride, max_dim=1)
@@ -577,11 +591,22 @@ class JointFGDSTNTrainer(DetectionTrainer):
                     np.random.set_state(rnd["numpy"])
                 if "python" in rnd:
                     random.setstate(rnd["python"])
+                if "dataloader" in rnd and rnd["dataloader"] is not None:
+                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None:
+                        self.train_loader.generator.set_state(rnd["dataloader"])
+
+            if "attacker_state" in ckpt or "attackers_state" in ckpt:
+                atk_st = ckpt.get("attacker_state", ckpt.get("attackers_state", {}))
+                for att_name, st in atk_st.items():
+                    if att_name in self.attackers and hasattr(self.attackers[att_name], "load_state_dict"):
+                        self.attackers[att_name].load_state_dict(st)
 
             self.start_epoch = ckpt["epoch"] + 1
             self.best_fitness = float(ckpt.get("best_fitness", 0.0))
             if self.start_epoch >= self.epochs:
-                raise ValueError(f"--epochs ({self.epochs}) must be greater than completed checkpoint epochs ({self.start_epoch}).")
+                raise ValueError(
+                    f"--epochs ({self.epochs}) must be greater than completed checkpoint epochs ({self.start_epoch})."
+                )
             self.joint_checkpoint = None
 
         if hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
@@ -865,42 +890,47 @@ class JointFGDSTNTrainer(DetectionTrainer):
         self.validator.guidance_model = self.guidance_model.to(self.device)
 
         try:
-            summary = self.validator.evaluate_all(
-                modes=[self.preprocess_mode],
-                attacks=["clean", "pgd", "bim", "mim", "worstk"],
+            with isolate_rng(
                 seed=int(getattr(self.args, "seed", 0)),
-            )
-            raw_res = summary.get("raw_results", {})
+                attackers=self.attackers,
+                dataloader=getattr(self, "train_loader", None),
+            ):
+                summary = self.validator.evaluate_all(
+                    modes=[self.preprocess_mode],
+                    attacks=["clean", "pgd", "bim", "mim", "worstk"],
+                    seed=int(getattr(self.args, "seed", 0)),
+                )
+                raw_res = summary.get("raw_results", {})
 
-            metrics = {}
-            attack_order = ["clean", "pgd", "bim", "mim", "worstk"]
-            fitness = 0.0
-            total_w = 0.0
+                metrics = {}
+                attack_order = ["clean", "pgd", "bim", "mim", "worstk"]
+                fitness = 0.0
+                total_w = 0.0
 
-            for i, att in enumerate(attack_order):
-                m_dict = raw_res.get(att, {}).get(self.preprocess_mode, {})
-                map50 = float(m_dict.get("mAP50", 0.0))
-                map95 = float(m_dict.get("mAP50-95", 0.0))
-                metrics[f"{att}/mAP50"] = map50
-                metrics[f"{att}/mAP50-95"] = map95
+                for i, att in enumerate(attack_order):
+                    m_dict = raw_res.get(att, {}).get(self.preprocess_mode, {})
+                    map50 = float(m_dict.get("mAP50", 0.0))
+                    map95 = float(m_dict.get("mAP50-95", 0.0))
+                    metrics[f"{att}/mAP50"] = map50
+                    metrics[f"{att}/mAP50-95"] = map95
 
-                w = self.eval_weights[i] if i < len(self.eval_weights) else (1.0 / len(attack_order))
-                fitness += w * map95
-                total_w += w
+                    w = self.eval_weights[i] if i < len(self.eval_weights) else (1.0 / len(attack_order))
+                    fitness += w * map95
+                    total_w += w
 
-            if total_w > 0:
-                fitness /= total_w
-            metrics["fitness"] = fitness
+                if total_w > 0:
+                    fitness /= total_w
+                metrics["fitness"] = fitness
 
-            LOGGER.info(
-                f"[Validation Epoch {self.epoch + 1}] Robust weighted mAP50-95 fitness: {fitness:.4f} "
-                f"(Clean: {metrics.get('clean/mAP50-95', 0.0):.4f}, "
-                f"PGD: {metrics.get('pgd/mAP50-95', 0.0):.4f}, "
-                f"BIM: {metrics.get('bim/mAP50-95', 0.0):.4f}, "
-                f"MIM: {metrics.get('mim/mAP50-95', 0.0):.4f}, "
-                f"WorstK: {metrics.get('worstk/mAP50-95', 0.0):.4f})"
-            )
-            return metrics, fitness
+                LOGGER.info(
+                    f"[Validation Epoch {self.epoch + 1}] Robust weighted mAP50-95 fitness: {fitness:.4f} "
+                    f"(Clean: {metrics.get('clean/mAP50-95', 0.0):.4f}, "
+                    f"PGD: {metrics.get('pgd/mAP50-95', 0.0):.4f}, "
+                    f"BIM: {metrics.get('bim/mAP50-95', 0.0):.4f}, "
+                    f"MIM: {metrics.get('mim/mAP50-95', 0.0):.4f}, "
+                    f"WorstK: {metrics.get('worstk/mAP50-95', 0.0):.4f})"
+                )
+                return metrics, fitness
         finally:
             # Restore training state and gradient computation to prevent permanent freezing of defense modules
             self.denoiser.train().requires_grad_(True)
@@ -959,11 +989,21 @@ class JointFGDSTNTrainer(DetectionTrainer):
             "validation_metrics": getattr(self, "metrics", {}),
             "best_fitness": self.best_fitness,
             "train_args": vars(self.args),
+            "attacker_state": {
+                name: atk.state_dict()
+                for name, atk in getattr(self, "attackers", {}).items()
+                if hasattr(atk, "state_dict")
+            },
             "random_state": {
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                 "numpy": np.random.get_state(),
                 "python": random.getstate(),
+                "dataloader": (
+                    self.train_loader.generator.get_state().clone()
+                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None
+                    else None
+                ),
             },
         }
 

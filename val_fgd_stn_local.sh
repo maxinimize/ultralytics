@@ -36,7 +36,8 @@ if [[ -d "$PROJECT/$NAME" ]]; then
   done
   NAME="${BASE_NAME}${i}"
 fi
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 
 # Setup logging to logs/ directory
 mkdir -p logs
@@ -64,12 +65,15 @@ VAL_ARGS=(
   --attacks $ATTACKS
   --batch "$BATCH"
   --imgsz "$IMGSZ"
-  --seed "$SEED"
   --device "$DEVICE"
   --workers "$WORKERS"
   --project "$PROJECT"
   --name "$NAME"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  VAL_ARGS+=(--seed "$SEED")
+fi
 
 if [[ -n "$ATTACK_WEIGHTS" ]]; then
   VAL_ARGS+=(--attack_weights "$ATTACK_WEIGHTS")

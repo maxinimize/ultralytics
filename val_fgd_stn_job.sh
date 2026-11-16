@@ -42,7 +42,8 @@ DEVICE="${DEVICE:-0}"
 WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-4} - 1 ))}"
 if [ "$WORKERS" -lt 1 ]; then WORKERS=1; fi
 PROJECT="${PROJECT:-runs/val_fgd_stn}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 
 # If data file with double underscore is specified and missing, fallback to single underscore
 if [[ "$DATA" == *"coco_train_traffic5k__test.yaml"* ]] && [[ ! -f "$DATA" ]] && [[ ! -f "ultralytics/cfg/datasets/$DATA" ]]; then
@@ -141,12 +142,15 @@ VAL_ARGS=(
   --mim_lr "$MIM_LR"
   --mim_iters "$MIM_ITERS"
   --mim_decay "$MIM_DECAY"
-  --seed "$SEED"
   --device "$DEVICE"
   --workers "$WORKERS"
   --project "$PROJECT"
   --name "$NAME"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  VAL_ARGS+=(--seed "$SEED")
+fi
 
 if [[ -n "$ATTACK_WEIGHTS" ]]; then
   VAL_ARGS+=(--attack_weights "$ATTACK_WEIGHTS")

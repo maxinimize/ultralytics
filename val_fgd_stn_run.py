@@ -32,7 +32,7 @@ from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import select_device, unwrap_model
 
 
-def parse_args():
+def parse_args(args=None):
     """Parse CLI options for Unified FGD + STN Defense validation."""
     parser = argparse.ArgumentParser(
         description="Unified FGD + STN Defense Validation across E1-E5 preprocessing modes and adversarial attacks."
@@ -200,8 +200,8 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=0,
-        help="Reproducibility random seed for data sampling and attacks (default: 0).",
+        default=None,
+        help="Reproducibility random seed for data sampling and attacks (default: inherited from cfg/default.yaml).",
     )
 
     # Output and Logging Settings
@@ -222,7 +222,7 @@ def parse_args():
         help="Save raw prediction detections to predictions.json.",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def resolve_models_and_pipeline(args, device: torch.device):
@@ -305,9 +305,7 @@ def build_attackers_map(args, attack_model: torch.nn.Module, imgsz: int, seed: i
                 img_size=imgsz,
                 seed=seed,
             )
-            LOGGER.info(
-                f"Initialized SpatialWorstOfK (k={args.worstk_k}, deg={args.degrees}, trans={args.translate})"
-            )
+            LOGGER.info(f"Initialized SpatialWorstOfK (k={args.worstk_k}, deg={args.degrees}, trans={args.translate})")
         elif att == "pgd":
             attackers["pgd"] = build_attacker(
                 "pgd",
@@ -379,7 +377,8 @@ def main():
     dataloader = build_dataloader(dataset, batch=args.batch, workers=args.workers, shuffle=False)
 
     # 3. Build attackers
-    attackers = build_attackers_map(args, attack_model, imgsz, seed=args.seed)
+    effective_seed = int(DEFAULT_CFG.seed) if args.seed is None else int(args.seed)
+    attackers = build_attackers_map(args, attack_model, imgsz, seed=effective_seed)
 
     # 4. Prepare save directory
     save_dir = Path(args.project) / args.name
@@ -407,7 +406,7 @@ def main():
     validator.attackers = attackers
 
     # 6. Run comprehensive evaluation
-    results = validator.evaluate_all(modes=args.modes, attacks=args.attacks, seed=args.seed)
+    results = validator.evaluate_all(modes=args.modes, attacks=args.attacks, seed=effective_seed)
     return results
 
 

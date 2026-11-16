@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
+import random
 from copy import copy
 from pathlib import Path
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
-from ultralytics.attacks.attack_utils import BatchContainer
+from ultralytics.attacks.attack_utils import BatchContainer, isolate_rng
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.cfg import get_cfg
 from ultralytics.data import build_yolo_dataset
@@ -109,6 +111,13 @@ class STNTrainer(DetectionTrainer):
                 self.stn_cfg["stn_max_translate"] = float(arch["max_translate"])
                 self.stn_cfg["stn_fill"] = float(arch.get("fill", 114.0 / 255.0))
             saved = self.stn_checkpoint.get("train_args", {}).copy()
+            if "seed" in overrides and overrides["seed"] is not None:
+                saved_seed = saved.get("seed", None)
+                if saved_seed is not None and int(overrides["seed"]) != int(saved_seed):
+                    raise ValueError(
+                        f"Cannot change seed from {saved_seed} to {overrides['seed']} when resuming training. "
+                        "Start a new run to change seed."
+                    )
             saved.update({k: overrides[k] for k in ("device", "workers", "epochs", "batch") if k in overrides})
             saved.update(resume=str(resume_path), exist_ok=True)
             self.args = get_cfg(DEFAULT_CFG, saved)
@@ -206,6 +215,21 @@ class STNTrainer(DetectionTrainer):
             self.optimizer.load_state_dict(ckpt["optimizer"])
             if "scheduler" in ckpt and hasattr(self, "scheduler"):
                 self.scheduler.load_state_dict(ckpt["scheduler"])
+            if "attacker_state" in ckpt and hasattr(self.attacker, "load_state_dict"):
+                self.attacker.load_state_dict(ckpt["attacker_state"])
+            if "random_state" in ckpt:
+                rnd = ckpt["random_state"]
+                if "torch" in rnd:
+                    torch.set_rng_state(rnd["torch"])
+                if torch.cuda.is_available() and rnd.get("cuda") is not None:
+                    torch.cuda.set_rng_state_all(rnd["cuda"])
+                if "numpy" in rnd:
+                    np.random.set_state(rnd["numpy"])
+                if "python" in rnd:
+                    random.setstate(rnd["python"])
+                if "dataloader" in rnd and rnd["dataloader"] is not None:
+                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None:
+                        self.train_loader.generator.set_state(rnd["dataloader"])
             self.start_epoch = ckpt["epoch"] + 1
             self.best_fitness = float(ckpt.get("best_fitness", 0.0))
             if self.start_epoch >= self.epochs:
@@ -344,8 +368,14 @@ class STNTrainer(DetectionTrainer):
         self.validator.guidance_model = self.guidance_model
         self.validator.attacker = self.attacker
 
-        results = self.validator(trainer=self)
-        worstk_map = float(results.get("worstk/mAP50-95", 0.0))
+        val_seed = int(getattr(self.args, "seed", 0))
+        with isolate_rng(
+            seed=val_seed,
+            attackers=self.attacker,
+            dataloader=getattr(self, "train_loader", None),
+        ):
+            results = self.validator(trainer=self)
+            worstk_map = float(results.get("worstk/mAP50-95", 0.0))
         self.stn.train().requires_grad_(True)
         return results, worstk_map
 
@@ -365,6 +395,18 @@ class STNTrainer(DetectionTrainer):
             },
             "guidance_model": str(self.args.model),
             "metrics": getattr(self, "metrics", {}),
+            "attacker_state": self.attacker.state_dict() if hasattr(self.attacker, "state_dict") else None,
+            "random_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+                "dataloader": (
+                    self.train_loader.generator.get_state().clone()
+                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None
+                    else None
+                ),
+            },
         }
 
         # Save last.pt

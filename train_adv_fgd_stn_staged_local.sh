@@ -38,7 +38,8 @@ FRACTION="${FRACTION:-1.0}"
 CLASSES="${CLASSES:-0 1 2 3 5 6 7 9 11 12}"
 PROJECT="${PROJECT:-$ROOT/runs/train_adv_fgd_stn_staged}"
 RESUME="${RESUME:-}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 EVAL_ONLY="${EVAL_ONLY:-false}"
 EVAL_EPOCH0="${EVAL_EPOCH0:-false}"
 
@@ -194,7 +195,6 @@ ARGS=(
   --save_period "$SAVE_PERIOD"
   --device "$DEVICE"
   --workers "$WORKERS"
-  --seed "$SEED"
   --amp "$AMP"
   --cache "$CACHE"
   --fraction "$FRACTION"
@@ -202,6 +202,10 @@ ARGS=(
   --name "$NAME"
   --strict_attacks "$STRICT_ATTACKS"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  ARGS+=(--seed "$SEED")
+fi
 
 if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then
   ARGS+=(--eval_only)

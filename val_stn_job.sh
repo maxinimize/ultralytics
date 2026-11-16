@@ -29,7 +29,8 @@ WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-4} - 1 ))}"
 if [ "$WORKERS" -lt 1 ]; then WORKERS=1; fi
 PROJECT="${PROJECT:-runs/val_stn}"
 MODES="${MODES:-clean_baseline worstk_baseline clean_stn worstk_stn}"
-SEED="${SEED:-0}"
+# Reproducibility seed (leave unset to inherit default cfg.seed; set explicitly e.g. SEED=0 to override)
+SEED="${SEED:-}"
 
 # If data file with double underscore is specified and missing, fallback to single underscore
 if [[ "$DATA" == *"coco_train_traffic5k__test.yaml"* ]] && [[ ! -f "$DATA" ]] && [[ ! -f "ultralytics/cfg/datasets/$DATA" ]]; then
@@ -112,12 +113,15 @@ VAL_ARGS=(
   --degrees "$DEGREES"
   --translate "$TRANSLATE"
   --worstk_k "$WORSTK_K"
-  --seed "$SEED"
   --device "$DEVICE"
   --workers "$WORKERS"
   --project "$PROJECT"
   --name "$NAME"
 )
+
+if [[ -n "${SEED:-}" ]]; then
+  VAL_ARGS+=(--seed "$SEED")
+fi
 
 echo "==> Running command: python -u val_stn_run.py ${VAL_ARGS[*]}"
 python -u val_stn_run.py "${VAL_ARGS[@]}"

@@ -26,12 +26,14 @@ def parse_bool(value: Any) -> bool:
     raise argparse.ArgumentTypeError(f"Expected boolean value (true/false), got: {value!r}")
 
 
-def main():
-    """Parse command-line arguments and launch FGD and STN joint training."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for joint training."""
     parser = argparse.ArgumentParser(description="FGD and STN joint defense training pipeline")
 
     # Model and dataset configuration
-    parser.add_argument("--model", default="yolo12l.pt", help="Guidance detector model weights path (default: yolo12l.pt)")
+    parser.add_argument(
+        "--model", default="yolo12l.pt", help="Guidance detector model weights path (default: yolo12l.pt)"
+    )
     parser.add_argument("--data", default="coco128.yaml", help="Dataset configuration YAML path")
     parser.add_argument("--classes", nargs="+", type=int, default=None, help="Filter dataset by specified class IDs")
 
@@ -53,7 +55,11 @@ def main():
     parser.add_argument("--stn_weights", default=None, help="Pretrained STN checkpoint path")
 
     # Attack generation and penetration settings
-    parser.add_argument("--attack_weights", default=None, help="Optional separate attack model weights path, defaults to detector itself")
+    parser.add_argument(
+        "--attack_weights",
+        default=None,
+        help="Optional separate attack model weights path, defaults to detector itself",
+    )
     parser.add_argument(
         "--attack_through_preprocess",
         type=parse_bool,
@@ -75,19 +81,36 @@ def main():
     )
     parser.add_argument("--p_clean", type=float, default=0.25, help="Fixed ratio of clean samples (default: 0.25)")
     parser.add_argument("--worstk_k", type=int, default=10, help="Worst-of-k candidate transform samples (default: 10)")
-    parser.add_argument("--degrees", type=float, default=30.0, help="Worst-of-k maximum rotation degrees (default: 30.0)")
-    parser.add_argument("--translate", type=float, default=0.10, help="Worst-of-k maximum translation fraction (default: 0.10)")
+    parser.add_argument(
+        "--degrees", type=float, default=30.0, help="Worst-of-k maximum rotation degrees (default: 30.0)"
+    )
+    parser.add_argument(
+        "--translate", type=float, default=0.10, help="Worst-of-k maximum translation fraction (default: 0.10)"
+    )
 
     # Joint loss weight configuration
     parser.add_argument("--lambda_fgd", type=float, default=1.0, help="FGD feature guidance loss weight (default: 1.0)")
-    parser.add_argument("--lambda_geom", type=float, default=1.0, help="STN geometric control point loss weight (default: 1.0)")
-    parser.add_argument("--lambda_recon", type=float, default=1.0, help="Masked image reconstruction loss weight (default: 1.0)")
-    parser.add_argument("--lambda_det", type=float, default=0.0, help="Frozen YOLO detection loss weight (default: 0.0)")
-    parser.add_argument("--lambda_identity", type=float, default=0.1, help="Clean sample identity preservation loss weight (default: 0.1)")
+    parser.add_argument(
+        "--lambda_geom", type=float, default=1.0, help="STN geometric control point loss weight (default: 1.0)"
+    )
+    parser.add_argument(
+        "--lambda_recon", type=float, default=1.0, help="Masked image reconstruction loss weight (default: 1.0)"
+    )
+    parser.add_argument(
+        "--lambda_det", type=float, default=0.0, help="Frozen YOLO detection loss weight (default: 0.0)"
+    )
+    parser.add_argument(
+        "--lambda_identity",
+        type=float,
+        default=0.1,
+        help="Clean sample identity preservation loss weight (default: 0.1)",
+    )
 
     # Optimizer and training hyperparameters
     parser.add_argument("--lr_fgd", type=float, default=1e-5, help="FGD denoiser initial learning rate (default: 1e-5)")
-    parser.add_argument("--lr_stn", type=float, default=1e-4, help="STN spatial transformer initial learning rate (default: 1e-4)")
+    parser.add_argument(
+        "--lr_stn", type=float, default=1e-4, help="STN spatial transformer initial learning rate (default: 1e-4)"
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Adam optimizer weight decay (default: 1e-5)")
     parser.add_argument("--epochs", type=int, default=50, help="Total training epochs (default: 50)")
     parser.add_argument("--batch", type=int, default=4, help="Training batch size (default: 4)")
@@ -96,9 +119,17 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes (default: 4)")
     parser.add_argument("--cache", default="True", help="Dataset cache mode (ram, disk, True, False)")
     parser.add_argument(
-        "--amp", default="bf16", choices=["bf16", "fp16", "fp32", "True", "False"], help="Mixed precision mode (default: bf16)"
+        "--amp",
+        default="bf16",
+        choices=["bf16", "fp16", "fp32", "True", "False"],
+        help="Mixed precision mode (default: bf16)",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed (default: 0)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: inherited from cfg/default.yaml)",
+    )
 
     # Validation and checkpoint settings
     parser.add_argument("--val_interval", type=int, default=5, help="Validation interval in epochs (default: 5)")
@@ -113,8 +144,17 @@ def main():
     parser.add_argument("--name", default="exp", help="Experiment name")
     parser.add_argument("--save_period", type=int, default=-1, help="Periodic checkpoint save interval (default: -1)")
     parser.add_argument("--resume", default=False, help="Resume training checkpoint path (e.g. weights/last.pt)")
+    return parser
 
-    args = parser.parse_args()
+
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    return build_parser().parse_args(args)
+
+
+def main():
+    """Parse command-line arguments and launch FGD and STN joint training."""
+    args = parse_args()
 
     # Normalization and early validation
     mode = canonicalize_mode(args.preprocess_mode)
@@ -127,9 +167,13 @@ def main():
 
     if not args.resume and init_mode == "pretrained":
         if not args.fgd_weights or not Path(args.fgd_weights).is_file():
-            raise FileNotFoundError(f"Pretrained fine-tuning requires valid --fgd_weights path, got: {args.fgd_weights}")
+            raise FileNotFoundError(
+                f"Pretrained fine-tuning requires valid --fgd_weights path, got: {args.fgd_weights}"
+            )
         if not args.stn_weights or not Path(args.stn_weights).is_file():
-            raise FileNotFoundError(f"Pretrained fine-tuning requires valid --stn_weights path, got: {args.stn_weights}")
+            raise FileNotFoundError(
+                f"Pretrained fine-tuning requires valid --stn_weights path, got: {args.stn_weights}"
+            )
 
     # Verify sum of ratios
     attack_ratios = [float(x) for x in args.attack_ratio]
@@ -196,7 +240,6 @@ def main():
         "workers": int(args.workers),
         "cache": cache_val,
         "amp": args.amp,
-        "seed": int(args.seed),
         "val_interval": int(args.val_interval),
         "eval_weights": args.eval_weights,
         "project": args.project,
@@ -204,6 +247,9 @@ def main():
         "save_period": int(args.save_period),
         "resume": args.resume,
     }
+
+    if args.seed is not None:
+        overrides["seed"] = int(args.seed)
 
     trainer = JointFGDSTNTrainer(overrides=overrides)
     trainer.train()

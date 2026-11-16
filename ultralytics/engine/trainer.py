@@ -74,6 +74,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+from ultralytics.attacks.attack_utils import isolate_rng
 
 
 class BaseTrainer:
@@ -928,17 +929,23 @@ class BaseTrainer:
                 - metrics (dict | None): Dictionary of validation metrics, or None if validation was skipped.
                 - fitness (float | None): Fitness score for the validation, or None if validation was skipped.
         """
-        if self.ema and self.world_size > 1:
-            # Sync EMA buffers from rank 0 to all ranks
-            for buffer in self.ema.ema.buffers():
-                dist.broadcast(buffer, src=0)
-        metrics = self.validator(self)
-        if metrics is None:
-            return None, None
-        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        if self.best_fitness is None or self.best_fitness < fitness:
-            self.best_fitness = fitness
-        return metrics, fitness
+        val_seed = int(getattr(self.args, "seed", 0))
+        attackers = getattr(self, "attackers", getattr(self, "attacker", None))
+        dl = getattr(self, "train_loader", None)
+        with isolate_rng(seed=val_seed, attackers=attackers, dataloader=dl):
+            if self.ema and self.world_size > 1:
+                # Sync EMA buffers from rank 0 to all ranks
+                for buffer in self.ema.ema.buffers():
+                    dist.broadcast(buffer, src=0)
+            metrics = self.validator(self)
+            if metrics is None:
+                return None, None
+            fitness = metrics.pop(
+                "fitness", -self.loss.detach().cpu().numpy()
+            )  # use loss as fitness measure if not found
+            if self.best_fitness is None or self.best_fitness < fitness:
+                self.best_fitness = fitness
+            return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
         """Raise NotImplementedError (must return a model built from cfg and weights in subclasses)."""
@@ -1055,6 +1062,14 @@ class BaseTrainer:
                 "distill_model",
                 "save_dir",
             }
+            if "seed" in overrides and overrides["seed"] is not None:
+                saved_seed = getattr(self.args, "seed", None)
+                if saved_seed is not None and int(overrides["seed"]) != int(saved_seed):
+                    raise ValueError(
+                        f"Cannot change seed from {saved_seed} to {overrides['seed']} when resuming training. "
+                        "Start a new run to change seed."
+                    )
+
             ignored = []
             for k, v in overrides.items():
                 if k in allowed:

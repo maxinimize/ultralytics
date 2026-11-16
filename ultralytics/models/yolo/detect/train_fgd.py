@@ -107,6 +107,13 @@ class FGDTrainer(DetectionTrainer):
             self.fgd_checkpoint = torch_load(self.args.resume, map_location="cpu")
             self.fgd = self.fgd_checkpoint["fgd_config"]
             saved = self.fgd_checkpoint["train_args"].copy()
+            if "seed" in overrides and overrides["seed"] is not None:
+                saved_seed = saved.get("seed", None)
+                if saved_seed is not None and int(overrides["seed"]) != int(saved_seed):
+                    raise ValueError(
+                        f"Cannot change seed from {saved_seed} to {overrides['seed']} when resuming training. "
+                        "Start a new run to change seed."
+                    )
             saved.update({k: overrides[k] for k in ("device", "workers", "epochs") if k in overrides})
             saved.update(resume=str(self.args.resume), exist_ok=True)
             self.args = get_cfg(DEFAULT_CFG, saved)

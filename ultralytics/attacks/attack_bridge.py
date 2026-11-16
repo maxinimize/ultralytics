@@ -539,6 +539,7 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
     saved_states = capture_module_training_states(model)
     try:
         normalized = name.lower().strip()
+        seed = kwargs.pop("seed", None)
 
         if normalized in {"fgsm"}:
             from ultralytics.attacks.art_fgsm import ARTFGSM
@@ -583,7 +584,7 @@ def build_attacker(name: str, model: nn.Module, **kwargs):
         if normalized in {"worstk"}:
             from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 
-            return SpatialWorstOfK(model=model, **kwargs)
+            return SpatialWorstOfK(model=model, seed=seed, **kwargs)
 
         raise ValueError(f"Unsupported attack name: {name}")
     finally:
