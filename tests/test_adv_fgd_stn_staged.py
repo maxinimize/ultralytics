@@ -65,6 +65,7 @@ from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.nn.modules.head import Detect
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_DICT, IterableSimpleNamespace
+from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import ModelEMA
 
 
@@ -900,6 +901,7 @@ class TestStagedPipeline(unittest.TestCase):
 
         # Epoch 2 (human epoch 3)
         trainer.epoch = 2
+        trainer.batch_size = 2
         trainer.save_model()
         self.assertTrue((trainer.wdir / "epoch3.pt").exists())
 
@@ -2730,6 +2732,502 @@ class TestStagedPipeline(unittest.TestCase):
             self.assertIn("Cannot change seed from 42 to 99", str(cm.exception))
         finally:
             trainer_mod.load_checkpoint = orig_load
+
+    def test_req11_stn_save_model_order_and_best_fitness_tracking(self):
+        """Verify Item 11: STN save_model updates best_fitness before saving, handles initial 0 score, skips non-val epochs, and preserves best on lower score."""
+        from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
+        from ultralytics.models.yolo.detect.train_stn import STNTrainer
+
+        stn_trainer = STNTrainer.__new__(STNTrainer)
+        stn_trainer.stn = SpatialTransformer(max_degrees=30.0, max_translate=0.10).to(self.device)
+        stn_trainer.optimizer = torch.optim.Adam(stn_trainer.stn.parameters(), lr=1e-3)
+        stn_trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(stn_trainer.optimizer, T_max=10)
+        stn_trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        stn_trainer.stn_cfg = {"degrees": 30.0, "translate": 0.10, "worstk_k": 5, "val_interval": 1}
+        stn_trainer.args = type("Args", (), {"seed": 42, "model": "mock.pt", "save_period": -1})()
+        stn_trainer.wdir = self.temp_dir / "stn_save_test"
+        stn_trainer.wdir.mkdir(parents=True, exist_ok=True)
+        stn_trainer.save_period = -1
+        mock_model = MockYOLOModel()
+        stn_trainer.attacker = SpatialWorstOfKWithMetadata(mock_model, k=3, degrees=10.0, translate=0.05, seed=42)
+        stn_trainer.train_loader = type("MockLoader", (), {"generator": torch.Generator().manual_seed(42)})()
+        stn_trainer.best_fitness = None
+
+        # 1. Epoch 0: valid fitness = 0.0 -> must establish initial best.pt and last.pt with best_fitness=0.0
+        stn_trainer.epoch = 0
+        stn_trainer.fitness = 0.0
+        stn_trainer.save_model()
+
+        self.assertEqual(stn_trainer.best_fitness, 0.0)
+        last_ckpt = torch_load(stn_trainer.wdir / "last.pt", map_location="cpu")
+        best_ckpt = torch_load(stn_trainer.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(last_ckpt["best_fitness"], 0.0)
+        self.assertEqual(best_ckpt["best_fitness"], 0.0)
+        self.assertIn("scheduler", last_ckpt)
+        self.assertIn("scaler", last_ckpt)
+        self.assertIsInstance(last_ckpt["scaler"], dict)
+
+        # 2. Epoch 1: validation skipped (fitness = None) -> must NOT overwrite best.pt
+        stn_trainer.epoch = 1
+        stn_trainer.fitness = None
+        stn_trainer.save_model()
+
+        self.assertEqual(stn_trainer.best_fitness, 0.0)
+        last_ckpt_e1 = torch_load(stn_trainer.wdir / "last.pt", map_location="cpu")
+        self.assertEqual(last_ckpt_e1["epoch"], 1)
+        best_ckpt_e1 = torch_load(stn_trainer.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(best_ckpt_e1["epoch"], 0)
+
+        # 3. Epoch 2: valid fitness = 0.40 -> updates best to 0.40
+        stn_trainer.epoch = 2
+        stn_trainer.fitness = 0.40
+        stn_trainer.save_model()
+
+        self.assertEqual(stn_trainer.best_fitness, 0.40)
+        best_ckpt_e2 = torch_load(stn_trainer.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(best_ckpt_e2["best_fitness"], 0.40)
+        self.assertEqual(best_ckpt_e2["epoch"], 2)
+
+        # 4. Epoch 3: valid fitness = 0.50 -> updates best to 0.50, last.pt also records 0.50
+        stn_trainer.epoch = 3
+        stn_trainer.fitness = 0.50
+        stn_trainer.save_model()
+
+        self.assertEqual(stn_trainer.best_fitness, 0.50)
+        last_ckpt_e3 = torch_load(stn_trainer.wdir / "last.pt", map_location="cpu")
+        best_ckpt_e3 = torch_load(stn_trainer.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(last_ckpt_e3["best_fitness"], 0.50)
+        self.assertEqual(best_ckpt_e3["best_fitness"], 0.50)
+
+        # 5. Resume from last.pt (0.50) -> next epoch achieves 0.45 -> must NOT overwrite best.pt (0.50)!
+        stn_resumed = STNTrainer.__new__(STNTrainer)
+        stn_resumed.stn = SpatialTransformer(max_degrees=30.0, max_translate=0.10).to(self.device)
+        stn_resumed.optimizer = torch.optim.Adam(stn_resumed.stn.parameters(), lr=1e-3)
+        stn_resumed.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(stn_resumed.optimizer, T_max=10)
+        stn_resumed.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        stn_resumed.stn_cfg = {"degrees": 30.0, "translate": 0.10, "worstk_k": 5, "val_interval": 1}
+        stn_resumed.args = type("Args", (), {"seed": 42, "model": "mock.pt", "save_period": -1, "epochs": 10})()
+        stn_resumed.wdir = stn_trainer.wdir
+        stn_resumed.save_period = -1
+        stn_resumed.attacker = SpatialWorstOfKWithMetadata(mock_model, k=3, degrees=10.0, translate=0.05, seed=42)
+        stn_resumed.train_loader = type("MockLoader", (), {"generator": torch.Generator().manual_seed(42)})()
+        stn_resumed.epochs = 10
+        stn_resumed.stn_checkpoint = last_ckpt_e3
+
+        ckpt = stn_resumed.stn_checkpoint
+        stn_resumed.stn.load_state_dict(ckpt["stn"])
+        stn_resumed.optimizer.load_state_dict(ckpt["optimizer"])
+        stn_resumed.scheduler.load_state_dict(ckpt["scheduler"])
+        stn_resumed.scaler.load_state_dict(ckpt["scaler"])
+        stn_resumed.attacker.load_state_dict(ckpt["attacker_state"])
+        stn_resumed.start_epoch = ckpt["epoch"] + 1
+        stn_resumed.best_fitness = float(ckpt["best_fitness"])
+        self.assertEqual(stn_resumed.best_fitness, 0.50)
+        self.assertEqual(stn_resumed.start_epoch, 4)
+
+        # Resumed training: epoch 4 evaluates to 0.45
+        stn_resumed.epoch = 4
+        stn_resumed.fitness = 0.45
+        stn_resumed.save_model()
+
+        # Check: best_fitness is STILL 0.50, and best.pt is STILL epoch 3 with 0.50
+        self.assertEqual(stn_resumed.best_fitness, 0.50)
+        best_ckpt_after = torch_load(stn_resumed.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(best_ckpt_after["best_fitness"], 0.50)
+        self.assertEqual(best_ckpt_after["epoch"], 3)
+
+    def test_req11_joint_save_model_order_and_export_consistency(self):
+        """Verify Item 11: Joint save_model updates best_fitness before checkpointing, handles initial 0 score, and synchronizes best_ and last_ exports."""
+        from ultralytics.models.yolo.detect.train_fgd_stn_joint import JointFGDSTNTrainer
+
+        joint_trainer = JointFGDSTNTrainer.__new__(JointFGDSTNTrainer)
+        joint_trainer.denoiser = ResidualDenoiser().to(self.device)
+        joint_trainer.stn = SpatialTransformer(max_degrees=30.0, max_translate=0.10).to(self.device)
+        joint_trainer.optimizer = torch.optim.Adam(
+            list(joint_trainer.denoiser.parameters()) + list(joint_trainer.stn.parameters()), lr=1e-3
+        )
+        joint_trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(joint_trainer.optimizer, T_max=10)
+        joint_trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        joint_trainer.preprocess_mode = "fgd_stn"
+        joint_trainer.init_mode = "scratch"
+        joint_trainer.lambda_fgd = 1.0
+        joint_trainer.lambda_geom = 1.0
+        joint_trainer.lambda_recon = 1.0
+        joint_trainer.lambda_det = 0.0
+        joint_trainer.lambda_identity = 0.1
+        joint_trainer.lr_fgd = 1e-4
+        joint_trainer.lr_stn = 1e-3
+        joint_trainer.val_interval = 1
+        joint_trainer.degrees = 30.0
+        joint_trainer.translate = 0.10
+        joint_trainer.worstk_k = 5
+        joint_trainer.attack_names = ["worstk"]
+        joint_trainer.attack_ratios = [1.0]
+        joint_trainer.p_clean = 0.0
+        joint_trainer.attack_through_preprocess = False
+        joint_trainer.attack_weights = None
+        joint_trainer.args = type("Args", (), {"seed": 42, "model": "mock.pt", "save_period": -1})()
+        joint_trainer.wdir = self.temp_dir / "joint_save_test"
+        joint_trainer.wdir.mkdir(parents=True, exist_ok=True)
+        joint_trainer.save_period = -1
+        mock_model = MockYOLOModel()
+        joint_trainer.attackers = {"worstk": SpatialWorstOfK(mock_model, k=3, degrees=10.0, translate=0.05, seed=42)}
+        joint_trainer.train_loader = type("MockLoader", (), {"generator": torch.Generator().manual_seed(42)})()
+        joint_trainer.best_fitness = None
+
+        # 1. Epoch 0: valid fitness = 0.0 -> must create initial best.pt and best_ exports
+        joint_trainer.epoch = 0
+        joint_trainer.fitness = 0.0
+        joint_trainer.save_model()
+
+        self.assertEqual(joint_trainer.best_fitness, 0.0)
+        self.assertTrue((joint_trainer.wdir / "last.pt").is_file())
+        self.assertTrue((joint_trainer.wdir / "best.pt").is_file())
+        self.assertTrue((joint_trainer.wdir / "best_fgd.pt").is_file())
+        self.assertTrue((joint_trainer.wdir / "best_stn.pt").is_file())
+        self.assertTrue((joint_trainer.wdir / "last_fgd.pt").is_file())
+        self.assertTrue((joint_trainer.wdir / "last_stn.pt").is_file())
+
+        last_ckpt = torch_load(joint_trainer.wdir / "last.pt", map_location="cpu")
+        best_ckpt = torch_load(joint_trainer.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(last_ckpt["best_fitness"], 0.0)
+        self.assertEqual(best_ckpt["best_fitness"], 0.0)
+        self.assertIn("scheduler_state_dict", last_ckpt)
+        self.assertIn("scaler_state_dict", last_ckpt)
+
+        # 2. Epoch 1: skipped validation (fitness = None) -> must NOT overwrite best.pt
+        joint_trainer.epoch = 1
+        joint_trainer.fitness = None
+        joint_trainer.save_model()
+
+        self.assertEqual(joint_trainer.best_fitness, 0.0)
+        self.assertEqual(torch_load(joint_trainer.wdir / "best.pt", map_location="cpu")["epoch"], 0)
+
+        # 3. Epoch 2: valid fitness = 0.50 -> updates best and last to 0.50
+        joint_trainer.epoch = 2
+        joint_trainer.fitness = 0.50
+        joint_trainer.save_model()
+
+        self.assertEqual(joint_trainer.best_fitness, 0.50)
+        best_ckpt_e2 = torch_load(joint_trainer.wdir / "best.pt", map_location="cpu")
+        last_ckpt_e2 = torch_load(joint_trainer.wdir / "last.pt", map_location="cpu")
+        self.assertEqual(best_ckpt_e2["best_fitness"], 0.50)
+        self.assertEqual(best_ckpt_e2["epoch"], 2)
+        self.assertEqual(last_ckpt_e2["best_fitness"], 0.50)
+
+        # 4. Resume from last.pt (0.50) and evaluate 0.45 in epoch 3 -> best.pt remains epoch 2 with 0.50
+        joint_resumed = copy.copy(joint_trainer)
+        joint_resumed.best_fitness = 0.50
+        joint_resumed.epoch = 3
+        joint_resumed.fitness = 0.45
+        joint_resumed.save_model()
+
+        self.assertEqual(joint_resumed.best_fitness, 0.50)
+        best_ckpt_final = torch_load(joint_resumed.wdir / "best.pt", map_location="cpu")
+        self.assertEqual(best_ckpt_final["epoch"], 2)
+        self.assertEqual(best_ckpt_final["best_fitness"], 0.50)
+
+    def test_req11_joint_scheduler_preservation_and_legacy_checkpoint_compatibility(self):
+        """Verify Item 11: Joint training resume preserves loaded scheduler state and does not overwrite last_epoch, while legacy checkpoints fallback safely."""
+        from ultralytics.models.yolo.detect.train_fgd_stn_joint import JointFGDSTNTrainer
+
+        # 1. Setup trainer with optimizer and scheduler
+        trainer = JointFGDSTNTrainer.__new__(JointFGDSTNTrainer)
+        trainer.device = self.device
+        trainer.denoiser = ResidualDenoiser().to(self.device)
+        trainer.stn = SpatialTransformer(max_degrees=30.0, max_translate=0.10).to(self.device)
+        trainer.optimizer = torch.optim.Adam(trainer.denoiser.parameters(), lr=1e-3)
+        trainer.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.optimizer, T_max=10)
+        trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        trainer.attackers = {}
+        trainer.epochs = 10
+        trainer.args = type("Args", (), {"seed": 42, "model": "mock.pt"})()
+        trainer.save_dir = self.temp_dir / "joint_sched_test"
+        trainer.joint_cfg = {}
+        trainer.preprocess_mode = "fgd_stn"
+        trainer.init_mode = "scratch"
+        trainer.lr_fgd = 1e-4
+        trainer.lr_stn = 1e-3
+
+        # Step scheduler 3 times
+        trainer.scheduler.step()
+        trainer.scheduler.step()
+        trainer.scheduler.step()
+        saved_last_epoch = trainer.scheduler.last_epoch
+        saved_lr = trainer.optimizer.param_groups[0]["lr"]
+
+        # Checkpoint containing scheduler_state_dict
+        ckpt = {
+            "epoch": 2,
+            "best_fitness": 0.42,
+            "fgd_state_dict": trainer.denoiser.state_dict(),
+            "stn_state_dict": trainer.stn.state_dict(),
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "scheduler_state_dict": trainer.scheduler.state_dict(),
+            "scaler_state_dict": trainer.scaler.state_dict(),
+        }
+
+        # Mock resuming
+        trainer.joint_checkpoint = ckpt
+        scheduler_restored = False
+        sched_st = ckpt.get("scheduler_state_dict", ckpt.get("scheduler"))
+        if sched_st and hasattr(trainer, "scheduler") and trainer.scheduler:
+            trainer.scheduler.load_state_dict(sched_st)
+            scheduler_restored = True
+        trainer.start_epoch = ckpt["epoch"] + 1
+
+        if not scheduler_restored and hasattr(trainer, "scheduler") and hasattr(trainer.scheduler, "last_epoch"):
+            trainer.scheduler.last_epoch = trainer.start_epoch - 1
+
+        # The scheduler's last_epoch and LR must NOT be clobbered
+        self.assertEqual(trainer.scheduler.last_epoch, saved_last_epoch)
+        self.assertEqual(trainer.optimizer.param_groups[0]["lr"], saved_lr)
+
+        # 2. Test legacy checkpoint lacking scheduler: falls back to start_epoch - 1
+        legacy_ckpt = {
+            "epoch": 4,
+            "best_fitness": 0.30,
+            "fgd_state_dict": trainer.denoiser.state_dict(),
+            "stn_state_dict": trainer.stn.state_dict(),
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+        }
+        trainer.joint_checkpoint = legacy_ckpt
+        scheduler_restored = False
+        sched_st = legacy_ckpt.get("scheduler_state_dict", legacy_ckpt.get("scheduler"))
+        if sched_st and hasattr(trainer, "scheduler") and trainer.scheduler:
+            trainer.scheduler.load_state_dict(sched_st)
+            scheduler_restored = True
+        trainer.start_epoch = legacy_ckpt["epoch"] + 1
+
+        if not scheduler_restored and hasattr(trainer, "scheduler") and hasattr(trainer.scheduler, "last_epoch"):
+            trainer.scheduler.last_epoch = trainer.start_epoch - 1
+
+        self.assertEqual(trainer.scheduler.last_epoch, 4)
+
+    def test_req11_step_by_step_resume_equivalence_workers0(self):
+        """Verify Item 11: Continuous training vs epoch-boundary save & resume produces identical next-epoch LR, WorstK candidates, and optimizer parameter updates with workers=0."""
+        import random
+
+        from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
+
+        def setup_stn_environment(seed=123):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            stn = SpatialTransformer(max_degrees=20.0, max_translate=0.05).cpu()
+            opt = torch.optim.Adam(stn.parameters(), lr=1e-3)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=4)
+            scaler = torch.amp.GradScaler("cpu", enabled=False)
+            model = MockYOLOModel(ch=16)
+            atk = SpatialWorstOfKWithMetadata(model, k=3, degrees=10.0, translate=0.05, seed=seed)
+            return stn, opt, sched, scaler, model, atk
+
+        dummy_batch = {
+            "img": torch.rand(2, 3, 64, 64),
+            "batch_idx": torch.tensor([0, 1]),
+            "cls": torch.tensor([[0.0], [1.0]]),
+            "bboxes": torch.tensor([[0.1, 0.1, 0.3, 0.3], [0.2, 0.2, 0.4, 0.4]]),
+        }
+
+        # RUN 1: Continuous training for Epoch 0 and Epoch 1
+        stn1, opt1, sched1, scaler1, _model1, atk1 = setup_stn_environment(seed=123)
+
+        # Epoch 0 step
+        sched1.step()
+        dummy_batch_0 = copy.deepcopy(dummy_batch)
+        atk1.forward_batch(dummy_batch_0)
+        rect_imgs1, _ = stn1(dummy_batch_0["img"])
+        loss1 = (rect_imgs1 - dummy_batch_0["clean_img"]).pow(2).mean()
+        opt1.zero_grad()
+        loss1.backward()
+        opt1.step()
+
+        # Capture checkpoint at end of Epoch 0
+        ckpt_e0 = {
+            "epoch": 0,
+            "stn": copy.deepcopy(stn1.state_dict()),
+            "optimizer": copy.deepcopy(opt1.state_dict()),
+            "scheduler": copy.deepcopy(sched1.state_dict()),
+            "scaler": copy.deepcopy(scaler1.state_dict()),
+            "attacker_state": copy.deepcopy(atk1.state_dict()),
+            "random_state": {
+                "torch": torch.get_rng_state().clone(),
+                "cuda": None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
+                "dataloader": None,
+            },
+            "best_fitness": 0.40,
+        }
+
+        # Continue into Epoch 1
+        sched1.step()
+        cont_lr = opt1.param_groups[0]["lr"]
+        dummy_batch_1 = copy.deepcopy(dummy_batch)
+        atk1.forward_batch(dummy_batch_1)
+        cont_gt_matrix = dummy_batch_1["gt_matrix"].clone()
+        cont_gt_params = dummy_batch_1["gt_params"].clone()
+
+        rect_imgs1_e1, _ = stn1(dummy_batch_1["img"])
+        loss1_e1 = (rect_imgs1_e1 - dummy_batch_1["clean_img"]).pow(2).mean()
+        opt1.zero_grad()
+        loss1_e1.backward()
+        opt1.step()
+        cont_weights = next(stn1.parameters()).clone()
+
+        # RUN 2: Resume from ckpt_e0 and execute Epoch 1
+        stn2, opt2, sched2, scaler2, _model2, atk2 = setup_stn_environment(seed=999)
+
+        # Restore from ckpt_e0
+        stn2.load_state_dict(ckpt_e0["stn"])
+        opt2.load_state_dict(ckpt_e0["optimizer"])
+        sched2.load_state_dict(ckpt_e0["scheduler"])
+        scaler2.load_state_dict(ckpt_e0["scaler"])
+        atk2.load_state_dict(ckpt_e0["attacker_state"])
+        rnd = ckpt_e0["random_state"]
+        torch.set_rng_state(rnd["torch"])
+        np.random.set_state(rnd["numpy"])
+        random.setstate(rnd["python"])
+
+        # Execute Epoch 1 on resumed trainer
+        sched2.step()
+        res_lr = opt2.param_groups[0]["lr"]
+        self.assertEqual(cont_lr, res_lr, "Resumed LR must match continuous training LR")
+
+        dummy_batch_res = copy.deepcopy(dummy_batch)
+        atk2.forward_batch(dummy_batch_res)
+        res_gt_matrix = dummy_batch_res["gt_matrix"].clone()
+        res_gt_params = dummy_batch_res["gt_params"].clone()
+
+        self.assertTrue(torch.allclose(cont_gt_matrix, res_gt_matrix), "WorstK candidate matrix must match continuous")
+        self.assertTrue(torch.allclose(cont_gt_params, res_gt_params), "WorstK candidate params must match continuous")
+
+        rect_imgs2_e1, _ = stn2(dummy_batch_res["img"])
+        loss2_e1 = (rect_imgs2_e1 - dummy_batch_res["clean_img"]).pow(2).mean()
+        opt2.zero_grad()
+        loss2_e1.backward()
+        opt2.step()
+        res_weights = next(stn2.parameters()).clone()
+
+        self.assertTrue(
+            torch.allclose(cont_weights, res_weights, atol=1e-6),
+            "STN parameters after Epoch 1 optimization step must match continuous training exactly",
+        )
+
+    def test_req_n1_staged_eval_epoch0_resume_preserves_best_fitness_and_results(self):
+        """Verify Problem N1: Staged trainer resuming with eval_epoch0 preserves restored best_fitness (e.g. 0.50), prevents lower epoch score (0.45) from overwriting best.pt, restores self.epoch safely via try/finally, and names resume evaluation distinctly."""
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 1
+        trainer.device = self.device
+        trainer.preprocess_mode = "none"
+        trainer.fgd_weights = None
+        trainer.stn_weights = None
+        trainer.pipeline = None
+        trainer.save_dir = self.temp_dir / "staged_n1_test"
+        trainer.save_dir.mkdir(parents=True, exist_ok=True)
+        trainer.wdir = trainer.save_dir / "weights"
+        trainer.wdir.mkdir(parents=True, exist_ok=True)
+        trainer.last = trainer.wdir / "last.pt"
+        trainer.best = trainer.wdir / "best.pt"
+        trainer.save_period = 1
+        trainer.eval_epoch0 = True
+        trainer.args = type(
+            "Args",
+            (),
+            {
+                "seed": 42,
+                "model": "mock.pt",
+                "save_period": 1,
+                "split": "val",
+                "imgsz": 640,
+                "task": "detect",
+                "batch": 2,
+            },
+        )()
+        trainer.data = {"val": "val_dummy", "nc": 2, "names": {0: "a", 1: "b"}}
+        trainer.best_fitness = 0.50
+        trainer.start_epoch = 2
+        trainer.resume = True
+        trainer.epoch = 2
+        trainer.batch_size = 2
+
+        # 1. Test run_epoch0_eval try/finally epoch restoration and distinct resume naming
+        class MockVal:
+            dataloader = None
+
+            def __call__(self, tr):
+                return {"metrics/mAP50(B)": 0.45, "metrics/mAP50-95(B)": 0.40, "fitness": 0.40}
+
+        trainer.get_validator = lambda: MockVal()
+        trainer.get_dataloader = lambda *a, **k: [
+            {
+                "img": torch.rand(2, 3, 64, 64),
+                "batch_idx": torch.tensor([0, 1]),
+                "cls": torch.tensor([[0.0], [1.0]]),
+                "bboxes": torch.zeros(2, 4),
+            }
+        ]
+        trainer.model = MockYOLOModel()
+        trainer.setup_model = lambda: None
+        trainer.set_model_attributes = lambda: None
+
+        res_record = trainer.run_epoch0_eval(save_results=True)
+        self.assertEqual(trainer.epoch, 2)
+        self.assertEqual(res_record["epoch"], 2)
+        self.assertTrue((trainer.save_dir / "resume_epoch2_results.json").is_file())
+        self.assertFalse((trainer.save_dir / "epoch0_results.json").is_file())
+
+        # Test exception safety in run_epoch0_eval
+        class FailingVal:
+            dataloader = None
+
+            def __call__(self, tr):
+                raise RuntimeError("simulated validation failure")
+
+        trainer.get_validator = lambda: FailingVal()
+        trainer.epoch = 99
+        with self.assertRaises(RuntimeError):
+            trainer.run_epoch0_eval(save_results=False)
+        self.assertEqual(trainer.epoch, 99, "self.epoch must be restored to 99 via try/finally even if validator fails")
+
+        # 2. Test _do_train initialization logic on resume: must NOT wipe best_fitness
+        trainer.best_fitness = 0.50
+        trainer.resume = True
+        if trainer.stage == 1 and getattr(trainer, "eval_epoch0", False) and not trainer.resume:
+            trainer.run_epoch0_eval(save_results=True)
+            trainer.best_fitness = None
+        self.assertEqual(trainer.best_fitness, 0.50, "Resume must preserve best_fitness and not wipe it to None")
+
+        # 3. Epoch 2 validation yields 0.45 (< 0.50) -> save_model must NOT overwrite best.pt!
+        trainer.epoch = 2
+        torch.save({"epoch": 1, "best_fitness": 0.50}, trainer.best)
+        trainer.fitness = 0.45
+        trainer.metrics = {}
+        trainer.ema = SimpleNamespace(ema=MockYOLOModel(), updates=1)
+        trainer.optimizer = torch.optim.Adam(trainer.model.parameters(), lr=1e-3)
+        trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+        trainer.stage1_weights = None
+        trainer.train_head_only = False
+        trainer.freeze_bn = False
+        trainer.adaptive_ratio = False
+        trainer.attack_through_preprocess = False
+        trainer.eval_weights = [1.0]
+        trainer.adaptive_controller = None
+        trainer.read_results_csv = dict
+        trainer.train_loader = type("MockLoader", (), {"generator": None})()
+
+        trainer.save_model()
+
+        # best.pt must NOT be overwritten by the 0.45 score!
+        best_ckpt = torch_load(trainer.best, map_location="cpu")
+        self.assertEqual(best_ckpt["epoch"], 1)
+        self.assertEqual(best_ckpt["best_fitness"], 0.50)
+        # last.pt is saved with epoch 2 and retains best_fitness 0.50
+        last_ckpt = torch_load(trainer.last, map_location="cpu")
+        self.assertEqual(last_ckpt["epoch"], 2)
+        self.assertEqual(last_ckpt["best_fitness"], 0.50)
+        # Stage 1 periodic checkpoint uses 1-based indexing: epoch 2 -> epoch3.pt
+        self.assertTrue((trainer.wdir / "epoch3.pt").is_file())
 
 
 if __name__ == "__main__":

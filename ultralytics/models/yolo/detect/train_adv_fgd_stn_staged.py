@@ -959,7 +959,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)
         return True
 
-    def run_epoch0_eval(self, save_results: bool = True) -> dict[str, Any]:
+    def run_epoch0_eval(self, save_results: bool = True, record_epoch: int | None = None) -> dict[str, Any]:
         """Execute Epoch 0 baseline evaluation using the exact Stage 1 validation pipeline.
 
         Evaluates the base detector with frozen STN->FGD defense on the validation set without
@@ -972,6 +972,13 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             )
             LOGGER.error(msg)
             raise NotImplementedError(msg)
+
+        if record_epoch is not None:
+            eval_epoch = int(record_epoch)
+        elif getattr(self, "resume", False) and getattr(self, "start_epoch", 0) > 0:
+            eval_epoch = int(self.start_epoch)
+        else:
+            eval_epoch = 0
 
         val_seed = int(getattr(self.args, "seed", 0))
         attackers = getattr(self, "attackers", getattr(self, "attacker", None))
@@ -986,11 +993,10 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 self.set_model_attributes()
 
             if getattr(self, "test_loader", None) is None:
+                bs = getattr(self, "batch_size", getattr(self.args, "batch", 16))
                 self.test_loader = self.get_dataloader(
                     self.data[self.args.split],
-                    batch_size=self.batch_size
-                    if self.args.task in {"obb", "semantic", "depth"}
-                    else self.batch_size * 2,
+                    batch_size=bs if self.args.task in {"obb", "semantic", "depth"} else bs * 2,
                     rank=-1,
                     mode="val",
                 )
@@ -1006,21 +1012,30 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 }
 
             prev_epoch = getattr(self, "epoch", 0)
-            self.epoch = 0
+            try:
+                self.epoch = eval_epoch
 
-            LOGGER.info("\n" + "=" * 60)
-            LOGGER.info(f"Starting Epoch 0 Baseline Validation (Stage {self.stage}, Mode: '{self.preprocess_mode}')...")
-            LOGGER.info("=" * 60)
+                LOGGER.info("\n" + "=" * 60)
+                if eval_epoch == 0:
+                    LOGGER.info(
+                        f"Starting Epoch 0 Baseline Validation (Stage {self.stage}, Mode: '{self.preprocess_mode}')..."
+                    )
+                else:
+                    LOGGER.info(
+                        f"Starting Resumed Baseline Validation (Epoch {eval_epoch}, Stage {self.stage}, Mode: '{self.preprocess_mode}')..."
+                    )
+                LOGGER.info("=" * 60)
 
-            stats = validator(self)
-            self.epoch = prev_epoch
+                stats = validator(self)
+            finally:
+                self.epoch = prev_epoch
 
         clean_map50 = float(stats.get("metrics/mAP50(B)", 0.0))
         clean_map50_95 = float(stats.get("metrics/mAP50-95(B)", 0.0))
         fitness = float(stats.get("fitness", clean_map50_95))
 
         results_record = {
-            "epoch": 0,
+            "epoch": eval_epoch,
             "stage": self.stage,
             "model": str(self.args.model),
             "preprocess_mode": self.preprocess_mode,
@@ -1033,8 +1048,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
 
         if save_results and RANK in {-1, 0}:
             self.save_dir.mkdir(parents=True, exist_ok=True)
-            json_file = self.save_dir / "epoch0_results.json"
-            csv_file = self.save_dir / "epoch0_results.csv"
+            prefix = "epoch0_results" if eval_epoch == 0 else f"resume_epoch{eval_epoch}_results"
+            json_file = self.save_dir / f"{prefix}.json"
+            csv_file = self.save_dir / f"{prefix}.csv"
 
             with open(json_file, "w", encoding="utf-8") as f:
                 json.dump(results_record, f, indent=2)
@@ -1044,10 +1060,16 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 writer.writeheader()
                 writer.writerow(results_record)
 
-            LOGGER.info(f"Epoch 0 Baseline Results: Clean mAP50={clean_map50:.5f}, Clean mAP50-95={clean_map50_95:.5f}")
-            LOGGER.info(f"Saved Epoch 0 results to:\n  JSON: {json_file}\n  CSV:  {csv_file}\n")
+            if eval_epoch == 0:
+                LOGGER.info(
+                    f"Epoch 0 Baseline Results: Clean mAP50={clean_map50:.5f}, Clean mAP50-95={clean_map50_95:.5f}"
+                )
+            else:
+                LOGGER.info(
+                    f"Resumed Epoch {eval_epoch} Baseline Results: Clean mAP50={clean_map50:.5f}, Clean mAP50-95={clean_map50_95:.5f}"
+                )
+            LOGGER.info(f"Saved evaluation results to:\n  JSON: {json_file}\n  CSV:  {csv_file}\n")
 
-        self.epoch = prev_epoch
         return results_record
 
     def eval_only(self) -> dict[str, Any]:
@@ -1100,9 +1122,15 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         self.optimizer.zero_grad()
 
         if self.stage == 1 and getattr(self, "eval_epoch0", False):
-            LOGGER.info("Evaluating Epoch 0 baseline before commencing Stage 1 training...")
-            self.run_epoch0_eval(save_results=True)
-            self.best_fitness = None
+            if not self.resume:
+                LOGGER.info("Evaluating Epoch 0 baseline before commencing Stage 1 training...")
+                self.run_epoch0_eval(save_results=True)
+                self.best_fitness = None
+            else:
+                LOGGER.info(
+                    f"Resuming Stage 1 from epoch {self.start_epoch}; preserving restored best_fitness "
+                    f"({self.best_fitness}) and skipping Epoch 0 baseline re-initialization."
+                )
         elif self.stage != 1 and getattr(self, "eval_epoch0", False):
             LOGGER.warning(
                 f"eval_epoch0 is ignored for stage={self.stage}; Epoch 0 baseline evaluation is only supported for Stage 1."

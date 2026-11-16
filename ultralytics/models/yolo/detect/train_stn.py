@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import random
 from copy import copy
 from pathlib import Path
@@ -199,42 +200,78 @@ class STNTrainer(DetectionTrainer):
                 else torch.cuda.amp.GradScaler(enabled=self.amp and self.args.amp != "bf16")
             )
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
-        if hasattr(self, "scheduler") and (not hasattr(self.scheduler, "last_epoch") or self.scheduler.last_epoch < 0):
-            self.scheduler.last_epoch = self.start_epoch - 1
 
         # 6. Setup validator
         self.validator = self.get_validator()
         self.loss_names = ("total_loss", "geom_loss", "recon_loss", "det_loss")
         self.metrics = {}
-        self.best_fitness = 0.0
+        self.best_fitness = None
 
         # 7. Restore from checkpoint if resuming
         if self.stn_checkpoint is not None:
             ckpt = self.stn_checkpoint
             self.stn.load_state_dict(ckpt["stn"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
-            if "scheduler" in ckpt and hasattr(self, "scheduler"):
+
+            scheduler_restored = False
+            if "scheduler" in ckpt and hasattr(self, "scheduler") and self.scheduler and ckpt["scheduler"]:
                 self.scheduler.load_state_dict(ckpt["scheduler"])
-            if "attacker_state" in ckpt and hasattr(self.attacker, "load_state_dict"):
+                scheduler_restored = True
+
+            if "scaler" in ckpt and hasattr(self, "scaler") and self.scaler and ckpt["scaler"]:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            elif getattr(self, "amp", False):
+                LOGGER.warning("Checkpoint does not contain 'scaler' state; amp scaler cannot be exactly restored.")
+
+            if "attacker_state" in ckpt and hasattr(self.attacker, "load_state_dict") and ckpt["attacker_state"]:
                 self.attacker.load_state_dict(ckpt["attacker_state"])
-            if "random_state" in ckpt:
-                rnd = ckpt["random_state"]
-                if "torch" in rnd:
-                    torch.set_rng_state(rnd["torch"])
-                if torch.cuda.is_available() and rnd.get("cuda") is not None:
-                    torch.cuda.set_rng_state_all(rnd["cuda"])
-                if "numpy" in rnd:
-                    np.random.set_state(rnd["numpy"])
-                if "python" in rnd:
-                    random.setstate(rnd["python"])
-                if "dataloader" in rnd and rnd["dataloader"] is not None:
-                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None:
-                        self.train_loader.generator.set_state(rnd["dataloader"])
+            else:
+                LOGGER.warning("Checkpoint does not contain 'attacker_state'; attacker generator cannot be restored.")
+
             self.start_epoch = ckpt["epoch"] + 1
-            self.best_fitness = float(ckpt.get("best_fitness", 0.0))
+            bf = ckpt.get("best_fitness")
+            self.best_fitness = float(bf) if bf is not None else None
             if self.start_epoch >= self.epochs:
                 raise ValueError(f"--epochs ({self.epochs}) must exceed checkpoint epoch ({self.start_epoch}).")
+
+            if not scheduler_restored and hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
+                LOGGER.warning(
+                    "Checkpoint does not contain 'scheduler' state; initializing last_epoch from start_epoch. "
+                    "Step-by-step equivalence cannot be guaranteed."
+                )
+                self.scheduler.last_epoch = self.start_epoch - 1
+
+            # Restore RNG states as the final step before training begins
+            if ckpt.get("random_state"):
+                rnd = ckpt["random_state"]
+                if "torch" in rnd and rnd["torch"] is not None:
+                    torch.set_rng_state(rnd["torch"])
+                if torch.cuda.is_available() and rnd.get("cuda") is not None:
+                    with contextlib.suppress(RuntimeError, TypeError, ValueError):
+                        torch.cuda.set_rng_state_all(rnd["cuda"])
+                if "numpy" in rnd and rnd["numpy"] is not None:
+                    np.random.set_state(rnd["numpy"])
+                if "python" in rnd and rnd["python"] is not None:
+                    random.setstate(rnd["python"])
+                if (
+                    "dataloader" in rnd
+                    and rnd["dataloader"] is not None
+                    and hasattr(self, "train_loader")
+                    and getattr(self.train_loader, "generator", None) is not None
+                ):
+                    self.train_loader.generator.set_state(rnd["dataloader"])
+            else:
+                LOGGER.warning(
+                    "Checkpoint does not contain 'random_state'; random number generators cannot be restored "
+                    "for step-by-step equivalence."
+                )
+
             self.stn_checkpoint = None
+        else:
+            if hasattr(self, "scheduler") and (
+                not hasattr(self.scheduler, "last_epoch") or self.scheduler.last_epoch < 0
+            ):
+                self.scheduler.last_epoch = self.start_epoch - 1
 
         YAML.save(self.save_dir / "args.yaml", vars(self.args))
         YAML.save(self.save_dir / "stn_config.yaml", self.stn_cfg)
@@ -360,7 +397,7 @@ class STNTrainer(DetectionTrainer):
     def validate(self):
         """Evaluate STN defense on validation dataset and return robust metrics dictionary."""
         if (self.epoch + 1) % self.stn_cfg["val_interval"] != 0 and (self.epoch + 1) < self.epochs:
-            return {}, 0.0
+            return {}, None
 
         self.stn.eval()
         self.validator.data = self.data
@@ -381,10 +418,26 @@ class STNTrainer(DetectionTrainer):
 
     def save_model(self):
         """Save dedicated STN checkpoints; best.pt is selected by validation Worst-of-k mAP50-95."""
+        # 1. Evaluate current valid fitness and determine is_best BEFORE constructing checkpoint
+        is_best = False
+        has_valid_val = (
+            self.fitness is not None
+            and isinstance(self.fitness, (int, float, np.floating, np.integer))
+            and np.isfinite(self.fitness)
+        )
+        if has_valid_val:
+            current_fitness = float(self.fitness)
+            if self.best_fitness is None or current_fitness > self.best_fitness:
+                self.best_fitness = current_fitness
+                is_best = True
+
+        # 2. Build single consistent checkpoint dictionary with updated self.best_fitness
         checkpoint = {
             "epoch": self.epoch,
             "stn": self.stn.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if hasattr(self, "scheduler") and self.scheduler else {},
+            "scaler": self.scaler.state_dict() if hasattr(self, "scaler") and self.scaler else {},
             "best_fitness": self.best_fitness,
             "train_args": vars(self.args),
             "stn_config": self.stn_cfg,
@@ -409,19 +462,18 @@ class STNTrainer(DetectionTrainer):
             },
         }
 
-        # Save last.pt
+        # 3. Save last.pt
+        self.wdir.mkdir(parents=True, exist_ok=True)
         last_path = self.wdir / "last.pt"
         torch.save(checkpoint, last_path)
 
-        # Update best.pt if Worst-of-k mAP50-95 improved
-        current_fitness = float(self.fitness) if self.fitness is not None else 0.0
-        if current_fitness > self.best_fitness:
-            self.best_fitness = current_fitness
-            checkpoint["best_fitness"] = self.best_fitness
+        # 4. Save best.pt if improved
+        if is_best:
             best_path = self.wdir / "best.pt"
             torch.save(checkpoint, best_path)
-            LOGGER.info(f"STN new best checkpoint saved: Worst-of-k mAP50-95={current_fitness:.5f}")
+            LOGGER.info(f"STN new best checkpoint saved: Worst-of-k mAP50-95={self.best_fitness:.5f}")
 
+        # 5. Periodic checkpoint save
         if self.save_period > 0 and (self.epoch + 1) % self.save_period == 0:
             torch.save(checkpoint, self.wdir / f"epoch{self.epoch + 1}.pt")
         return True

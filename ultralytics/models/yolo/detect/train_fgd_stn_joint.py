@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import random
 from pathlib import Path
@@ -558,7 +559,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
         self.validator = self.get_validator()
         self.loss_names = ("total_loss", "fgd_loss", "geom_loss", "recon_loss", "det_loss", "identity_loss")
         self.metrics = {}
-        self.best_fitness = 0.0
+        self.best_fitness = None
 
         # 8. Load checkpoint state if resuming
         if self.joint_checkpoint is not None:
@@ -575,42 +576,78 @@ class JointFGDSTNTrainer(DetectionTrainer):
             elif "optimizer" in ckpt:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
 
-            if "scheduler_state_dict" in ckpt and hasattr(self, "scheduler") and self.scheduler:
-                self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            scheduler_restored = False
+            sched_st = ckpt.get("scheduler_state_dict", ckpt.get("scheduler"))
+            if sched_st and hasattr(self, "scheduler") and self.scheduler:
+                self.scheduler.load_state_dict(sched_st)
+                scheduler_restored = True
 
-            if "scaler_state_dict" in ckpt and hasattr(self, "scaler") and self.scaler:
-                self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-
-            if "random_state" in ckpt:
-                rnd = ckpt["random_state"]
-                if "torch" in rnd:
-                    torch.set_rng_state(rnd["torch"])
-                if torch.cuda.is_available() and rnd.get("cuda") is not None:
-                    torch.cuda.set_rng_state_all(rnd["cuda"])
-                if "numpy" in rnd:
-                    np.random.set_state(rnd["numpy"])
-                if "python" in rnd:
-                    random.setstate(rnd["python"])
-                if "dataloader" in rnd and rnd["dataloader"] is not None:
-                    if hasattr(self, "train_loader") and getattr(self.train_loader, "generator", None) is not None:
-                        self.train_loader.generator.set_state(rnd["dataloader"])
+            scaler_st = ckpt.get("scaler_state_dict", ckpt.get("scaler"))
+            if scaler_st and hasattr(self, "scaler") and self.scaler:
+                self.scaler.load_state_dict(scaler_st)
+            elif getattr(self, "amp", False):
+                LOGGER.warning(
+                    "Checkpoint does not contain 'scaler_state_dict'; amp scaler cannot be exactly restored."
+                )
 
             if "attacker_state" in ckpt or "attackers_state" in ckpt:
                 atk_st = ckpt.get("attacker_state", ckpt.get("attackers_state", {}))
                 for att_name, st in atk_st.items():
-                    if att_name in self.attackers and hasattr(self.attackers[att_name], "load_state_dict"):
+                    if (
+                        att_name in self.attackers
+                        and hasattr(self.attackers[att_name], "load_state_dict")
+                        and st is not None
+                    ):
                         self.attackers[att_name].load_state_dict(st)
+            else:
+                LOGGER.warning("Checkpoint does not contain 'attacker_state'; attackers cannot be restored.")
 
             self.start_epoch = ckpt["epoch"] + 1
-            self.best_fitness = float(ckpt.get("best_fitness", 0.0))
+            bf = ckpt.get("best_fitness")
+            self.best_fitness = float(bf) if bf is not None else None
             if self.start_epoch >= self.epochs:
                 raise ValueError(
                     f"--epochs ({self.epochs}) must be greater than completed checkpoint epochs ({self.start_epoch})."
                 )
-            self.joint_checkpoint = None
 
-        if hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
-            self.scheduler.last_epoch = self.start_epoch - 1
+            if not scheduler_restored and hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
+                LOGGER.warning(
+                    "Checkpoint does not contain scheduler state; setting last_epoch from start_epoch. "
+                    "Step-by-step equivalence cannot be guaranteed."
+                )
+                self.scheduler.last_epoch = self.start_epoch - 1
+
+            # Restore RNG states as the final step before training begins
+            if ckpt.get("random_state"):
+                rnd = ckpt["random_state"]
+                if "torch" in rnd and rnd["torch"] is not None:
+                    torch.set_rng_state(rnd["torch"])
+                if torch.cuda.is_available() and rnd.get("cuda") is not None:
+                    with contextlib.suppress(RuntimeError, TypeError, ValueError):
+                        torch.cuda.set_rng_state_all(rnd["cuda"])
+                if "numpy" in rnd and rnd["numpy"] is not None:
+                    np.random.set_state(rnd["numpy"])
+                if "python" in rnd and rnd["python"] is not None:
+                    random.setstate(rnd["python"])
+                if (
+                    "dataloader" in rnd
+                    and rnd["dataloader"] is not None
+                    and hasattr(self, "train_loader")
+                    and getattr(self.train_loader, "generator", None) is not None
+                ):
+                    self.train_loader.generator.set_state(rnd["dataloader"])
+            else:
+                LOGGER.warning(
+                    "Checkpoint does not contain 'random_state'; random number generators cannot be restored "
+                    "for step-by-step equivalence."
+                )
+
+            self.joint_checkpoint = None
+        else:
+            if hasattr(self, "scheduler") and (
+                not hasattr(self.scheduler, "last_epoch") or self.scheduler.last_epoch < 0
+            ):
+                self.scheduler.last_epoch = self.start_epoch - 1
 
         # Ensure defense modules remain trainable after resuming
         self.denoiser.train().requires_grad_(True)
@@ -873,10 +910,10 @@ class JointFGDSTNTrainer(DetectionTrainer):
         }
         return validator
 
-    def validate(self) -> tuple[dict, float]:
+    def validate(self) -> tuple[dict, float | None]:
         """Run periodic validation and compute robust fitness from weighted mAP50-95."""
         if (self.epoch + 1) % self.val_interval != 0 and (self.epoch + 1) < self.epochs:
-            return {}, 0.0
+            return {}, None
 
         # Temporarily switch defense modules to eval mode
         self.denoiser.eval().requires_grad_(False)
@@ -939,6 +976,20 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
     def save_model(self) -> bool:
         """Save joint checkpoint and standalone FGD and STN checkpoints."""
+        # 1. Evaluate current valid fitness and determine is_best BEFORE constructing checkpoint
+        is_best = False
+        has_valid_val = (
+            self.fitness is not None
+            and isinstance(self.fitness, (int, float, np.floating, np.integer))
+            and np.isfinite(self.fitness)
+        )
+        if has_valid_val:
+            current_fitness = float(self.fitness)
+            if self.best_fitness is None or current_fitness > self.best_fitness:
+                self.best_fitness = current_fitness
+                is_best = True
+
+        # 2. Build single consistent checkpoint dictionary with updated self.best_fitness
         checkpoint = {
             "epoch": self.epoch,
             "fgd_state_dict": self.denoiser.state_dict(),
@@ -1007,24 +1058,20 @@ class JointFGDSTNTrainer(DetectionTrainer):
             },
         }
 
-        # Save last.pt
+        # 3. Save last.pt and export standalone last checkpoints
+        self.wdir.mkdir(parents=True, exist_ok=True)
         last_path = self.wdir / "last.pt"
         torch.save(checkpoint, last_path)
-
-        # Export standalone last checkpoints
         export_joint_checkpoint(checkpoint, output_dir=self.wdir, prefix="last_")
 
-        # Update best.pt if fitness improved
-        current_fitness = float(self.fitness) if self.fitness is not None else 0.0
-        if current_fitness > self.best_fitness:
-            self.best_fitness = current_fitness
-            checkpoint["best_fitness"] = self.best_fitness
+        # 4. Save best.pt and export standalone best checkpoints if improved
+        if is_best:
             best_path = self.wdir / "best.pt"
             torch.save(checkpoint, best_path)
             export_joint_checkpoint(checkpoint, output_dir=self.wdir, prefix="best_")
             LOGGER.info(f"Saving new best joint checkpoint: robust fitness={self.best_fitness:.4f}")
 
-        # Periodic checkpoint save
+        # 5. Periodic checkpoint save
         if self.save_period > 0 and (self.epoch + 1) % self.save_period == 0:
             torch.save(checkpoint, self.wdir / f"epoch{self.epoch + 1}.pt")
 
