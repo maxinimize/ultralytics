@@ -89,6 +89,7 @@ class DetectionValidator(BaseValidator):
         args=None,
         _callbacks=None,
         attack_weights: str | Path | None = None,
+        strict_attacks: bool = True,
     ) -> None:
         """Initialize detection validator with necessary variables and settings.
 
@@ -98,34 +99,53 @@ class DetectionValidator(BaseValidator):
             args (dict[str, Any], optional): Arguments for the validator.
             _callbacks (list[Any], optional): List of callback functions.
             attack_weights (str | Path | None, optional): Surrogate weights source ('current' or checkpoint path).
+            strict_attacks (bool, optional): Whether to abort immediately on adversarial generation failure.
         """
         attack_names = []
         attack_ratios = []
         eval_weights = None
         raw_attack_weights = attack_weights
+        raw_strict = strict_attacks
         if isinstance(args, dict):
             raw_attack_name = args.pop("attack_name", None)
+            raw_attack_names = args.pop("attack_names", None)
             raw_ratio = args.pop("ratio", None)
+            raw_ratios = args.pop("ratios", None)
             raw_eval_w = args.pop("eval_weights", None)
             raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
+            raw_strict = args.pop("strict_attacks", raw_strict)
             if raw_attack_name is not None:
                 attack_names = parse_list_arg(raw_attack_name, str)
+            elif raw_attack_names is not None:
+                attack_names = parse_list_arg(raw_attack_names, str)
             if raw_ratio is not None:
                 attack_ratios = parse_list_arg(raw_ratio, float)
+            elif raw_ratios is not None:
+                attack_ratios = parse_list_arg(raw_ratios, float)
             if raw_eval_w is not None:
                 eval_weights = raw_eval_w
         elif args is not None:
-            for k in ("attack_name", "ratio", "eval_weights", "attack_weights"):
+            for k in (
+                "attack_name",
+                "attack_names",
+                "ratio",
+                "ratios",
+                "eval_weights",
+                "attack_weights",
+                "strict_attacks",
+            ):
                 if hasattr(args, k):
                     val = getattr(args, k)
-                    if k == "attack_name" and val is not None:
+                    if k in ("attack_name", "attack_names") and val is not None:
                         attack_names = parse_list_arg(val, str)
-                    elif k == "ratio" and val is not None:
+                    elif k in ("ratio", "ratios") and val is not None:
                         attack_ratios = parse_list_arg(val, float)
                     elif k == "eval_weights" and val is not None:
                         eval_weights = val
                     elif k == "attack_weights" and val is not None:
                         raw_attack_weights = val
+                    elif k == "strict_attacks" and val is not None:
+                        raw_strict = val
                     try:
                         delattr(args, k)
                     except AttributeError:
@@ -143,6 +163,10 @@ class DetectionValidator(BaseValidator):
         self.attack_ratios = attack_ratios
         self.eval_weights = eval_weights
         self.attack_weights = raw_attack_weights
+        self.strict_attacks = (
+            raw_strict if isinstance(raw_strict, bool) else str(raw_strict).lower() in ("true", "1", "yes")
+        )
+        self.args.strict_attacks = self.strict_attacks
         self._fixed_surrogate = None
         self._fixed_surrogate_source = None
         self.last_attack_maps = {}
@@ -159,12 +183,16 @@ class DetectionValidator(BaseValidator):
             (dict): Dictionary containing validation statistics.
         """
         self.training = trainer is not None
-        if trainer is not None and getattr(self, "attack_weights", None) is None:
-            self.attack_weights = (
-                getattr(trainer, "attack_weights", None)
-                or getattr(trainer, "_attack_weights_arg", None)
-                or getattr(getattr(trainer, "args", None), "attack_weights", None)
-            )
+        if trainer is not None:
+            if hasattr(trainer, "strict_attacks"):
+                self.strict_attacks = bool(trainer.strict_attacks)
+                self.args.strict_attacks = self.strict_attacks
+            if getattr(self, "attack_weights", None) is None:
+                self.attack_weights = (
+                    getattr(trainer, "attack_weights", None)
+                    or getattr(trainer, "_attack_weights_arg", None)
+                    or getattr(getattr(trainer, "args", None), "attack_weights", None)
+                )
         augment = self.args.augment and (not self.training)
         if self.training:
             self.device = trainer.device
@@ -414,12 +442,25 @@ class DetectionValidator(BaseValidator):
 
             self.run_callbacks("on_val_end")
 
+            # Check for attack failures
+            if self.attack_failures:
+                if self.strict_attacks:
+                    raise RuntimeError(
+                        f"Adversarial generation failed during validation for attacks: {self.attack_failures}. "
+                        "Silent fallback to clean data is prohibited in strict mode."
+                    )
+                for f_att in self.attack_failures:
+                    if f_att in all_results:
+                        all_results[f_att]["metrics/mAP50-95(B)"] = 0.0
+                        all_results[f_att]["metrics/mAP50(B)"] = 0.0
+
             # Extract final metrics dict
             stats = self.metrics.results_dict
 
             # Fitness is computed strictly from fixed evaluation weights on attack mAP50-95 (Clean weight=0)
             fitness = sum(
-                norm_eval_weights.get(a, 0.0) * all_results.get(a, {}).get("metrics/mAP50-95(B)", 0.0)
+                norm_eval_weights.get(a, 0.0)
+                * (0.0 if a in self.attack_failures else all_results.get(a, {}).get("metrics/mAP50-95(B)", 0.0))
                 for a in eval_attacks
             )
             stats["fitness"] = float(fitness)
@@ -428,10 +469,16 @@ class DetectionValidator(BaseValidator):
             # Record individual attack mAPs into stats
             self.last_attack_maps = {}
             for run in unique_runs:
-                m50_95 = all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0)
+                if run in self.attack_failures:
+                    m50_95 = 0.0
+                    m50 = 0.0
+                    stats[f"metrics/attack_failed_{run}"] = 1.0
+                else:
+                    m50_95 = all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0)
+                    m50 = all_results.get(run, {}).get("metrics/mAP50(B)", 0.0)
                 self.last_attack_maps[run] = float(m50_95)
                 stats[f"metrics/mAP50-95(B)_{run}"] = float(m50_95)
-                stats[f"metrics/mAP50(B)_{run}"] = float(all_results.get(run, {}).get("metrics/mAP50(B)", 0.0))
+                stats[f"metrics/mAP50(B)_{run}"] = float(m50)
 
             if self.training:
                 # Compute weighted validation loss across attacks
@@ -610,9 +657,18 @@ class DetectionValidator(BaseValidator):
 
         val_attackers = {}
         for att in eval_attacks:
-            val_attackers[att] = build_attacker(att, model=val_attack_target, img_size=imgsz)
+            try:
+                val_attackers[att] = build_attacker(att, model=val_attack_target, img_size=imgsz)
+            except Exception as e:
+                if self.strict_attacks:
+                    raise RuntimeError(f"Failed to initialize validation attacker '{att}': {e}") from e
+                LOGGER.warning(f"Failed to initialize validation attacker '{att}': {e}")
         self.attackers = val_attackers
         self.attacker = val_attackers.get(eval_attacks[0], None)
+        if self.strict_attacks:
+            for att in eval_attacks:
+                if att not in self.attackers or self.attackers[att] is None:
+                    raise RuntimeError(f"Validation attacker for '{att}' was not initialized.")
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation."""
@@ -629,43 +685,74 @@ class DetectionValidator(BaseValidator):
             if attacker is None:
                 attacker = getattr(self, "attacker", None)
 
-            if attacker:
-                try:
-                    im_files = batch.get("im_file", [])
-                    if hasattr(attacker, "proxy_model"):
-                        attacker.proxy_model.current_paths = im_files
-                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                        attacker.estimator.model.current_paths = im_files
+            batch_i = getattr(self, "batch_i", 0)
+            if attacker is None:
+                self.attack_failures = getattr(self, "attack_failures", set())
+                self.attack_failures.add(attack_name)
+                msg = f"Attacker for '{attack_name}' was not initialized at batch {batch_i}. Cannot substitute clean data."
+                LOGGER.error(msg)
+                if self.strict_attacks:
+                    raise RuntimeError(msg)
+                return batch
 
-                    if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
-                        amp_ctx = autocast(torch.bfloat16, device=self.device.type)
-                    elif self.device.type == "cuda" and (
-                        getattr(self.args, "amp", False)
-                        or getattr(self.args, "half", False)
-                        or getattr(self.args, "quantize", None) == 16
-                    ):
-                        amp_ctx = autocast(True, device=self.device.type)
+            has_targets = "bboxes" in batch and batch["bboxes"] is not None and batch["bboxes"].numel() > 0
+            if not has_targets and attack_name != "worstk":
+                # Legitimate skip due to no targets
+                return batch
+
+            try:
+                im_files = batch.get("im_file", [])
+                if hasattr(attacker, "proxy_model"):
+                    attacker.proxy_model.current_paths = im_files
+                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                    attacker.estimator.model.current_paths = im_files
+
+                if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
+                    amp_ctx = autocast(torch.bfloat16, device=self.device.type)
+                elif self.device.type == "cuda" and (
+                    getattr(self.args, "amp", False)
+                    or getattr(self.args, "half", False)
+                    or getattr(self.args, "quantize", None) == 16
+                ):
+                    amp_ctx = autocast(True, device=self.device.type)
+                else:
+                    amp_ctx = autocast(False, device=self.device.type)
+
+                adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
+                with amp_ctx:
+                    if attack_name == "worstk" and callable(getattr(attacker, "forward_batch", None)):
+                        attacker.forward_batch(batch)
+                        imgs_adv = batch["img"]
                     else:
-                        amp_ctx = autocast(False, device=self.device.type)
-
-                    adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
-                    with amp_ctx:
                         imgs_adv = run_attack_on_batch(
                             attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
                         )
-                    if imgs_adv is not None:
-                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                        batch["img"] = imgs_adv_cast
-                        del imgs_adv, imgs_adv_cast
-                        torch.cuda.empty_cache()
-                except Exception as e:
-                    self.attack_failures = getattr(self, "attack_failures", set())
-                    self.attack_failures.add(attack_name)
-                    LOGGER.error(
-                        f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch."
+
+                if imgs_adv is None:
+                    raise RuntimeError(
+                        f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
                     )
-                    if getattr(self.args, "strict_attacks", False):
-                        raise
+                if not torch.isfinite(imgs_adv).all():
+                    raise RuntimeError(
+                        f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
+                    )
+                if imgs_adv.shape != batch["img"].shape:
+                    raise RuntimeError(
+                        f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
+                    )
+
+                imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
+                batch["img"] = imgs_adv_cast
+                del imgs_adv, imgs_adv_cast
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                self.attack_failures = getattr(self, "attack_failures", set())
+                self.attack_failures.add(attack_name)
+                msg = f"Adversarial generation failed for attack '{attack_name}' at batch {batch_i}: {e}"
+                LOGGER.error(msg)
+                if self.strict_attacks:
+                    raise RuntimeError(msg) from e
 
         denoiser = getattr(self, "denoiser", None)
         if denoiser is not None:

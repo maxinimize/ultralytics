@@ -821,6 +821,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         """Load optimizer, scaler, EMA, and stage metadata from checkpoint."""
         super()._load_checkpoint_state(ckpt)
         if ckpt:
+            if "strict_attacks" in ckpt:
+                self.strict_attacks = bool(ckpt["strict_attacks"])
+                self.args.strict_attacks = self.strict_attacks
             if "stage" in ckpt:
                 self.stage = int(ckpt["stage"])
                 self.args.stage = self.stage
@@ -890,6 +893,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             "stn_weights": str(self.stn_weights) if self.stn_weights else None,
             "adaptive_ratio": self.adaptive_ratio,
             "attack_through_preprocess": self.attack_through_preprocess,
+            "strict_attacks": getattr(self, "strict_attacks", True),
             "eval_weights": self.eval_weights,
             "date": datetime.now().astimezone().isoformat(),
             "version": __version__,
@@ -1109,6 +1113,14 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 self.group_batch_count[att] = 0
                 self.epoch_counts[att] = 0
 
+            self.epoch_attack_stats = {
+                "attempted": {att: 0 for att in self.attack_names},
+                "generated": {att: 0 for att in self.attack_names},
+                "skipped": {att: 0 for att in self.attack_names},
+                "failed": {att: 0 for att in self.attack_names},
+                "actual_raw": 0,
+            }
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 if self.stage == 1:
@@ -1139,11 +1151,36 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 with autocast(amp_dtype, device=self.device.type):
                     batch = self.preprocess_batch(batch)
 
-                    for st in batch.get("sample_type", []):
+                    sample_types = batch.get("sample_type", [])
+                    if not sample_types:
+                        sample_types = ["raw"] * batch["img"].shape[0]
+
+                    for st in sample_types:
                         if st in self.epoch_counts:
                             self.epoch_counts[st] += 1
 
                     sub_batches = self.split_batch_by_type(batch)
+
+                    if self.stage == 1:
+                        self.epoch_attack_stats["actual_raw"] += len(sample_types)
+                    else:
+                        if "raw" in sub_batches:
+                            self.epoch_attack_stats["actual_raw"] += len(sub_batches["raw"]["img"])
+
+                        for att in sub_batches:
+                            if att != "raw" and (
+                                not getattr(self, "attackers", None)
+                                or att not in self.attackers
+                                or self.attackers[att] is None
+                            ):
+                                n_sub = len(sub_batches[att]["img"])
+                                self.epoch_attack_stats["attempted"][att] += n_sub
+                                if self.strict_attacks:
+                                    raise RuntimeError(
+                                        f"Attacker '{att}' was not initialized for Stage 2 training at batch {i}."
+                                    )
+                                self.epoch_attack_stats["failed"][att] += n_sub
+                                self.epoch_attack_stats["actual_raw"] += n_sub
 
                     # 1. Generate adversarial images on-the-fly for Stage 2
                     if getattr(self, "attackers", None) and self.stage == 2:
@@ -1157,13 +1194,37 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                             for att, attacker in self.attackers.items():
                                 if att in sub_batches:
                                     sub_batch = sub_batches[att]
+                                    n_sub = len(sub_batch["img"])
+                                    self.epoch_attack_stats["attempted"][att] += n_sub
+
                                     has_targets = (
                                         "bboxes" in sub_batch
                                         and sub_batch["bboxes"] is not None
                                         and sub_batch["bboxes"].numel() > 0
                                     )
                                     if not has_targets and att != "worstk":
+                                        self.epoch_attack_stats["skipped"][att] += n_sub
+                                        self.epoch_attack_stats["actual_raw"] += n_sub
                                         continue
+
+                                    sub_backup = {
+                                        "img": sub_batch["img"].clone(),
+                                        "bboxes": (
+                                            sub_batch["bboxes"].clone()
+                                            if ("bboxes" in sub_batch and torch.is_tensor(sub_batch["bboxes"]))
+                                            else None
+                                        ),
+                                        "cls": (
+                                            sub_batch["cls"].clone()
+                                            if ("cls" in sub_batch and torch.is_tensor(sub_batch["cls"]))
+                                            else None
+                                        ),
+                                        "batch_idx": (
+                                            sub_batch["batch_idx"].clone()
+                                            if ("batch_idx" in sub_batch and torch.is_tensor(sub_batch["batch_idx"]))
+                                            else None
+                                        ),
+                                    }
 
                                     try:
                                         if hasattr(attacker, "proxy_model"):
@@ -1198,22 +1259,39 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                                                         attacker, sub_batch, label_policy="largest_box"
                                                     )
 
-                                        if imgs_adv is not None:
-                                            sub_batch["img"] = (
-                                                imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)
+                                        if imgs_adv is None:
+                                            raise RuntimeError(
+                                                f"Adversarial generation returned None for attack '{att}' at batch {i} on batch with targets."
                                             )
-                                            del imgs_adv
-                                        elif has_targets:
-                                            msg = f"Adversarial generation returned None for {att} on a batch with targets."
-                                            if self.strict_attacks:
-                                                raise RuntimeError(msg)
-                                            LOGGER.warning(msg)
+                                        if not torch.isfinite(imgs_adv).all():
+                                            raise RuntimeError(
+                                                f"Adversarial generation produced NaN or Inf for attack '{att}' at batch {i}."
+                                            )
+                                        if imgs_adv.shape != sub_backup["img"].shape:
+                                            raise RuntimeError(
+                                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {sub_backup['img'].shape} for attack '{att}' at batch {i}."
+                                            )
+
+                                        sub_batch["img"] = imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)
+                                        self.epoch_attack_stats["generated"][att] += n_sub
+                                        del imgs_adv
                                     except Exception as e:
                                         if self.strict_attacks:
                                             raise RuntimeError(
-                                                f"Adversarial generation failed during training for {att}: {e}"
+                                                f"Adversarial generation failed during training for attack '{att}' at batch {i}: {e}"
                                             ) from e
-                                        LOGGER.warning(f"Adversarial generation failed for {att}: {e}.")
+                                        LOGGER.warning(
+                                            f"Adversarial generation failed for attack '{att}' at batch {i}: {e}. Rolling back to raw."
+                                        )
+                                        sub_batch["img"] = sub_backup["img"]
+                                        if sub_backup["bboxes"] is not None:
+                                            sub_batch["bboxes"] = sub_backup["bboxes"]
+                                        if sub_backup["cls"] is not None:
+                                            sub_batch["cls"] = sub_backup["cls"]
+                                        if sub_backup["batch_idx"] is not None:
+                                            sub_batch["batch_idx"] = sub_backup["batch_idx"]
+                                        self.epoch_attack_stats["failed"][att] += n_sub
+                                        self.epoch_attack_stats["actual_raw"] += n_sub
                         finally:
                             if is_current_model:
                                 for p, state in zip(self.model.parameters(), param_grad_states):
@@ -1367,11 +1445,41 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                 assert self.epoch_counts.get("raw", 0) == total_epoch_samples, (
                     f"Stage 1 must contain exactly 100% raw samples! Counts: {self.epoch_counts}"
                 )
+                assert sum(self.epoch_attack_stats["attempted"].values()) == 0
+                assert sum(self.epoch_attack_stats["generated"].values()) == 0
+                assert sum(self.epoch_attack_stats["failed"].values()) == 0
+                assert self.epoch_attack_stats["actual_raw"] == total_epoch_samples
+
+            total_gen = sum(self.epoch_attack_stats["generated"].values())
+            assert total_gen + self.epoch_attack_stats["actual_raw"] == total_epoch_samples, (
+                f"Sample count conservation mismatch: generated ({total_gen}) + actual_raw ({self.epoch_attack_stats['actual_raw']}) != total planned ({total_epoch_samples})"
+            )
+            for att in self.attack_names:
+                att_cnt = self.epoch_attack_stats["attempted"][att]
+                gen_cnt = self.epoch_attack_stats["generated"][att]
+                skip_cnt = self.epoch_attack_stats["skipped"][att]
+                fail_cnt = self.epoch_attack_stats["failed"][att]
+                assert att_cnt == gen_cnt + skip_cnt + fail_cnt, (
+                    f"Attack count conservation violated for {att}: attempted ({att_cnt}) != gen ({gen_cnt}) + skip ({skip_cnt}) + fail ({fail_cnt})"
+                )
+
             if total_epoch_samples > 0 and RANK in {-1, 0}:
-                ratios = {t: self.epoch_counts[t] / total_epoch_samples for t in self.epoch_counts}
+                planned_ratios = {t: self.epoch_counts[t] / total_epoch_samples for t in self.epoch_counts}
+                actual_counts = {"raw": self.epoch_attack_stats["actual_raw"]}
+                for att in self.attack_names:
+                    actual_counts[att] = self.epoch_attack_stats["generated"][att]
+                total_actual = sum(actual_counts.values())
+                actual_ratios = {t: actual_counts[t] / total_actual for t in actual_counts} if total_actual > 0 else {}
                 LOGGER.info(
-                    f"Epoch {epoch + 1} processed sample ratios: "
-                    + ", ".join(f"{t}: {r:.3f}" for t, r in ratios.items())
+                    f"Epoch {epoch + 1} sample statistics (Planned vs Actual Executed):\n"
+                    f"  Planned:  "
+                    + ", ".join(f"{t}: {r:.3f} ({self.epoch_counts[t]})" for t, r in planned_ratios.items())
+                    + "\n"
+                    "  Actual:   "
+                    + ", ".join(f"{t}: {r:.3f} ({actual_counts[t]})" for t, r in actual_ratios.items())
+                    + "\n"
+                    f"  Details:  attempted={self.epoch_attack_stats['attempted']}, generated={self.epoch_attack_stats['generated']}, "
+                    f"skipped={self.epoch_attack_stats['skipped']}, failed={self.epoch_attack_stats['failed']}, actual_raw={self.epoch_attack_stats['actual_raw']}"
                 )
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}
@@ -1396,7 +1504,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             if self.stage == 2 and self.adaptive_controller is not None:
                 if RANK in {-1, 0}:
                     val_failures = getattr(self.validator, "attack_failures", set())
-                    if val_failures:
+                    if val_failures and self.strict_attacks:
                         raise RuntimeError(
                             f"Adversarial generation failed during validation for attacks: {val_failures}. "
                             "Cannot silently use Clean mAP or update Controller!"

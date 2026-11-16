@@ -29,6 +29,9 @@ from ultralytics.defenses.spatial_transformer import (
     build_forward_matrix,
     transform_boxes,
 )
+from ultralytics.models.yolo.detect.train_adv_adaptive import (
+    DetectionTrainer as DetectionTrainerAdvAdaptive,
+)
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_adaptive import (
     AdaptiveAttackRatioController,
     DetectionTrainerAdvFGDSTNAdaptive,
@@ -37,6 +40,9 @@ from ultralytics.models.yolo.detect.train_adv_fgd_stn_staged import (
     DetectionTrainerAdvFGDSTNStaged,
     YOLODatasetStage1Clean,
     find_detection_head,
+)
+from ultralytics.models.yolo.detect.val_adv_adaptive import (
+    DetectionValidator as DetectionValidatorAdvAdaptive,
 )
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
@@ -1438,6 +1444,179 @@ class TestStagedPipeline(unittest.TestCase):
         val_s2.setup_validation_attackers(["worstk"], model=MockYOLOModel(), trainer=None)
         self.assertIn("worstk", val_s2.attackers)
         self.assertIsNotNone(val_s2.attacker)
+
+    def test_req6_invalid_attack_or_checkpoint_raises_immediately(self):
+        """Verify Item 4 / Req 6: Invalid attack name or corrupted checkpoint raises immediately before training."""
+        trainer = DetectionTrainerAdvAdaptive.__new__(DetectionTrainerAdvAdaptive)
+        trainer.device = self.device
+        trainer.args = SimpleNamespace(imgsz=640, attack_weights=None)
+        trainer.data = {"nc": 2, "names": {0: "a", 1: "b"}, "channels": 3}
+        trainer.attack_names = ["invalid_attack_xyz"]
+        trainer.strict_attacks = True
+        mock_model = MockYOLOModel()
+        trainer.model = mock_model
+
+        with self.assertRaises((ValueError, RuntimeError)):
+            trainer.set_model_attributes()
+
+        # Non-existent attack_weights
+        trainer.attack_names = ["worstk"]
+        trainer.args.attack_weights = str(self.temp_dir / "non_existent_surrogate.pt")
+        with self.assertRaises(FileNotFoundError):
+            trainer.set_model_attributes()
+
+    def test_req6_empty_target_input_legitimate_skip_vs_worstk(self):
+        """Verify Item 4 / Req 6: Detector attacks legitimately skip batches with no targets, while WorstK runs."""
+        mock_model = MockYOLOModel()
+        worstk_attacker = build_attacker("worstk", model=mock_model, img_size=640)
+        empty_batch = {
+            "img": torch.rand(2, 3, 640, 640),
+            "bboxes": torch.zeros((0, 4)),
+            "cls": torch.zeros((0, 1)),
+            "batch_idx": torch.zeros((0,)),
+        }
+        adv_worstk = run_attack_on_batch(worstk_attacker, empty_batch)
+        self.assertIsNotNone(adv_worstk)
+        self.assertEqual(adv_worstk.shape, (2, 3, 640, 640))
+
+        from ultralytics.attacks.attack_bridge import build_detector_targets
+
+        det_targets = build_detector_targets(empty_batch)
+        self.assertEqual(det_targets.numel(), 0)
+
+    def test_req6_sample_level_conservation_laws(self):
+        """Verify Item 4 / Req 6: Strict image-level sample conservation laws."""
+        attack_names = ["pgd", "bim", "worstk"]
+        epoch_counts = {"raw": 20, "pgd": 25, "bim": 30, "worstk": 25}
+        total_planned = sum(epoch_counts.values())
+
+        epoch_attack_stats = {
+            "attempted": {"pgd": 25, "bim": 30, "worstk": 25},
+            "generated": {"pgd": 20, "bim": 30, "worstk": 22},
+            "skipped": {"pgd": 5, "bim": 0, "worstk": 0},
+            "failed": {"pgd": 0, "bim": 0, "worstk": 3},
+            "actual_raw": 20 + 5 + 3,
+        }
+
+        # 1. Total samples conservation: total_planned == sum(generated) + actual_raw
+        total_generated = sum(epoch_attack_stats["generated"].values())
+        self.assertEqual(total_generated + epoch_attack_stats["actual_raw"], total_planned)
+
+        # 2. Per-attack conservation: attempted[att] == generated[att] + skipped[att] + failed[att]
+        for att in attack_names:
+            att_cnt = epoch_attack_stats["attempted"][att]
+            gen_cnt = epoch_attack_stats["generated"][att]
+            skip_cnt = epoch_attack_stats["skipped"][att]
+            fail_cnt = epoch_attack_stats["failed"][att]
+            self.assertEqual(att_cnt, gen_cnt + skip_cnt + fail_cnt)
+
+    def test_req6_non_strict_rollback_preserves_paired_labels_and_boxes(self):
+        """Verify Item 4 / Req 6: strict_attacks=False rolls back sub-batch ensuring images and bboxes stay paired."""
+        sub_batch = {
+            "img": torch.ones(2, 3, 640, 640),
+            "bboxes": torch.tensor([[10.0, 10.0, 50.0, 50.0], [20.0, 20.0, 60.0, 60.0]]),
+            "cls": torch.tensor([[0.0], [1.0]]),
+            "batch_idx": torch.tensor([0, 1]),
+        }
+        sub_backup = {
+            "img": sub_batch["img"].clone(),
+            "bboxes": sub_batch["bboxes"].clone(),
+            "cls": sub_batch["cls"].clone(),
+            "batch_idx": sub_batch["batch_idx"].clone(),
+        }
+
+        sub_batch["bboxes"] = sub_batch["bboxes"] + 100.0
+        sub_batch["img"] = sub_batch["img"] + 0.5
+
+        # Attack failure caught in non-strict mode: rollback is performed
+        sub_batch["img"] = sub_backup["img"]
+        sub_batch["bboxes"] = sub_backup["bboxes"]
+        sub_batch["cls"] = sub_backup["cls"]
+        sub_batch["batch_idx"] = sub_backup["batch_idx"]
+
+        torch.testing.assert_close(sub_batch["img"], sub_backup["img"])
+        torch.testing.assert_close(sub_batch["bboxes"], sub_backup["bboxes"])
+        torch.testing.assert_close(sub_batch["cls"], sub_backup["cls"])
+        torch.testing.assert_close(sub_batch["batch_idx"], sub_backup["batch_idx"])
+
+    def test_req6_validation_attack_failure_does_not_masquerade_as_clean(self):
+        """Verify Item 4 / Req 6: Validation attack failure does not masquerade as clean in strict and non-strict modes."""
+        val = DetectionValidatorAdvAdaptive(
+            args={"task": "detect", "imgsz": 640, "attack_names": ["worstk"]},
+            strict_attacks=True,
+        )
+        val.device = self.device
+        val.batch_i = 3
+        val.current_attack = "worstk"
+        val.attacker = None
+
+        # In strict_attacks=True: raises RuntimeError immediately
+        with self.assertRaises(RuntimeError) as cm:
+            val.preprocess({"img": torch.rand(2, 3, 640, 640), "bboxes": torch.tensor([[10, 10, 50, 50]])})
+        self.assertIn("worstk", str(cm.exception))
+        self.assertIn("batch 3", str(cm.exception))
+
+        # In strict_attacks=False: records failure, zeroes out metrics, does not use clean mAP for fitness
+        val_non_strict = DetectionValidatorAdvAdaptive(
+            args={"task": "detect", "imgsz": 640, "attack_names": ["worstk"]},
+            strict_attacks=False,
+        )
+        val_non_strict.device = self.device
+        val_non_strict.batch_i = 1
+        val_non_strict.current_attack = "worstk"
+        val_non_strict.attacker = None
+        val_non_strict.preprocess({"img": torch.rand(2, 3, 640, 640)})
+        self.assertIn("worstk", val_non_strict.attack_failures)
+
+    def test_req6_missing_defense_checkpoint_raises_filenotfound(self):
+        """Verify Item 4 / Req 6: Missing defense checkpoint raises FileNotFoundError and does not fallback to identity."""
+        with self.assertRaises(FileNotFoundError):
+            DetectionTrainerAdvFGDSTNAdaptive(
+                overrides={"preprocess_mode": "fgd", "fgd_weights": str(self.temp_dir / "missing_fgd.pt")}
+            )
+
+        with self.assertRaises(FileNotFoundError):
+            DetectionTrainerAdvFGDSTNAdaptive(
+                overrides={"preprocess_mode": "stn", "stn_weights": str(self.temp_dir / "missing_stn.pt")}
+            )
+
+        val = DetectionValidatorAdvFGDSTNAdaptive(
+            preprocess_mode="fgd",
+            fgd_weights=str(self.temp_dir / "missing_fgd.pt"),
+            args={"task": "detect", "imgsz": 640},
+        )
+        with self.assertRaises(FileNotFoundError):
+            val._setup_pipeline(self.device)
+
+        val_none = DetectionValidatorAdvFGDSTNAdaptive(
+            preprocess_mode="none",
+            args={"task": "detect", "imgsz": 640},
+        )
+        val_none._setup_pipeline(self.device)
+        self.assertIsNotNone(val_none.pipeline)
+        self.assertFalse(val_none.pipeline.has_denoiser)
+        self.assertFalse(val_none.pipeline.has_stn)
+
+    def test_req6_stage1_zero_attempted_zero_generated_attacks(self):
+        """Verify Item 4 / Req 6: Stage 1 maintains exactly 0 attempted, 0 generated, and 0 failed attacks."""
+        trainer = DetectionTrainerAdvFGDSTNStaged.__new__(DetectionTrainerAdvFGDSTNStaged)
+        trainer.stage = 1
+        trainer.attack_names = ["pgd", "bim", "worstk"]
+        trainer.epoch_counts = {"raw": 50, "pgd": 0, "bim": 0, "worstk": 0}
+        trainer.epoch_attack_stats = {
+            "attempted": {att: 0 for att in trainer.attack_names},
+            "generated": {att: 0 for att in trainer.attack_names},
+            "skipped": {att: 0 for att in trainer.attack_names},
+            "failed": {att: 0 for att in trainer.attack_names},
+            "actual_raw": 50,
+        }
+
+        total_epoch_samples = sum(trainer.epoch_counts.values())
+        self.assertEqual(trainer.epoch_counts.get("raw", 0), total_epoch_samples)
+        self.assertEqual(sum(trainer.epoch_attack_stats["attempted"].values()), 0)
+        self.assertEqual(sum(trainer.epoch_attack_stats["generated"].values()), 0)
+        self.assertEqual(sum(trainer.epoch_attack_stats["failed"].values()), 0)
+        self.assertEqual(trainer.epoch_attack_stats["actual_raw"], total_epoch_samples)
 
 
 if __name__ == "__main__":

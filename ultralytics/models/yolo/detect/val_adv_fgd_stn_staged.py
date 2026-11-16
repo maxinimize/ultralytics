@@ -257,22 +257,34 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                                 attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
                             )
 
+                    batch_i = getattr(self, "batch_i", 0)
                     if imgs_adv is not None:
+                        if not torch.isfinite(imgs_adv).all():
+                            raise RuntimeError(
+                                f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
+                            )
+                        if imgs_adv.shape != batch["img"].shape:
+                            raise RuntimeError(
+                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
+                            )
                         batch["img"] = imgs_adv.to(batch["img"].dtype).to(self.device)
                     elif has_targets:
                         self.attack_failures.add(attack_name)
-                        msg = f"Adversarial generation returned None for attack '{attack_name}' on batch with targets."
+                        msg = f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
                         LOGGER.error(msg)
                         if self.strict_attacks:
                             raise RuntimeError(msg)
                 except Exception as e:
                     self.attack_failures.add(attack_name)
-                    LOGGER.error(f"Adversarial generation failed for attack '{attack_name}': {e}")
+                    batch_i = getattr(self, "batch_i", 0)
+                    msg = f"Adversarial generation failed for attack '{attack_name}' at batch {batch_i}: {e}"
+                    LOGGER.error(msg)
                     if self.strict_attacks:
-                        raise
+                        raise RuntimeError(msg) from e
             else:
+                batch_i = getattr(self, "batch_i", 0)
                 self.attack_failures.add(attack_name)
-                msg = f"Attacker for '{attack_name}' was not initialized. Cannot substitute clean data."
+                msg = f"Attacker for '{attack_name}' was not initialized at batch {batch_i}. Cannot substitute clean data."
                 LOGGER.error(msg)
                 if self.strict_attacks:
                     raise RuntimeError(msg)
@@ -579,6 +591,18 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             LOGGER.info(f"  {run:10s} -> mAP50-95: {m50_95:.5f}, mAP50: {m50:.5f}  {w_str}")
 
         self.run_callbacks("on_val_end")
+        # Check for attack failures
+        if self.attack_failures:
+            if self.strict_attacks:
+                raise RuntimeError(
+                    f"Adversarial generation failed during validation for attacks: {self.attack_failures}. "
+                    "Silent fallback is prohibited."
+                )
+            for f_att in self.attack_failures:
+                if f_att in all_results:
+                    all_results[f_att]["metrics/mAP50-95(B)"] = 0.0
+                    all_results[f_att]["metrics/mAP50(B)"] = 0.0
+
         stats = self.metrics.results_dict
 
         # Compute fitness
@@ -587,7 +611,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             LOGGER.info(f"Stage 1 fitness (Clean mAP50-95): {fitness:.5f}\n")
         else:
             fitness = sum(
-                norm_eval_weights.get(r, 0.0) * float(all_results.get(r, {}).get("metrics/mAP50-95(B)", 0.0))
+                norm_eval_weights.get(r, 0.0)
+                * (0.0 if r in self.attack_failures else float(all_results.get(r, {}).get("metrics/mAP50-95(B)", 0.0)))
                 for r in unique_runs
             )
             LOGGER.info(f"Stage 2 fitness (Weighted Clean + Attacks mAP50-95): {fitness:.5f}\n")
@@ -597,18 +622,16 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         # Record every individual metric
         self.last_attack_maps = {}
         for run in unique_runs:
-            m50_95 = float(all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0))
-            m50 = float(all_results.get(run, {}).get("metrics/mAP50(B)", 0.0))
+            if run in self.attack_failures:
+                m50_95 = 0.0
+                m50 = 0.0
+                stats[f"metrics/attack_failed_{run}"] = 1.0
+            else:
+                m50_95 = float(all_results.get(run, {}).get("metrics/mAP50-95(B)", 0.0))
+                m50 = float(all_results.get(run, {}).get("metrics/mAP50(B)", 0.0))
             self.last_attack_maps[run] = m50_95
             stats[f"metrics/mAP50-95(B)_{run}"] = m50_95
             stats[f"metrics/mAP50(B)_{run}"] = m50
-
-        # Check for attack failures
-        if self.attack_failures and self.strict_attacks:
-            raise RuntimeError(
-                f"Adversarial generation failed during validation for attacks: {self.attack_failures}. "
-                "Silent fallback is prohibited."
-            )
 
         return stats
 

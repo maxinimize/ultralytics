@@ -48,6 +48,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         attack_through_preprocess: bool = False,
         eval_weights: Sequence[float] | None = None,
         attack_weights: str | Path | None = None,
+        strict_attacks: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize validator with defense pipeline and preprocessing options."""
@@ -56,6 +57,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
         raw_stn_w = stn_weights
         raw_att_through = attack_through_preprocess
         raw_attack_weights = attack_weights
+        raw_strict = strict_attacks
 
         if isinstance(args, dict):
             raw_mode = args.pop("preprocess_mode", raw_mode)
@@ -63,8 +65,16 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             raw_stn_w = args.pop("stn_weights", raw_stn_w)
             raw_att_through = args.pop("attack_through_preprocess", raw_att_through)
             raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
+            raw_strict = args.pop("strict_attacks", raw_strict)
         elif args is not None:
-            for k in ("preprocess_mode", "fgd_weights", "stn_weights", "attack_through_preprocess", "attack_weights"):
+            for k in (
+                "preprocess_mode",
+                "fgd_weights",
+                "stn_weights",
+                "attack_through_preprocess",
+                "attack_weights",
+                "strict_attacks",
+            ):
                 if hasattr(args, k):
                     val = getattr(args, k)
                     if k == "preprocess_mode":
@@ -77,6 +87,8 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                         raw_att_through = val
                     elif k == "attack_weights":
                         raw_attack_weights = val
+                    elif k == "strict_attacks":
+                        raw_strict = val
                     try:
                         delattr(args, k)
                     except AttributeError:
@@ -88,6 +100,7 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             args=args,
             _callbacks=_callbacks,
             attack_weights=raw_attack_weights,
+            strict_attacks=raw_strict,
             **kwargs,
         )
 
@@ -99,6 +112,10 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             if isinstance(raw_att_through, bool)
             else str(raw_att_through).lower() in ("true", "1", "yes")
         )
+        self.strict_attacks = (
+            raw_strict if isinstance(raw_strict, bool) else str(raw_strict).lower() in ("true", "1", "yes")
+        )
+        self.args.strict_attacks = self.strict_attacks
 
         self.pipeline: FGDSTNPipeline | None = pipeline
         self.current_pred_matrix: torch.Tensor | None = None
@@ -110,18 +127,42 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
     def _setup_pipeline(self, device: torch.device):
         """Ensure pipeline is built and frozen on the active device."""
         if self.pipeline is None:
+            if self.preprocess_mode in {"fgd", "fgd_stn", "stn_fgd"} and (
+                not self.fgd_weights or not Path(self.fgd_weights).exists()
+            ):
+                raise FileNotFoundError(
+                    f"FGD checkpoint is required for preprocess_mode '{self.preprocess_mode}' but was not found at: "
+                    f"'{self.fgd_weights}'. Silent fallback to identity is prohibited."
+                )
+            if self.preprocess_mode in {"stn", "fgd_stn", "stn_fgd"} and (
+                not self.stn_weights or not Path(self.stn_weights).exists()
+            ):
+                raise FileNotFoundError(
+                    f"STN checkpoint is required for preprocess_mode '{self.preprocess_mode}' but was not found at: "
+                    f"'{self.stn_weights}'. Silent fallback to identity is prohibited."
+                )
+
             self.pipeline, _ = build_fgd_stn_pipeline(
                 fgd_weights=self.fgd_weights,
                 stn_weights=self.stn_weights,
                 device=device,
-                allow_identity_fallback=True,
+                allow_identity_fallback=False,
             )
+
+            if self.preprocess_mode in {"fgd", "fgd_stn", "stn_fgd"} and not self.pipeline.has_denoiser:
+                raise RuntimeError("FGD denoiser module failed to load from checkpoint!")
+            if self.preprocess_mode in {"stn", "fgd_stn", "stn_fgd"} and not self.pipeline.has_stn:
+                raise RuntimeError("STN module failed to load from checkpoint!")
+
         self.pipeline.to(device)
         self.pipeline.eval().requires_grad_(False)
 
     def __call__(self, trainer=None, model=None):
         """Execute multi-attack validation with configured defense preprocessing pipeline."""
         if trainer is not None:
+            if hasattr(trainer, "strict_attacks"):
+                self.strict_attacks = bool(trainer.strict_attacks)
+                self.args.strict_attacks = self.strict_attacks
             if hasattr(trainer, "preprocess_mode"):
                 self.preprocess_mode = canonicalize_mode(trainer.preprocess_mode)
             if hasattr(trainer, "fgd_weights"):
@@ -194,47 +235,67 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
             if attacker is None:
                 attacker = getattr(self, "attacker", None)
 
-            if attacker:
-                try:
-                    im_files = batch.get("im_file", [])
-                    if hasattr(attacker, "proxy_model"):
-                        attacker.proxy_model.current_paths = im_files
-                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                        attacker.estimator.model.current_paths = im_files
+            batch_i = getattr(self, "batch_i", 0)
+            if attacker is None:
+                self.attack_failures.add(attack_name)
+                msg = f"Attacker for '{attack_name}' was not initialized at batch {batch_i}. Cannot substitute clean data."
+                LOGGER.error(msg)
+                if self.strict_attacks:
+                    raise RuntimeError(msg)
+            else:
+                has_targets = "bboxes" in batch and batch["bboxes"] is not None and batch["bboxes"].numel() > 0
+                if not has_targets and attack_name != "worstk":
+                    # Legitimate skip due to no targets
+                    pass
+                else:
+                    try:
+                        im_files = batch.get("im_file", [])
+                        if hasattr(attacker, "proxy_model"):
+                            attacker.proxy_model.current_paths = im_files
+                        if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                            attacker.estimator.model.current_paths = im_files
 
-                    if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
-                        amp_ctx = autocast(torch.bfloat16, device=self.device.type)
-                    elif self.device.type == "cuda" and (
-                        getattr(self.args, "amp", False)
-                        or getattr(self.args, "half", False)
-                        or getattr(self.args, "quantize", None) == 16
-                    ):
-                        amp_ctx = autocast(True, device=self.device.type)
-                    else:
-                        amp_ctx = autocast(False, device=self.device.type)
-
-                    adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
-                    with amp_ctx:
-                        if attack_name == "worstk" and callable(getattr(attacker, "forward_batch", None)):
-                            attacker.forward_batch(batch)
-                            imgs_adv = batch["img"]
+                        if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
+                            amp_ctx = autocast(torch.bfloat16, device=self.device.type)
+                        elif self.device.type == "cuda" and (
+                            getattr(self.args, "amp", False)
+                            or getattr(self.args, "half", False)
+                            or getattr(self.args, "quantize", None) == 16
+                        ):
+                            amp_ctx = autocast(True, device=self.device.type)
                         else:
-                            imgs_adv = run_attack_on_batch(
-                                attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
+                            amp_ctx = autocast(False, device=self.device.type)
+
+                        adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
+                        with amp_ctx:
+                            if attack_name == "worstk" and callable(getattr(attacker, "forward_batch", None)):
+                                attacker.forward_batch(batch)
+                                imgs_adv = batch["img"]
+                            else:
+                                imgs_adv = run_attack_on_batch(
+                                    attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
+                                )
+
+                        if imgs_adv is None:
+                            raise RuntimeError(
+                                f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
+                            )
+                        if not torch.isfinite(imgs_adv).all():
+                            raise RuntimeError(
+                                f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
+                            )
+                        if imgs_adv.shape != batch["img"].shape:
+                            raise RuntimeError(
+                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
                             )
 
-                    if imgs_adv is not None:
                         batch["img"] = imgs_adv.to(batch["img"].dtype).to(self.device)
-                    else:
+                    except Exception as e:
                         self.attack_failures.add(attack_name)
-                        LOGGER.error(
-                            f"Adversarial generation returned None for {attack_name}. Cannot substitute clean data."
-                        )
-                except Exception as e:
-                    self.attack_failures.add(attack_name)
-                    LOGGER.error(f"Adversarial generation failed for {attack_name}: {e}. Attack failure recorded.")
-                    if getattr(self.args, "strict_attacks", False):
-                        raise
+                        msg = f"Adversarial generation failed for attack '{attack_name}' at batch {batch_i}: {e}"
+                        LOGGER.error(msg)
+                        if self.strict_attacks:
+                            raise RuntimeError(msg) from e
 
         _, _, h, w = batch["img"].shape
         self._current_hw = (h, w)
