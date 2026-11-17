@@ -358,6 +358,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         overrides.setdefault("optimizer", saved_args.get("optimizer", "AdamW"))
         overrides.setdefault("warmup_bias_lr", saved_args.get("warmup_bias_lr", 0.0))
         overrides.setdefault("save_period", saved_args.get("save_period", stage_save_period))
+        overrides["strict_attacks"] = self.strict_attacks
 
         # Attack source
         raw_att_w = overrides.get("attack_weights", attack_weights)

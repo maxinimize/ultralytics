@@ -19,6 +19,8 @@
   parameter .grad untouched. All 7 isolate_rng fallback and exception cases verified.
 - Test F: Real eval_weights normalization and non-zero multi-metric aggregation. 4-level priority without
   mutating caller dictionary/namespace. Zero-weight clean exclusion and accurate mathematical fitness calculation.
+- Test G: Native PGD numerical failure handling, strict error propagation, transaction rollback, and sample conservation.
+
 """
 
 from __future__ import annotations
@@ -148,9 +150,118 @@ class FaultyTrainer(DetectionTrainerAdvAdaptive):
         super().__init__(*args, **kwargs)
 
     def build_attacker(self, name, model, imgsz, seed=None):
+        effective_seed = getattr(self.args, "seed", None) if seed is None else seed
         if name == "worstk":
-            return FaultySpatialWorstOfK(model=model, img_size=imgsz, seed=seed or 42, fault_mode=self.fault_mode)
+            return FaultySpatialWorstOfK(model=model, img_size=imgsz, seed=effective_seed, fault_mode=self.fault_mode)
         return super().build_attacker(name, model, imgsz, seed=seed)
+
+
+class InjectedFaultLoss(torch.autograd.Function):
+    """Autograd function to inject NaN, Inf, or zero gradients for testing."""
+
+    @staticmethod
+    def forward(ctx, loss, fault_mode="nan_grad"):
+        ctx.fault_mode = fault_mode
+        return loss.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        mode = ctx.fault_mode
+        if mode == "nan_grad":
+            return torch.full_like(grad_output, float("nan")), None
+        elif mode == "inf_grad":
+            return torch.full_like(grad_output, float("inf")), None
+        elif mode == "zero_grad":
+            return torch.zeros_like(grad_output), None
+        return grad_output, None
+
+
+class FaultyPGD(ARTPGD):
+    """Injected faulty PGD attacker to test numerical failures and state preservation."""
+
+    def __init__(self, *args, fault_mode: str = "nan_grad", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fault_mode = fault_mode
+        self._wrap_loss()
+
+    def _wrap_loss(self):
+        orig_loss_fn = self.wrapped_model._loss_fn
+
+        def faulty_loss(batch, preds):
+            loss, items = orig_loss_fn(batch, preds)
+            if self.fault_mode == "none_loss":
+                return None, items
+            if self.fault_mode == "no_grad":
+                return loss.detach(), items
+            if self.fault_mode == "nan_loss":
+                return loss * float("nan"), items
+            if self.fault_mode in ("nan_grad", "inf_grad", "zero_grad"):
+                return InjectedFaultLoss.apply(loss, self.fault_mode), items
+            return loss, items
+
+        self.wrapped_model._loss_fn = faulty_loss
+
+
+def create_faulty_pgd_trainer_class(base_cls):
+    """Factory to create a trainer subclass that injects FaultyPGD."""
+
+    class FaultyPGDTrainer(base_cls):
+        def __init__(self, *args, fault_mode: str = "nan_grad", **kwargs):
+            self.fault_mode = fault_mode
+            super().__init__(*args, **kwargs)
+
+        def build_attacker(self, name, model, imgsz, seed=None):
+            effective_seed = getattr(self.args, "seed", None) if seed is None else seed
+            atk = super().build_attacker(name, model, imgsz, seed=effective_seed)
+            if name == "pgd" and self.fault_mode:
+                orig_loss_fn = atk.wrapped_model._loss_fn
+                m = self.fault_mode
+
+                def faulty_loss(batch, preds):
+                    loss, items = orig_loss_fn(batch, preds)
+                    if m == "none_loss":
+                        return None, items
+                    if m == "no_grad":
+                        return loss.detach(), items
+                    if m == "nan_loss":
+                        return loss * float("nan"), items
+                    if m in ("nan_grad", "inf_grad", "zero_grad"):
+                        return InjectedFaultLoss.apply(loss, m), items
+                    return loss, items
+
+                atk.wrapped_model._loss_fn = faulty_loss
+            return atk
+
+    return FaultyPGDTrainer
+
+
+class FaultyPGDValidator(DetectionValidatorAdvAdaptive):
+    """Validator subclass injecting faults into PGD attacker."""
+
+    def __init__(self, *args, fault_mode: str = "nan_grad", **kwargs):
+        self.fault_mode = fault_mode
+        super().__init__(*args, **kwargs)
+
+    def build_attacker(self, name: str, model: Any, imgsz: int, seed: int = 0):
+        atk = super().build_attacker(name, model=model, imgsz=imgsz, seed=seed)
+        if name == "pgd" and self.fault_mode:
+            orig_loss_fn = atk.wrapped_model._loss_fn
+            m = self.fault_mode
+
+            def faulty_loss(batch, preds):
+                loss, items = orig_loss_fn(batch, preds)
+                if m == "none_loss":
+                    return None, items
+                if m == "no_grad":
+                    return loss.detach(), items
+                if m == "nan_loss":
+                    return loss * float("nan"), items
+                if m in ("nan_grad", "inf_grad", "zero_grad"):
+                    return InjectedFaultLoss.apply(loss, m), items
+                return loss, items
+
+            atk.wrapped_model._loss_fn = faulty_loss
+        return atk
 
 
 class TestResearchTrainingIntegration(unittest.TestCase):
@@ -380,6 +491,15 @@ class TestResearchTrainingIntegration(unittest.TestCase):
             "mismatch with input" in err_msg or "input" in err_msg,
             f"Error message must include input shape information: {err_msg}",
         )
+
+        # 3. Verify seed=0 is preserved and not coerced to 42
+        m0 = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        tr_seed0 = FaultyTrainer(
+            overrides={"model": "yolo11n.yaml", "data": str(self.data_yaml), "seed": 0},
+            fault_mode="exception",
+        )
+        atk0 = tr_seed0.build_attacker("worstk", m0, 64)
+        self.assertEqual(atk0.seed, 0, "seed=0 must be preserved and not overridden to 42!")
 
     # -------------------------------------------------------------------------
     # Test C: Stage 1 Real 3-Epoch Continuous vs Resume Consistency
@@ -778,6 +898,331 @@ class TestResearchTrainingIntegration(unittest.TestCase):
         self.assertAlmostEqual(stats["metrics/mAP50-95(B)"], 0.40, places=5)
         self.assertAlmostEqual(stats["metrics/mAP50(B)"], 0.60, places=5)
         self.assertAlmostEqual(stats["fitness"], 0.40, places=5)
+
+    # -------------------------------------------------------------------------
+    # Test G: Native PGD Numerical Failures, Rollback, and Sample Conservation
+    # -------------------------------------------------------------------------
+    def test_g1_direct_pgd_numerical_failures_and_state_preservation(self):
+        """Test G1: Direct PGD numerical failure handling and state preservation:
+        1. NaN loss before grad raises FloatingPointError with iteration info.
+        2. Finite loss + NaN grad raises FloatingPointError with iteration info.
+        3. Finite loss + Inf grad raises FloatingPointError with iteration info.
+        4. Disconnected loss (no grad) raises RuntimeError with iteration info.
+        5. Loss is None raises RuntimeError.
+        6. Finite all-zero grad executes normally.
+        7. Model parameter .grad, requires_grad, and .training are preserved after failure.
+        8. Delayed fault at step 2/3 reports iteration 2/3.
+        """
+        model = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False).to(torch.device("cpu"))
+        model.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5)
+        model.init_criterion()
+        model.train()
+
+        # Set dummy grad on first parameter to verify preservation
+        first_param = next(model.parameters())
+        first_param.grad = torch.ones_like(first_param.data) * 0.42
+        orig_grad = first_param.grad.clone()
+        orig_req_grad = first_param.requires_grad
+        orig_training = model.training
+
+        x = torch.rand(2, 3, 64, 64)
+        y = torch.tensor([[0, 0, 0.5, 0.5, 0.2, 0.2]], dtype=torch.float32)
+
+        # 1. NaN loss
+        pgd_nan_loss = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="nan_loss")
+        with self.assertRaises(FloatingPointError) as ctx:
+            pgd_nan_loss.forward(x, y)
+        self.assertIn("iteration 0/3", str(ctx.exception))
+
+        # 2. NaN grad
+        pgd_nan_grad = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="nan_grad")
+        with self.assertRaises(FloatingPointError) as ctx:
+            pgd_nan_grad.forward(x, y)
+        self.assertIn("iteration 0/3", str(ctx.exception))
+
+        # 3. Inf grad
+        pgd_inf_grad = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="inf_grad")
+        with self.assertRaises(FloatingPointError) as ctx:
+            pgd_inf_grad.forward(x, y)
+        self.assertIn("iteration 0/3", str(ctx.exception))
+
+        # 4. Disconnected loss
+        pgd_no_grad = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="no_grad")
+        with self.assertRaises(RuntimeError) as ctx:
+            pgd_no_grad.forward(x, y)
+        self.assertTrue("requires_grad" in str(ctx.exception) or "require grad" in str(ctx.exception))
+
+        # 5. Loss is None
+        pgd_none_loss = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="none_loss")
+        with self.assertRaises(RuntimeError) as ctx:
+            pgd_none_loss.forward(x, y)
+        self.assertIn("None", str(ctx.exception))
+
+        # 6. All-zero grad executes normally
+        pgd_zero_grad = FaultyPGD(model, epsilon=8.0 / 255.0, epoch=3, fault_mode="zero_grad")
+        adv_zero = pgd_zero_grad.forward(x, y)
+        self.assertIsNotNone(adv_zero)
+        self.assertTrue((adv_zero >= 0.0).all() and (adv_zero <= 1.0).all())
+
+        # 7. Model state preservation verification
+        self.assertTrue(torch.equal(first_param.grad, orig_grad), "param.grad was modified during exception!")
+        self.assertEqual(first_param.requires_grad, orig_req_grad, "param.requires_grad was modified!")
+        self.assertEqual(model.training, orig_training, "model.training mode was not restored!")
+
+        # 8. Delayed fault reporting exact step
+        pgd_delayed = ARTPGD(model, epsilon=8.0 / 255.0, epoch=3)
+        orig_fn = pgd_delayed.wrapped_model._loss_fn
+        delayed_step = 0
+
+        def delayed_fault_fn(b, p):
+            nonlocal delayed_step
+            loss, items = orig_fn(b, p)
+            if delayed_step == 2:
+                loss = loss * float("nan")
+            delayed_step += 1
+            return loss, items
+
+        pgd_delayed.wrapped_model._loss_fn = delayed_fault_fn
+        with self.assertRaises(FloatingPointError) as ctx:
+            pgd_delayed.forward(x, y)
+        self.assertIn("iteration 2/3", str(ctx.exception))
+
+    def test_g2_trainer_pgd_numerical_failure_strict_and_non_strict(self):
+        """Test G2: Real trainer PGD numerical failure across all 3 defense trainers:
+        - DetectionTrainerAdvAdaptive
+        - DetectionTrainerAdvFGDSTNAdaptive
+        - DetectionTrainerAdvFGDSTNStaged (Stage 2)
+        Verify strict raises RuntimeError with iteration and batch info;
+        non-strict rolls back to raw, increments failed and actual_raw, and conserves total samples.
+        """
+        stage1_weights = self.temp_dir / "stage1_g2.pt"
+        base_model = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        torch.save({"model": base_model}, stage1_weights)
+
+        trainer_configs = [
+            (
+                create_faulty_pgd_trainer_class(DetectionTrainerAdvAdaptive),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 2,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g2_1"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": False,
+                    "save": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [1.0],
+                },
+            ),
+            (
+                create_faulty_pgd_trainer_class(DetectionTrainerAdvFGDSTNAdaptive),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 2,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g2_2"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": False,
+                    "save": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [1.0],
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                },
+            ),
+            (
+                create_faulty_pgd_trainer_class(DetectionTrainerAdvFGDSTNStaged),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 2,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g2_3"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": False,
+                    "save": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [1.0],
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                    "stage": 2,
+                    "stage1_weights": str(stage1_weights),
+                },
+            ),
+        ]
+
+        for trainer_cls, overrides in trainer_configs:
+            tr_name = trainer_cls.__mro__[1].__name__
+            with self.subTest(trainer=tr_name, mode="non_strict"):
+                cfg_non_strict = {**overrides, "strict_attacks": False}
+                trainer_ns = trainer_cls(overrides=cfg_non_strict, fault_mode="nan_grad")
+                trainer_ns.train()
+
+                stats = trainer_ns.epoch_attack_stats
+                failed_pgd = stats["failed"]["pgd"]
+                gen_pgd = stats["generated"]["pgd"]
+                actual_raw = stats["actual_raw"]
+
+                self.assertGreater(failed_pgd, 0, f"{tr_name} failed.pgd must be > 0!")
+                self.assertEqual(gen_pgd, 0, f"{tr_name} generated.pgd must be 0 on failure!")
+                self.assertEqual(actual_raw + gen_pgd, 4, f"{tr_name} total samples must equal dataset size (4)!")
+
+            with self.subTest(trainer=tr_name, mode="strict"):
+                cfg_strict = {**overrides, "strict_attacks": True}
+                trainer_s = trainer_cls(overrides=cfg_strict, fault_mode="nan_grad")
+                with self.assertRaises(RuntimeError) as ctx:
+                    trainer_s.train()
+
+                err_msg = str(ctx.exception)
+                self.assertIn("pgd", err_msg)
+                self.assertIn("batch 0", err_msg)
+                self.assertTrue(
+                    "iteration" in err_msg or "input_img_shape" in err_msg,
+                    f"Error message must include iteration or input shape: {err_msg}",
+                )
+
+    def test_g3_mixed_batch_fault_isolation_and_sample_conservation(self):
+        """Test G3: Mixed batch with 4 attacks (pgd, bim, mim, worstk) where PGD fails:
+        1. PGD rolls back to raw; BIM, MIM, and WorstK succeed.
+        2. Total executed batch samples is exactly conserved (actual_raw + generated == total).
+        """
+        ds_g3 = create_synthetic_dataset(self.temp_dir / "ds_g3", num_images=8, imgsz=64)
+        overrides = {
+            "model": "yolo11n.yaml",
+            "data": str(ds_g3),
+            "epochs": 1,
+            "imgsz": 64,
+            "batch": 8,
+            "workers": 0,
+            "device": "cpu",
+            "amp": False,
+            "project": str(self.temp_dir / "runs_g3"),
+            "name": "exp",
+            "plots": False,
+            "val": False,
+            "save": False,
+            "attack_name": ["pgd", "bim", "mim", "worstk"],
+            "attack_ratio": [0.25, 0.25, 0.25, 0.25],
+            "strict_attacks": False,
+        }
+        trainer_cls = create_faulty_pgd_trainer_class(DetectionTrainerAdvAdaptive)
+        trainer = trainer_cls(overrides=overrides, fault_mode="nan_grad")
+        trainer.train()
+
+        stats = trainer.epoch_attack_stats
+        self.assertGreater(stats["failed"]["pgd"], 0, "PGD must be recorded as failed!")
+        self.assertEqual(stats["generated"]["pgd"], 0, "PGD must have 0 generated samples!")
+        self.assertGreater(stats["generated"]["bim"], 0, "BIM must generate samples!")
+        self.assertGreater(stats["generated"]["mim"], 0, "MIM must generate samples!")
+        self.assertGreater(stats["generated"]["worstk"], 0, "WorstK must generate samples!")
+
+        total_executed = stats["actual_raw"] + sum(stats["generated"].values())
+        self.assertEqual(total_executed, 8, "Total batch samples must be conserved exactly at 8!")
+
+    def test_g4_validator_pgd_numerical_failure_strict_and_non_strict(self):
+        """Test G4: Validator fault handling on numerical failure:
+        1. Non-strict validator records attack_failures and assigns 0.0 mAP.
+        2. Strict validator raises RuntimeError identifying attack and batch.
+        """
+        ds_g4 = create_synthetic_dataset(self.temp_dir / "ds_g4", num_images=2, imgsz=64)
+        val_pt = self.temp_dir / "val_g4.pt"
+        m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        torch.save({"model": m}, val_pt)
+
+        # 1. Non-strict validator
+        args_ns = {
+            "model": str(val_pt),
+            "data": str(ds_g4),
+            "batch": 2,
+            "imgsz": 64,
+            "workers": 0,
+            "device": "cpu",
+            "plots": False,
+            "save_json": False,
+            "attack_name": ["pgd"],
+            "strict_attacks": False,
+        }
+        v_ns = FaultyPGDValidator(args=args_ns, fault_mode="nan_grad")
+        _ = v_ns(model=str(val_pt))
+        self.assertIn("pgd", v_ns.attack_failures, "attack_failures must include 'pgd'!")
+        self.assertEqual(v_ns.last_attack_maps.get("pgd"), 0.0, "Failed attack mAP must be 0.0!")
+
+        # 2. Strict validator
+        args_s = {
+            "model": str(val_pt),
+            "data": str(ds_g4),
+            "batch": 2,
+            "imgsz": 64,
+            "workers": 0,
+            "device": "cpu",
+            "plots": False,
+            "save_json": False,
+            "attack_name": ["pgd"],
+            "strict_attacks": True,
+        }
+        v_s = FaultyPGDValidator(args=args_s, fault_mode="nan_grad")
+        with self.assertRaises(RuntimeError) as ctx:
+            v_s(model=str(val_pt))
+        self.assertIn("pgd", str(ctx.exception), "Strict validator error must identify attack name!")
+
+    def test_g5_stage2_real_pipeline_four_attacks_normal_flow(self):
+        """Test G5: Stage 2 normal execution with 4 attacks (pgd, bim, mim, worstk) and real STN/FGD."""
+        ds_g5 = create_synthetic_dataset(self.temp_dir / "ds_g5", num_images=8, imgsz=64)
+        stage1_weights = self.temp_dir / "stage1_g5.pt"
+        base_model = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        torch.save({"model": base_model}, stage1_weights)
+
+        overrides = {
+            "model": "yolo11n.yaml",
+            "data": str(ds_g5),
+            "epochs": 1,
+            "imgsz": 64,
+            "batch": 8,
+            "workers": 0,
+            "device": "cpu",
+            "amp": False,
+            "project": str(self.temp_dir / "runs_stage2_g5"),
+            "name": "exp",
+            "plots": False,
+            "val": True,
+            "save": True,
+            "attack_name": ["pgd", "bim", "mim", "worstk"],
+            "attack_ratio": [0.25, 0.25, 0.25, 0.25],
+            "preprocess_mode": "stn_fgd",
+            "fgd_weights": str(self.fgd_path),
+            "stn_weights": str(self.stn_path),
+            "stage": 2,
+            "stage1_weights": str(stage1_weights),
+        }
+        trainer = DetectionTrainerAdvFGDSTNStaged(overrides=overrides)
+        trainer.train()
+
+        stats = trainer.epoch_attack_stats
+        for att in ("pgd", "bim", "mim", "worstk"):
+            self.assertGreater(stats["generated"][att], 0, f"Attack {att} must generate samples!")
+            self.assertEqual(stats["failed"][att], 0, f"Attack {att} must have 0 failed samples!")
+
+        self.assertTrue((trainer.wdir / "last.pt").exists(), "last.pt must exist!")
+        self.assertTrue((trainer.wdir / "best.pt").exists(), "best.pt must exist!")
 
 
 if __name__ == "__main__":

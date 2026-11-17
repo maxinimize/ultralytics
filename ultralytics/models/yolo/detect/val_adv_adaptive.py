@@ -913,10 +913,10 @@ class DetectionValidator(BaseValidator):
         val_attackers = {}
         for att in eval_attacks:
             try:
-                val_attackers[att] = build_attacker(
+                val_attackers[att] = self.build_attacker(
                     att,
                     model=val_attack_target,
-                    img_size=imgsz,
+                    imgsz=imgsz,
                     seed=val_seed,
                 )
             except Exception as e:
@@ -929,6 +929,10 @@ class DetectionValidator(BaseValidator):
             for att in eval_attacks:
                 if att not in self.attackers or self.attackers[att] is None:
                     raise RuntimeError(f"Validation attacker for '{att}' was not initialized.")
+
+    def build_attacker(self, name: str, model: Any, imgsz: int, seed: int = 0):
+        """Build an adversarial attacker for validation."""
+        return build_attacker(name, model=model, img_size=imgsz, seed=seed)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation."""

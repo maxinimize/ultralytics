@@ -189,6 +189,8 @@ class YoloV5ForART(nn.Module):
 
                 # call loss function
                 loss, _loss_items = self._loss_fn(batch, preds)
+                if loss is None:
+                    raise RuntimeError("Adversarial loss function returned None for input targets!")
 
                 # Ensure loss is scalar for backward()
                 final_loss = loss.sum()
@@ -342,15 +344,25 @@ class ARTPGD(Attacker):
 
         saved_states = capture_module_training_states(self.model)
         try:
-            for _ in range(max_iter):
+            for step in range(max_iter):
                 x_adv = x_adv.detach().requires_grad_(True)
                 out = wrapped(x_adv, y_art)
-                loss = out.get("loss")
-                if loss is None or not loss.requires_grad:
-                    break
+                loss = out.get("loss") if isinstance(out, dict) else None
+                if loss is None:
+                    raise RuntimeError(f"Adversarial loss is None at iteration {step}/{max_iter} for native PGD.")
+                if not loss.requires_grad:
+                    raise RuntimeError(
+                        f"Adversarial loss does not require grad at iteration {step}/{max_iter} for native PGD."
+                    )
+                if not torch.isfinite(loss).all():
+                    raise FloatingPointError(
+                        f"Adversarial loss is NaN/Inf at iteration {step}/{max_iter} for native PGD."
+                    )
                 grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0]
                 if not torch.isfinite(grad).all():
-                    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    raise FloatingPointError(
+                        f"Adversarial gradient is NaN/Inf at iteration {step}/{max_iter} for native PGD."
+                    )
 
                 # Step along gradient sign
                 x_adv = x_adv.detach() + eps_step * grad.sign()
