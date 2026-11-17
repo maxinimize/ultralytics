@@ -1605,7 +1605,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             if self.stage == 2 and self.adaptive_controller is not None:
                 if RANK in {-1, 0}:
                     val_failures = getattr(self.validator, "attack_failures", set())
-                    if val_failures and self.strict_attacks:
+                    if val_failures:
                         raise RuntimeError(
                             f"Adversarial generation failed during validation for attacks: {val_failures}. "
                             "Cannot silently use Clean mAP or update Controller!"

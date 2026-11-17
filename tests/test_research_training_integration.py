@@ -203,7 +203,7 @@ class FaultyPGD(ARTPGD):
 
 
 def create_faulty_pgd_trainer_class(base_cls):
-    """Factory to create a trainer subclass that injects FaultyPGD."""
+    """Factory to create a trainer subclass that injects FaultyPGD into training."""
 
     class FaultyPGDTrainer(base_cls):
         def __init__(self, *args, fault_mode: str = "nan_grad", **kwargs):
@@ -233,6 +233,34 @@ def create_faulty_pgd_trainer_class(base_cls):
             return atk
 
     return FaultyPGDTrainer
+
+
+def create_val_faulty_pgd_trainer_class(base_cls):
+    """Factory to create a trainer subclass that injects faults exclusively into the validation attacker."""
+
+    class ValFaultyPGDTrainer(base_cls):
+        def get_validator(self):
+            validator = super().get_validator()
+            orig_build = validator.build_attacker
+
+            def faulty_build(name, model, imgsz, seed=0):
+                atk = orig_build(name, model=model, imgsz=imgsz, seed=seed)
+                if name == "pgd":
+                    orig_loss = atk.wrapped_model._loss_fn
+
+                    def faulty_loss(batch, preds):
+                        loss, items = orig_loss(batch, preds)
+                        if not torch.isfinite(loss).all():
+                            raise ValueError("Expected original detection loss to be finite!")
+                        return InjectedFaultLoss.apply(loss, "nan_grad"), items
+
+                    atk.wrapped_model._loss_fn = faulty_loss
+                return atk
+
+            validator.build_attacker = faulty_build
+            return validator
+
+    return ValFaultyPGDTrainer
 
 
 class FaultyPGDValidator(DetectionValidatorAdvAdaptive):
@@ -1223,6 +1251,257 @@ class TestResearchTrainingIntegration(unittest.TestCase):
 
         self.assertTrue((trainer.wdir / "last.pt").exists(), "last.pt must exist!")
         self.assertTrue((trainer.wdir / "best.pt").exists(), "best.pt must exist!")
+
+    def test_g6_validation_failure_intercepts_controller_and_checkpoints(self):
+        """Test G6: Validation attack failure interception across all 3 adaptive trainers:
+        - DetectionTrainerAdvAdaptive
+        - DetectionTrainerAdvFGDSTNAdaptive
+        - DetectionTrainerAdvFGDSTNStaged (Stage 2)
+        Verifies:
+        1. Non-strict mode (strict_attacks=False):
+           a. train() raises RuntimeError identifying validation failure and 'pgd'.
+           b. validator.attack_failures contains 'pgd', and original detection loss was finite.
+           c. Training attack stats (failed.pgd) is 0, proving training was unaffected.
+           d. Controller state (current_train_ratios, next_train_ratios, last_updated_epoch, history)
+              is completely unchanged from before validation.
+           e. No checkpoint (best.pt or last.pt) is written.
+        2. Strict mode (strict_attacks=True):
+           Combination trainers raise RuntimeError on validation failure and write no checkpoint.
+        3. update_interval=5 (non-update epoch):
+           Validation failure is intercepted before saving model; no checkpoint or history written.
+        4. Healthy validation (no fault injection, legitimate mAP=0):
+           Completes normally, updates controller, and writes valid checkpoints.
+        """
+        ds_g6 = create_synthetic_dataset(self.temp_dir / "ds_g6", num_images=4, imgsz=64)
+        stage1_weights = self.temp_dir / "stage1_g6.pt"
+        base_model = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        torch.save({"model": base_model}, stage1_weights)
+
+        # 1. Non-strict mode across all 3 trainers
+        trainer_configs = [
+            (
+                create_val_faulty_pgd_trainer_class(DetectionTrainerAdvAdaptive),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(ds_g6),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 4,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g6_ns1"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": True,
+                    "save": True,
+                    "seed": 0,
+                    "p_clean": 0.5,
+                    "attack_name": ["pgd", "worstk"],
+                    "attack_ratio": [0.1, 0.4],
+                    "update_interval": 1,
+                    "strict_attacks": False,
+                },
+            ),
+            (
+                create_val_faulty_pgd_trainer_class(DetectionTrainerAdvFGDSTNAdaptive),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(ds_g6),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 4,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g6_ns2"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": True,
+                    "save": True,
+                    "seed": 0,
+                    "p_clean": 0.5,
+                    "attack_name": ["pgd", "worstk"],
+                    "attack_ratio": [0.1, 0.4],
+                    "update_interval": 1,
+                    "strict_attacks": False,
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                },
+            ),
+            (
+                create_val_faulty_pgd_trainer_class(DetectionTrainerAdvFGDSTNStaged),
+                {
+                    "model": "yolo11n.yaml",
+                    "data": str(ds_g6),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 4,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / "runs_g6_ns3"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": True,
+                    "save": True,
+                    "seed": 0,
+                    "p_clean": 0.5,
+                    "attack_name": ["pgd", "worstk"],
+                    "attack_ratio": [0.1, 0.4],
+                    "update_interval": 1,
+                    "strict_attacks": False,
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                    "stage": 2,
+                    "stage1_weights": str(stage1_weights),
+                },
+            ),
+        ]
+
+        for trainer_cls, overrides in trainer_configs:
+            tr_name = trainer_cls.__mro__[1].__name__
+            with self.subTest(trainer=tr_name, scenario="non_strict_val_fault"):
+                trainer = trainer_cls(overrides=overrides)
+                init_ratios = dict(trainer.adaptive_controller.current_train_ratios)
+                init_history = list(trainer.adaptive_controller.history)
+                init_epoch = trainer.adaptive_controller.last_updated_epoch
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    trainer.train()
+
+                err_msg = str(ctx.exception)
+                self.assertIn("pgd", err_msg.lower())
+                self.assertTrue("fail" in err_msg.lower() or "validation" in err_msg.lower())
+
+                # b. Validator recorded attack failure
+                val_failures = getattr(trainer.validator, "attack_failures", set())
+                self.assertIn("pgd", val_failures)
+
+                # c. Training attacks had 0 failures
+                train_failed = trainer.epoch_attack_stats["failed"].get("pgd", 0)
+                self.assertEqual(train_failed, 0)
+
+                # d. Controller state untouched
+                self.assertEqual(trainer.adaptive_controller.current_train_ratios, init_ratios)
+                self.assertEqual(trainer.adaptive_controller.history, init_history)
+                self.assertEqual(trainer.adaptive_controller.last_updated_epoch, init_epoch)
+
+                # e. No checkpoints written
+                self.assertFalse(
+                    (trainer.wdir / "best.pt").exists(), "best.pt must not be saved on validation failure!"
+                )
+                self.assertFalse(
+                    (trainer.wdir / "last.pt").exists(), "last.pt must not be saved on validation failure!"
+                )
+
+        # 2. Strict mode across combination trainers
+        for base_cls in (DetectionTrainerAdvFGDSTNAdaptive, DetectionTrainerAdvFGDSTNStaged):
+            with self.subTest(trainer=base_cls.__name__, scenario="strict_val_fault"):
+                trainer_cls = create_val_faulty_pgd_trainer_class(base_cls)
+                ov_strict = {
+                    "model": "yolo11n.yaml",
+                    "data": str(ds_g6),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 4,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "project": str(self.temp_dir / f"runs_g6_str_{base_cls.__name__}"),
+                    "name": "exp",
+                    "plots": False,
+                    "val": True,
+                    "save": True,
+                    "seed": 0,
+                    "p_clean": 0.5,
+                    "attack_name": ["pgd", "worstk"],
+                    "attack_ratio": [0.1, 0.4],
+                    "update_interval": 1,
+                    "strict_attacks": True,
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                }
+                if base_cls is DetectionTrainerAdvFGDSTNStaged:
+                    ov_strict["stage"] = 2
+                    ov_strict["stage1_weights"] = str(stage1_weights)
+
+                trainer_s = trainer_cls(overrides=ov_strict)
+                with self.assertRaises(RuntimeError):
+                    trainer_s.train()
+                self.assertFalse((trainer_s.wdir / "best.pt").exists())
+
+        # 3. update_interval=5 (non-update epoch) interception
+        with self.subTest(scenario="non_update_epoch_interception"):
+            trainer_cls = create_val_faulty_pgd_trainer_class(DetectionTrainerAdvFGDSTNStaged)
+            ov_no_update = {
+                "model": "yolo11n.yaml",
+                "data": str(ds_g6),
+                "epochs": 1,
+                "imgsz": 64,
+                "batch": 4,
+                "workers": 0,
+                "device": "cpu",
+                "amp": False,
+                "project": str(self.temp_dir / "runs_g6_no_upd"),
+                "name": "exp",
+                "plots": False,
+                "val": True,
+                "save": True,
+                "seed": 0,
+                "p_clean": 0.5,
+                "attack_name": ["pgd", "worstk"],
+                "attack_ratio": [0.1, 0.4],
+                "update_interval": 5,
+                "strict_attacks": False,
+                "preprocess_mode": "stn_fgd",
+                "fgd_weights": str(self.fgd_path),
+                "stn_weights": str(self.stn_path),
+                "stage": 2,
+                "stage1_weights": str(stage1_weights),
+            }
+            trainer_nu = trainer_cls(overrides=ov_no_update)
+            with self.assertRaises(RuntimeError):
+                trainer_nu.train()
+            self.assertFalse((trainer_nu.wdir / "best.pt").exists())
+            self.assertEqual(len(trainer_nu.adaptive_controller.history), 0)
+
+        # 4. Healthy validation (no fault injection, legitimate mAP=0): completes and saves
+        with self.subTest(scenario="healthy_validation_completes"):
+            ov_healthy = {
+                "model": "yolo11n.yaml",
+                "data": str(ds_g6),
+                "epochs": 1,
+                "imgsz": 64,
+                "batch": 4,
+                "workers": 0,
+                "device": "cpu",
+                "amp": False,
+                "project": str(self.temp_dir / "runs_g6_healthy"),
+                "name": "exp",
+                "plots": False,
+                "val": True,
+                "save": True,
+                "seed": 0,
+                "p_clean": 0.5,
+                "attack_name": ["pgd", "worstk"],
+                "attack_ratio": [0.1, 0.4],
+                "update_interval": 1,
+                "strict_attacks": False,
+                "preprocess_mode": "stn_fgd",
+                "fgd_weights": str(self.fgd_path),
+                "stn_weights": str(self.stn_path),
+                "stage": 2,
+                "stage1_weights": str(stage1_weights),
+            }
+            trainer_h = DetectionTrainerAdvFGDSTNStaged(overrides=ov_healthy)
+            trainer_h.train()
+            self.assertTrue((trainer_h.wdir / "best.pt").exists(), "Healthy run must save best.pt!")
+            self.assertTrue((trainer_h.wdir / "last.pt").exists(), "Healthy run must save last.pt!")
+            self.assertEqual(len(trainer_h.adaptive_controller.history), 1)
 
 
 if __name__ == "__main__":
