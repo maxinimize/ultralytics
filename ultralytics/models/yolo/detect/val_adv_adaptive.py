@@ -207,7 +207,7 @@ class DetectionValidator(BaseValidator):
         self.metrics = AdversarialDetMetrics()
         self.attack_names = attack_names
         self.attack_ratios = attack_ratios
-        self.eval_weights = eval_weights
+        self.eval_weights = raw_eval_w
         self.attack_weights = raw_attack_weights
         self.strict_attacks = (
             raw_strict if isinstance(raw_strict, bool) else str(raw_strict).lower() in ("true", "1", "yes")
@@ -436,6 +436,30 @@ class DetectionValidator(BaseValidator):
         with isolate_rng(seed=val_seed, attackers=active_attackers, dataloader=dl):
             return self._execute_validation(trainer=trainer, model=model)
 
+    def compute_norm_eval_weights(self, eval_attacks: list[str]) -> dict[str, float]:
+        """Parse and normalize evaluation weights across non-clean attacks with Clean=0.0."""
+        raw_eval_w = getattr(self, "eval_weights", None) or getattr(getattr(self, "args", None), "eval_weights", None)
+        eval_weights_dict = {}
+        if isinstance(raw_eval_w, dict):
+            eval_weights_dict = {str(k).lower().strip(): float(v) for k, v in raw_eval_w.items()}
+        elif raw_eval_w is not None:
+            parsed_eval_w = parse_list_arg(raw_eval_w, float)
+            for k, w in zip(eval_attacks, parsed_eval_w):
+                eval_weights_dict[k] = float(w)
+
+        default_fixed_weights = {"pgd": 0.25, "bim": 0.15, "mim": 0.15, "worstk": 0.20}
+        for k, v in default_fixed_weights.items():
+            if k not in eval_weights_dict:
+                eval_weights_dict[k] = v
+
+        w_sum = sum(eval_weights_dict.get(a, 0.0) for a in eval_attacks)
+        if w_sum > 0:
+            norm_eval_weights = {a: eval_weights_dict.get(a, 0.0) / w_sum for a in eval_attacks}
+        else:
+            norm_eval_weights = {a: 1.0 / len(eval_attacks) for a in eval_attacks} if eval_attacks else {}
+        norm_eval_weights["raw"] = 0.0
+        return norm_eval_weights
+
     def _execute_validation(self, trainer=None, model=None):
         self.training = trainer is not None
         if trainer is not None:
@@ -538,27 +562,11 @@ class DetectionValidator(BaseValidator):
         eval_attacks = [a for a in unique_runs if a != "raw"]
 
         # Parse fixed evaluation weights: spec requires PGD=.25 BIM=.15 MIM=.15 worstk=.20, Clean=0.0
-        raw_eval_w = getattr(self, "eval_weights", None) or getattr(self.args, "eval_weights", None)
-        eval_weights_dict = {}
-        if isinstance(raw_eval_w, dict):
-            eval_weights_dict = {str(k).lower().strip(): float(v) for k, v in raw_eval_w.items()}
-        elif raw_eval_w is not None:
-            parsed_eval_w = parse_list_arg(raw_eval_w, float)
-            for k, w in zip(eval_attacks, parsed_eval_w):
-                eval_weights_dict[k] = float(w)
-
-        default_fixed_weights = {"pgd": 0.25, "bim": 0.15, "mim": 0.15, "worstk": 0.20}
-        for k, v in default_fixed_weights.items():
-            if k not in eval_weights_dict:
-                eval_weights_dict[k] = v
-
-        # Normalize weights over non-clean attacks; Clean weight is strictly 0.0
-        w_sum = sum(eval_weights_dict.get(a, 0.0) for a in eval_attacks)
-        if w_sum > 0:
-            norm_eval_weights = {a: eval_weights_dict.get(a, 0.0) / w_sum for a in eval_attacks}
-        else:
-            norm_eval_weights = {a: 1.0 / len(eval_attacks) for a in eval_attacks} if eval_attacks else {}
-        norm_eval_weights["raw"] = 0.0
+        norm_eval_weights = self.compute_norm_eval_weights(eval_attacks)
+        LOGGER.info(
+            "Normalized evaluation weights (Clean=0.0): "
+            + ", ".join(f"{k}={v:.4f}" for k, v in norm_eval_weights.items())
+        )
 
         all_results = {}
         all_losses = {}

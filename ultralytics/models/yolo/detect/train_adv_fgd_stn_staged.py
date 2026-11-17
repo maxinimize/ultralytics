@@ -1046,11 +1046,12 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         )
         effective_imgsz = val_ctx.get("effective_imgsz", getattr(self.args, "imgsz", 640))
         model_name = val_ctx.get("model_source", str(self.args.model))
+        requested_model = val_ctx.get("requested_model", str(self.args.model))
 
         results_record = {
             "epoch": eval_epoch,
             "stage": self.stage,
-            "model": str(self.args.model),
+            "model": requested_model,
             "model_source": model_name,
             "precision": val_precision,
             "split": str(val_ctx.get("split", getattr(self.args, "split", "val"))),
@@ -1059,6 +1060,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             "preprocess_mode": self.preprocess_mode,
             "fgd_weights": str(self.fgd_weights) if self.fgd_weights else None,
             "stn_weights": str(self.stn_weights) if self.stn_weights else None,
+            "dataset": str(val_ctx.get("dataset", getattr(self.args, "data", ""))),
+            "seed": int(val_ctx.get("seed", getattr(self.args, "seed", 0))),
             "metrics/mAP50(B)": clean_map50,
             "metrics/mAP50-95(B)": clean_map50_95,
             "fitness": fitness,
@@ -1309,6 +1312,7 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                                         continue
 
                                     # Backup sub_batch before running attack for potential rollback
+                                    input_img_shape = tuple(sub_batch["img"].shape)
                                     sub_backup = snapshot_batch_state(sub_batch)
 
                                     try:
@@ -1352,9 +1356,9 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                                             raise RuntimeError(
                                                 f"Adversarial generation produced NaN or Inf for attack '{att}' at batch {i}."
                                             )
-                                        if imgs_adv.shape != sub_backup["img"].shape:
+                                        if tuple(imgs_adv.shape) != input_img_shape:
                                             raise RuntimeError(
-                                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {sub_backup['img'].shape} for attack '{att}' at batch {i}."
+                                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {input_img_shape} for attack '{att}' at batch {i}."
                                             )
 
                                         sub_batch["img"] = imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)

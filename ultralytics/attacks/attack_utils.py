@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import random
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -242,14 +243,15 @@ def isolate_rng(
       - DataLoader generator state (if present)
 
     Sets `seed` if provided (for Python, NumPy, PyTorch CPU, PyTorch CUDA, and attackers via reset_seed).
-    Guarantees restoration of all captured states in `finally`.
+    Guarantees restoration of all captured states in `finally`, attempting all cleanup operations even
+    if individual steps fail, and preserving both body exceptions and cleanup errors.
     """
     py_state = random.getstate()
     np_state = np.random.get_state()
-    torch_cpu_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch_cpu_state = torch.get_rng_state().clone()
+    cuda_states = [s.clone() for s in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else None
 
-    # Capture attacker states
+    # Capture attacker states with deduplication by object identity
     atk_list = []
     if attackers is not None:
         if isinstance(attackers, dict):
@@ -268,59 +270,73 @@ def isolate_rng(
 
     saved_atk_states = []
     for atk in unique_atks:
+        state = None
+        capture_err = None
         if hasattr(atk, "state_dict"):
-            state = None
             try:
                 state = atk.state_dict()
-            except (RuntimeError, TypeError, ValueError, AttributeError) as e:
-                LOGGER.debug(f"Could not capture attacker state_dict: {e}")
-            saved_atk_states.append((atk, state))
-        elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
-            saved_atk_states.append((atk, {"generator_state": atk._generator.get_state().clone()}))
-        else:
-            saved_atk_states.append((atk, None))
+            except Exception as e:  # noqa: BLE001
+                capture_err = e
+        if state is None and hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
+            try:
+                state = {"generator_state": atk._generator.get_state().clone()}
+                capture_err = None  # private generator fallback succeeded
+            except Exception as e:  # noqa: BLE001
+                capture_err = e
+
+        if (
+            state is None
+            and seed is not None
+            and (
+                hasattr(atk, "reset_seed")
+                or (hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator))
+            )
+        ):
+            msg = f"Failed to capture RNG state for attacker {atk} before reseeding: {capture_err}"
+            LOGGER.error(msg)
+            raise RuntimeError(msg) from capture_err
+
+        saved_atk_states.append((atk, state))
 
     # Capture DataLoader generator state
     saved_dl_gen_state = None
     if dataloader is not None and hasattr(dataloader, "generator") and dataloader.generator is not None:
         try:
             saved_dl_gen_state = dataloader.generator.get_state().clone()
-        except (RuntimeError, TypeError, ValueError, AttributeError) as e:
+        except Exception as e:  # noqa: BLE001
             LOGGER.debug(f"Could not capture dataloader generator state: {e}")
 
-    # Apply isolated seed if specified
-    if seed is not None:
-        int_seed = int(seed)
-        random.seed(int_seed)
-        np.random.seed(int_seed)
-        torch.manual_seed(int_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int_seed)
-        for atk, _ in saved_atk_states:
-            if hasattr(atk, "reset_seed"):
-                atk.reset_seed(int_seed)
-            elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
-                atk._generator.manual_seed(int_seed)
-
     try:
+        # Apply isolated seed inside try block so any preparation failure still triggers finally
+        if seed is not None:
+            int_seed = int(seed)
+            random.seed(int_seed)
+            np.random.seed(int_seed)
+            torch.manual_seed(int_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int_seed)
+            for atk, _ in saved_atk_states:
+                if hasattr(atk, "reset_seed"):
+                    atk.reset_seed(int_seed)
+                elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
+                    atk._generator.manual_seed(int_seed)
+
         yield
     finally:
-        # Restore all states unconditionally
+        cleanup_errors: list[Exception] = []
+
+        # 1. Restore attacker states
         for atk, state in saved_atk_states:
             if state is not None:
-                if hasattr(atk, "load_state_dict"):
-                    try:
+                try:
+                    if hasattr(atk, "load_state_dict"):
                         atk.load_state_dict(state)
-                    except Exception as e:
-                        LOGGER.error(f"Failed to restore attacker state: {e}")
-                        raise
-                elif hasattr(atk, "_generator") and "generator_state" in state:
-                    try:
+                    elif hasattr(atk, "_generator") and "generator_state" in state:
                         atk._generator.set_state(state["generator_state"])
-                    except Exception as e:
-                        LOGGER.error(f"Failed to restore generator state: {e}")
-                        raise
+                except Exception as e:  # noqa: BLE001
+                    cleanup_errors.append(RuntimeError(f"Failed to restore state for attacker {atk}: {e}"))
 
+        # 2. Restore DataLoader generator
         if (
             saved_dl_gen_state is not None
             and dataloader is not None
@@ -328,17 +344,45 @@ def isolate_rng(
         ):
             try:
                 dataloader.generator.set_state(saved_dl_gen_state)
-            except Exception as e:
-                LOGGER.error(f"Failed to restore dataloader generator state: {e}")
-                raise
+            except Exception as e:  # noqa: BLE001
+                cleanup_errors.append(RuntimeError(f"Failed to restore DataLoader generator state: {e}"))
 
+        # 3. Restore CUDA RNG
         if cuda_states is not None and torch.cuda.is_available():
-            with contextlib.suppress(RuntimeError, TypeError, ValueError, AttributeError):
+            try:
                 torch.cuda.set_rng_state_all(cuda_states)
+            except Exception as e:  # noqa: BLE001
+                cleanup_errors.append(RuntimeError(f"Failed to restore CUDA RNG state: {e}"))
 
-        torch.set_rng_state(torch_cpu_state)
-        np.random.set_state(np_state)
-        random.setstate(py_state)
+        # 4. Restore Torch CPU RNG
+        try:
+            torch.set_rng_state(torch_cpu_state)
+        except Exception as e:  # noqa: BLE001
+            cleanup_errors.append(RuntimeError(f"Failed to restore PyTorch CPU RNG state: {e}"))
+
+        # 5. Restore NumPy
+        try:
+            np.random.set_state(np_state)
+        except Exception as e:  # noqa: BLE001
+            cleanup_errors.append(RuntimeError(f"Failed to restore NumPy RNG state: {e}"))
+
+        # 6. Restore Python random
+        try:
+            random.setstate(py_state)
+        except Exception as e:  # noqa: BLE001
+            cleanup_errors.append(RuntimeError(f"Failed to restore Python random state: {e}"))
+
+        # 7. Check cleanup errors and chain with body exception if present
+        if cleanup_errors:
+            err_msg = f"isolate_rng cleanup encountered {len(cleanup_errors)} failure(s): " + "; ".join(
+                str(e) for e in cleanup_errors
+            )
+            cleanup_exc = RuntimeError(err_msg)
+            cleanup_exc.cleanup_errors = cleanup_errors
+            body_exc = sys.exc_info()[1]
+            if body_exc is not None:
+                raise cleanup_exc from body_exc
+            raise cleanup_exc
 
 
 TRANSIENT_ATTACKER_ATTRS = (

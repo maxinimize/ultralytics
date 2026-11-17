@@ -771,6 +771,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                                         continue
 
                                     # Backup sub_batch before running attack for potential rollback
+                                    input_img_shape = tuple(sub_batch["img"].shape)
                                     sub_backup = snapshot_batch_state(sub_batch)
 
                                     try:
@@ -814,9 +815,9 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
                                             raise RuntimeError(
                                                 f"Adversarial generation produced NaN or Inf for attack '{att}' at batch {i}."
                                             )
-                                        if imgs_adv.shape != sub_backup["img"].shape:
+                                        if tuple(imgs_adv.shape) != input_img_shape:
                                             raise RuntimeError(
-                                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {sub_backup['img'].shape} for attack '{att}' at batch {i}."
+                                                f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {input_img_shape} for attack '{att}' at batch {i}."
                                             )
 
                                         sub_batch["img"] = imgs_adv.detach().to(sub_batch["img"].dtype).to(self.device)

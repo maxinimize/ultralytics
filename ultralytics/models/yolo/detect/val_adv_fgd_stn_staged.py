@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from copy import copy
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -76,13 +77,16 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         raw_attack_weights = attack_weights
 
         if isinstance(args, dict):
+            args = dict(args)
             raw_mode = args.pop("preprocess_mode", raw_mode)
             raw_fgd_w = args.pop("fgd_weights", raw_fgd_w)
             raw_stn_w = args.pop("stn_weights", raw_stn_w)
             raw_att_through = args.pop("attack_through_preprocess", raw_att_through)
             raw_stage = args.pop("stage", raw_stage)
             raw_strict = args.pop("strict_attacks", raw_strict)
-            raw_eval_w = args.pop("eval_weights", raw_eval_w)
+            arg_eval_w = args.pop("eval_weights", None)
+            if raw_eval_w is None:
+                raw_eval_w = arg_eval_w
             raw_attack_weights = args.pop("attack_weights", raw_attack_weights)
             for k in (
                 "eval_only",
@@ -100,6 +104,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             ):
                 args.pop(k, None)
         elif args is not None:
+            args = copy(args)
             for k in (
                 "preprocess_mode",
                 "fgd_weights",
@@ -136,7 +141,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                         raw_stage = val
                     elif k == "strict_attacks":
                         raw_strict = val
-                    elif k == "eval_weights":
+                    elif k == "eval_weights" and raw_eval_w is None:
                         raw_eval_w = val
                     elif k == "attack_weights":
                         raw_attack_weights = val
@@ -151,6 +156,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             args=args,
             _callbacks=_callbacks,
             attack_weights=raw_attack_weights,
+            strict_attacks=raw_strict,
+            eval_weights=raw_eval_w,
             **kwargs,
         )
 
@@ -333,18 +340,25 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         with isolate_rng(seed=val_seed, attackers=active_attackers, dataloader=dl):
             return self._execute_validation(trainer=trainer, model=model)
 
-    def record_validation_context(self, trainer=None) -> dict[str, Any]:
+    def record_validation_context(
+        self,
+        trainer=None,
+        model_source: str | None = None,
+        requested_model: str | None = None,
+    ) -> dict[str, Any]:
         """Record and log validation configuration context and actual runtime parameters."""
-        is_training = getattr(self, "training", False) or (trainer is not None)
-        if is_training:
-            if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None):
-                model_source = "trainer.ema"
-            elif getattr(trainer, "model", None):
-                model_source = "trainer.model"
+        req_m = str(requested_model or getattr(self.args, "model", "AutoBackend"))
+        if model_source is None:
+            is_training = getattr(self, "training", False) or (trainer is not None)
+            if is_training:
+                if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None):
+                    model_source = "trainer.ema"
+                elif getattr(trainer, "model", None):
+                    model_source = "trainer.model"
+                else:
+                    model_source = "trainer"
             else:
-                model_source = "trainer"
-        else:
-            model_source = getattr(self.args, "model", "AutoBackend")
+                model_source = req_m
 
         # Determine actual precision
         val_precision = "FP32" if self.stage == 1 or getattr(self.args, "quantize", None) != 16 else "FP16"
@@ -359,12 +373,23 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
         else:
             stride_max = int(stride_val)
         effective_imgsz = check_imgsz(getattr(self.args, "imgsz", 640), stride=stride_max)
+        if isinstance(effective_imgsz, (list, tuple)):
+            effective_imgsz = list(effective_imgsz)
+
         actual_batch = (
             getattr(self.dataloader, "batch_size", None)
             or getattr(getattr(trainer, "test_loader", None), "batch_size", None)
             or getattr(self.args, "batch", 16)
             or 16
         )
+        if hasattr(self.dataloader, "dataset"):
+            try:
+                ds_len = len(self.dataloader.dataset)
+                if 0 < ds_len < actual_batch:
+                    actual_batch = ds_len
+            except (TypeError, AttributeError):
+                pass
+
         data_obj = getattr(self, "data", None)
         if data_obj is None and trainer is not None:
             data_obj = getattr(trainer, "data", None)
@@ -383,6 +408,7 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             "epoch": getattr(trainer, "epoch", 0) if trainer else 0,
             "stage": self.stage,
             "model_source": str(model_source),
+            "requested_model": req_m,
             "dataset": str(dataset_yaml),
             "split": str(self.args.split),
             "requested_imgsz": self.args.imgsz,
@@ -428,6 +454,29 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 self.strict_attacks = bool(trainer.strict_attacks)
             if hasattr(trainer, "eval_weights") and trainer.eval_weights is not None:
                 self.eval_weights = trainer.eval_weights
+
+        # Determine actual model source description before model reference is replaced
+        requested_model = getattr(self.args, "model", "AutoBackend")
+        if trainer is not None:
+            if getattr(trainer, "ema", None) and getattr(trainer.ema, "ema", None):
+                actual_model_source = "trainer.ema"
+            elif getattr(trainer, "model", None):
+                actual_model_source = "trainer.model"
+            else:
+                actual_model_source = "trainer"
+        elif model is not None:
+            if isinstance(model, (str, Path)):
+                actual_model_source = str(Path(model))
+            elif hasattr(model, "pt_path") and model.pt_path:
+                actual_model_source = str(Path(model.pt_path))
+            elif hasattr(model, "yaml_file") and model.yaml_file:
+                actual_model_source = str(Path(model.yaml_file))
+            elif isinstance(model, torch.nn.Module):
+                actual_model_source = model.__class__.__name__
+            else:
+                actual_model_source = str(model)
+        else:
+            actual_model_source = str(requested_model)
 
         target_device = trainer.device if trainer is not None else getattr(self, "device", None)
         if target_device is None:
@@ -513,7 +562,11 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             ch = self.data.get("channels", 3) if isinstance(self.data, dict) else 3
             model.warmup(imgsz=(1 if pt else self.args.batch, ch, imgsz, imgsz))
 
-        self.record_validation_context(trainer=trainer)
+        self.record_validation_context(
+            trainer=trainer,
+            model_source=actual_model_source,
+            requested_model=requested_model,
+        )
 
         # Determine validation runs based on stage
         if self.stage == 1:
