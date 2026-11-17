@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 from art.attacks.evasion import ProjectedGradientDescent
 
-from .art_pgd import ARTPGD, YoloV5ForART
+from .art_pgd import ARTPGD
 
 
 class ARTMIM(ARTPGD):
@@ -38,6 +37,7 @@ class ARTMIM(ARTPGD):
             lr=lr,
             epoch=epoch,
             img_size=img_size,
+            num_random_init=0,
         )
         self.decay = decay
 

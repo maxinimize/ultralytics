@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict, List
+import contextlib
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ultralytics.attacks.attacker import Attacker
 from ultralytics.utils.nms import non_max_suppression
@@ -19,7 +19,6 @@ except (ImportError, AttributeError):
     from art.estimators.object_detection import PyTorchYolo as ARTDetector
 
 from art.attacks.evasion import ProjectedGradientDescent
-
 
 from ultralytics.attacks.attack_utils import (
     BatchContainer,
@@ -48,7 +47,6 @@ class YoloV5ForART(nn.Module):
 
     def zero_grad(self, set_to_none: bool = False):
         """Prevent ART from clearing outer training model accumulated parameter gradients."""
-        pass
 
     @torch.enable_grad()
     def forward(self, images: torch.Tensor, targets=None):
@@ -86,7 +84,7 @@ class YoloV5ForART(nn.Module):
             return out
 
         # training mode: convert targets
-        n, _, H, W = images.shape
+        _n, _, H, W = images.shape
         yolo_tgts = []
 
         for i, tgt in enumerate(targets):
@@ -190,7 +188,7 @@ class YoloV5ForART(nn.Module):
                 )
 
                 # call loss function
-                loss, loss_items = self._loss_fn(batch, preds)
+                loss, _loss_items = self._loss_fn(batch, preds)
 
                 # Ensure loss is scalar for backward()
                 final_loss = loss.sum()
@@ -218,9 +216,28 @@ class ARTPGD(Attacker):
       epoch   -> PGD.max_iter
     """
 
-    def __init__(self, model, config=None, target=None, epsilon=0.031372549, lr=0.00784313725, epoch=5, img_size=640):
+    def __init__(
+        self,
+        model,
+        config=None,
+        target=None,
+        epsilon: float = 0.031372549,
+        lr: float = 0.00784313725,
+        epoch: int = 5,
+        img_size: int = 640,
+        num_random_init: int = 1,
+    ):
         super().__init__(model, config, epsilon)
         self.device = next(model.parameters()).device
+        self.epsilon = float(epsilon)
+        self.lr = float(lr)
+        self.epoch = int(epoch)
+        self.img_size = int(img_size)
+        self.num_random_init = int(num_random_init)
+        if self.num_random_init > 1:
+            raise ValueError(
+                f"num_random_init={self.num_random_init} > 1 is not supported for detection PGD. Set num_random_init=1."
+            )
 
         saved_states = capture_module_training_states(self.model)
         try:
@@ -230,14 +247,16 @@ class ARTPGD(Attacker):
 
             # wrap yolo model for ART
             wrapped = YoloV5ForART(self.model, img_size)
+            self.wrapped_model = wrapped
 
-            # ART Detector
+            # ART Detector with dynamic device resolution to avoid moving CPU models to GPU
+            resolved_device_type = "gpu" if self.device.type == "cuda" else "cpu"
             self.estimator = ARTDetector(
                 model=wrapped,
                 input_shape=(3, img_size, img_size),
                 clip_values=(0.0, 1.0),
                 channels_first=True,
-                device_type="gpu",
+                device_type=resolved_device_type,
                 attack_losses=("loss",),
             )
             # disable batchnorm/dropout
@@ -254,7 +273,7 @@ class ARTPGD(Attacker):
                 eps_step=lr,
                 max_iter=epoch,
                 targeted=False,
-                num_random_init=1,
+                num_random_init=self.num_random_init,
                 verbose=False,
             )
         finally:
@@ -265,6 +284,23 @@ class ARTPGD(Attacker):
         x: (N,C,H,W) in [0,1] float
         targets: (M,6) [img_idx, cls, x, y, w, h] normalized xywh
         """
+        is_mim = getattr(self, "decay", 0.0) > 0.0
+        num_random_init = int(getattr(self.attack, "num_random_init", getattr(self, "num_random_init", 1)))
+
+        # Route MIM and zero-random-init attacks to ART's generate path
+        if is_mim or num_random_init == 0:
+            return self._forward_art(x, targets)
+
+        if num_random_init > 1:
+            raise ValueError(
+                f"num_random_init={num_random_init} > 1 is not supported for detection PGD. Set num_random_init=1."
+            )
+
+        # Native PyTorch L_inf PGD with random initialization
+        return self._forward_native_pgd(x, targets)
+
+    def _forward_art(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """ART generate execution path for MIM and zero random initialization."""
         saved_states = capture_module_training_states(self.model)
         try:
             n, _, h, w = x.shape
@@ -272,10 +308,8 @@ class ARTPGD(Attacker):
 
             x_np = x.detach().cpu().numpy()
             if hasattr(self.attack, "set_params"):
-                try:
+                with contextlib.suppress(Exception):
                     self.attack.set_params(batch_size=n)
-                except Exception:
-                    pass
             if hasattr(self.attack, "_attack") and hasattr(self.attack._attack, "batch_size"):
                 self.attack._attack.batch_size = n
             if hasattr(self.attack, "batch_size"):
@@ -286,8 +320,53 @@ class ARTPGD(Attacker):
         finally:
             restore_module_training_states(saved_states)
 
+    def _forward_native_pgd(self, x: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Native PyTorch L_inf PGD execution path with random initialization for object detection."""
+        orig_dtype = x.dtype
+        orig_device = x.device
+
+        eps = float(getattr(self.attack, "eps", self.epsilon))
+        eps_step = float(getattr(self.attack, "eps_step", self.lr))
+        max_iter = int(getattr(self.attack, "max_iter", self.epoch))
+
+        # Save original center in FP32 on model device without modifying x
+        x0 = x.detach().clone().float().to(self.device)
+
+        # Uniform random perturbation in [-epsilon, +epsilon], clipped to [0, 1]
+        noise = torch.empty_like(x0).uniform_(-eps, eps)
+        x_adv = torch.clamp(x0 + noise, 0.0, 1.0)
+
+        n, _, h, w = x.shape
+        y_art = self._to_art_labels(targets, h, w, n)
+        wrapped = getattr(self, "wrapped_model", getattr(self.estimator, "model", None))
+
+        saved_states = capture_module_training_states(self.model)
+        try:
+            for _ in range(max_iter):
+                x_adv = x_adv.detach().requires_grad_(True)
+                out = wrapped(x_adv, y_art)
+                loss = out.get("loss")
+                if loss is None or not loss.requires_grad:
+                    break
+                grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0]
+                if not torch.isfinite(grad).all():
+                    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # Step along gradient sign
+                x_adv = x_adv.detach() + eps_step * grad.sign()
+
+                # Project onto L_inf ball of radius eps centered at original x0
+                x_adv = torch.max(torch.min(x_adv, x0 + eps), x0 - eps)
+
+                # Clip to valid image range [0, 1]
+                x_adv = torch.clamp(x_adv, 0.0, 1.0)
+
+            return x_adv.detach().to(dtype=orig_dtype, device=orig_device)
+        finally:
+            restore_module_training_states(saved_states)
+
     @staticmethod
-    def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> List[Dict[str, np.ndarray]]:
+    def _to_art_labels(targets: torch.Tensor, H: int, W: int, batch_size: int) -> list[dict[str, np.ndarray]]:
         """Convert YOLO targets to ART label format.
 
         Args:
@@ -299,7 +378,7 @@ class ARTPGD(Attacker):
         Returns:
             List of dicts with 'boxes' (N, 4) xyxy and 'labels' (N,)
         """
-        out: List[Dict[str, np.ndarray]] = []
+        out: list[dict[str, np.ndarray]] = []
 
         # input validation
         if targets is None or targets.numel() == 0:

@@ -205,6 +205,10 @@ class DetectionValidatorAdvFGDSTNAdaptive(DetectionValidatorAdvAdaptive):
                     self.eval_weights = trainer.eval_weights
 
             target_device = trainer.device if trainer is not None else getattr(self, "device", None)
+            if target_device is None and hasattr(self, "args") and getattr(self.args, "device", None) is not None:
+                from ultralytics.utils.torch_utils import select_device
+
+                target_device = select_device(self.args.device)
             if target_device is None:
                 target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             self._setup_pipeline(target_device)

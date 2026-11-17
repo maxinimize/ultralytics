@@ -271,15 +271,19 @@ def isolate_rng(
     saved_atk_states = []
     for atk in unique_atks:
         state = None
+        restore_fn = None
         capture_err = None
         if hasattr(atk, "state_dict"):
             try:
                 state = atk.state_dict()
+                if hasattr(atk, "load_state_dict"):
+                    restore_fn = atk.load_state_dict
             except Exception as e:  # noqa: BLE001
                 capture_err = e
         if state is None and hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
             try:
-                state = {"generator_state": atk._generator.get_state().clone()}
+                state = atk._generator.get_state().clone()
+                restore_fn = atk._generator.set_state
                 capture_err = None  # private generator fallback succeeded
             except Exception as e:  # noqa: BLE001
                 capture_err = e
@@ -296,15 +300,17 @@ def isolate_rng(
             LOGGER.error(msg)
             raise RuntimeError(msg) from capture_err
 
-        saved_atk_states.append((atk, state))
+        saved_atk_states.append((atk, restore_fn, state))
 
     # Capture DataLoader generator state
     saved_dl_gen_state = None
-    if dataloader is not None and hasattr(dataloader, "generator") and dataloader.generator is not None:
+    if dataloader is not None and getattr(dataloader, "generator", None) is not None:
         try:
             saved_dl_gen_state = dataloader.generator.get_state().clone()
-        except Exception as e:  # noqa: BLE001
-            LOGGER.debug(f"Could not capture dataloader generator state: {e}")
+        except Exception as e:
+            msg = f"Failed to capture DataLoader generator state before reseeding: {e}"
+            LOGGER.error(msg)
+            raise RuntimeError(msg) from e
 
     try:
         # Apply isolated seed inside try block so any preparation failure still triggers finally
@@ -315,7 +321,7 @@ def isolate_rng(
             torch.manual_seed(int_seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int_seed)
-            for atk, _ in saved_atk_states:
+            for atk, _, _ in saved_atk_states:
                 if hasattr(atk, "reset_seed"):
                     atk.reset_seed(int_seed)
                 elif hasattr(atk, "_generator") and isinstance(atk._generator, torch.Generator):
@@ -325,14 +331,11 @@ def isolate_rng(
     finally:
         cleanup_errors: list[Exception] = []
 
-        # 1. Restore attacker states
-        for atk, state in saved_atk_states:
-            if state is not None:
+        # 1. Restore attacker states using exact bound restoration methods
+        for atk, restore_fn, state in saved_atk_states:
+            if restore_fn is not None and state is not None:
                 try:
-                    if hasattr(atk, "load_state_dict"):
-                        atk.load_state_dict(state)
-                    elif hasattr(atk, "_generator") and "generator_state" in state:
-                        atk._generator.set_state(state["generator_state"])
+                    restore_fn(state)
                 except Exception as e:  # noqa: BLE001
                     cleanup_errors.append(RuntimeError(f"Failed to restore state for attacker {atk}: {e}"))
 

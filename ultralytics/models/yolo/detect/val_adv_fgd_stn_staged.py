@@ -479,6 +479,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
             actual_model_source = str(requested_model)
 
         target_device = trainer.device if trainer is not None else getattr(self, "device", None)
+        if target_device is None and hasattr(self, "args") and getattr(self.args, "device", None) is not None:
+            target_device = select_device(self.args.device)
         if target_device is None:
             target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self._setup_pipeline(target_device)
@@ -531,6 +533,8 @@ class DetectionValidatorAdvFGDSTNStaged(DetectionValidatorAdvFGDSTNAdaptive):
                 fp16=use_fp16,
             )
             self.device = model.device
+            if self.pipeline is not None:
+                self.pipeline.to(self.device)
             if self.stage == 1:
                 self.args.quantize = None
             else:
