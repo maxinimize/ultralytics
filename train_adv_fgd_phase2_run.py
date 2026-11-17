@@ -134,28 +134,16 @@ def main():
         use_fgd = saved_args.get("use_fgd", True)
         if isinstance(use_fgd, str):
             use_fgd = use_fgd.lower() in ("true", "1", "yes")
+        overrides["use_fgd"] = use_fgd
     else:
         use_fgd = True
         overrides["use_fgd"] = True
 
-    if use_fgd:
-        for key in FGDAdversarialTrainer.defaults:
-            if hasattr(args, key):
-                overrides[key] = getattr(args, key)
-        trainer_class = FGDAdversarialTrainer
-    else:
-        if is_resume:
-            overrides["use_fgd"] = False
-            for key in FGDAdversarialTrainer.defaults:
-                if hasattr(args, key):
-                    overrides[key] = getattr(args, key)
-            trainer_class = FGDAdversarialTrainer
-        else:
-            from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
+    for key in FGDAdversarialTrainer.defaults:
+        if hasattr(args, key):
+            overrides[key] = getattr(args, key)
 
-            trainer_class = DetectionTrainer
-
-    trainer = trainer_class(overrides=overrides, attack_weights=getattr(args, "attack_weights", None))
+    trainer = FGDAdversarialTrainer(overrides=overrides, attack_weights=getattr(args, "attack_weights", None))
     trainer.train()
 
 

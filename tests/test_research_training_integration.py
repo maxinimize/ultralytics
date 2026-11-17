@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import random
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +58,7 @@ from ultralytics.models.yolo.detect.val_adv_fgd_phase2 import DetectionValidator
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_staged import DetectionValidatorAdvFGDSTNStaged
 from ultralytics.models.yolo.detect.val_adv_multi import DetectionValidator as MultiAdvDetectionValidator
 from ultralytics.nn.tasks import DetectionModel
+from ultralytics.utils import YAML
 from val_fgd_stn_run import resolve_models_and_pipeline as resolve_fgd_stn_models
 from val_stn_run import resolve_models as resolve_stn_models
 
@@ -1957,6 +1960,243 @@ class TestResearchTrainingIntegration(unittest.TestCase):
                 self.assertIn('CURRENT_MODEL="${STAGE2_BEST}"', content)
                 self.assertIn('CURRENT_MODEL="${MATERIALIZED_MODEL}"', content)
                 self.assertIn('--model "${CURRENT_MODEL}"', content)
+
+    def test_h7_phase2_fresh_cli_and_adaptive_yaml(self):
+        """Test H7: Verify Phase 2 fresh false CLI roundtrip, fresh true control,
+        Phase 2 Shell argument construction, and plain adaptive args.yaml writing."""
+        repo_root = Path(__file__).resolve().parents[1]
+
+        # 1. Phase 2 fresh false CLI execution -> warm checkpoint -> resume roundtrip
+        with self.subTest(scenario="phase2_fresh_false_cli_and_resume"):
+            p2_dir = self.temp_dir / "runs_p2_fresh_false"
+            dev = "0" if torch.cuda.is_available() else "cpu"
+            cmd_fresh = [
+                sys.executable,
+                str(repo_root / "train_adv_fgd_phase2_run.py"),
+                "--use_fgd",
+                "false",
+                "--model",
+                "yolo11n.yaml",
+                "--data",
+                str(self.data_yaml),
+                "--epochs",
+                "1",
+                "--batch",
+                "2",
+                "--imgsz",
+                "64",
+                "--workers",
+                "0",
+                "--device",
+                dev,
+                "--cache",
+                "false",
+                "--attack_name",
+                "worstk",
+                "--attack_ratio",
+                "0.5",
+                "--project",
+                str(p2_dir),
+                "--name",
+                "fresh_false",
+            ]
+            if dev == "cpu":
+                cmd_fresh += ["--amp", "fp32"]
+            res_fresh = subprocess.run(cmd_fresh, check=False, capture_output=True, text=True, cwd=str(repo_root))
+            self.assertEqual(
+                res_fresh.returncode,
+                0,
+                f"Fresh false CLI run failed:\nSTDOUT:\n{res_fresh.stdout}\nSTDERR:\n{res_fresh.stderr}",
+            )
+            self.assertNotIn("is not a valid YOLO argument", res_fresh.stderr)
+            self.assertNotIn("SyntaxError", res_fresh.stderr)
+
+            yaml_path = p2_dir / "fresh_false" / "args.yaml"
+            self.assertTrue(yaml_path.exists(), "args.yaml should exist in fresh run save_dir")
+            yaml_data = YAML.load(yaml_path)
+            self.assertIs(yaml_data.get("use_fgd"), False, "args.yaml must contain use_fgd: False")
+
+            # Create a 2-epoch warm checkpoint with use_fgd=False
+            warm_p2 = self.temp_dir / "runs_p2_warm"
+            trainer_warm = FGDAdversarialTrainer(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 2,
+                    "batch": 2,
+                    "imgsz": 64,
+                    "workers": 0,
+                    "device": dev,
+                    "amp": "fp32" if dev == "cpu" else "bf16",
+                    "cache": False,
+                    "use_fgd": False,
+                    "attack_name": ["worstk"],
+                    "attack_ratio": [0.5],
+                    "project": str(warm_p2),
+                    "name": "warm_exp",
+                }
+            )
+
+            def stop_ep0(t):
+                if t.epoch == 0 and t.last.exists():
+                    raise KeyboardInterrupt("Simulate warm checkpoint after epoch 0")
+
+            trainer_warm.add_callback("on_fit_epoch_end", stop_ep0)
+            try:
+                trainer_warm.train()
+            except KeyboardInterrupt:
+                pass
+
+            warm_ckpt = warm_p2 / "warm_exp" / "weights" / "last.pt"
+            self.assertTrue(warm_ckpt.exists(), "Warm checkpoint last.pt must exist")
+            ckpt_obj = torch.load(warm_ckpt, weights_only=False)
+            self.assertIs(ckpt_obj.get("train_args", {}).get("use_fgd"), False)
+            self.assertIsNotNone(ckpt_obj.get("optimizer"))
+
+            # Resume via CLI omitting --use_fgd
+            cmd_resume = [
+                sys.executable,
+                str(repo_root / "train_adv_fgd_phase2_run.py"),
+                "--resume",
+                str(warm_ckpt),
+                "--device",
+                dev,
+            ]
+            if dev == "cpu":
+                cmd_resume += ["--amp", "fp32"]
+            res_resume = subprocess.run(cmd_resume, check=False, capture_output=True, text=True, cwd=str(repo_root))
+            self.assertEqual(
+                res_resume.returncode,
+                0,
+                f"Resume CLI run failed:\nSTDOUT:\n{res_resume.stdout}\nSTDERR:\n{res_resume.stderr}",
+            )
+            self.assertNotIn("is not a valid YOLO argument", res_resume.stderr)
+
+        # 2. Phase 2 fresh true control and defenses
+        with self.subTest(scenario="phase2_fresh_true_control_and_defense"):
+            # A: Explicit valid FGD weights loads denoiser and freezes it
+            trainer_true = FGDAdversarialTrainer(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 2,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "use_fgd": True,
+                    "fgd_weights": str(self.fgd_path),
+                    "project": str(self.temp_dir / "runs_p2_true"),
+                    "name": "true_exp",
+                }
+            )
+            trainer_true._setup_train()
+            self.assertIsNotNone(trainer_true.denoiser)
+            self.assertTrue(trainer_true.phase2["use_fgd"])
+            self.assertFalse(any(p.requires_grad for p in trainer_true.denoiser.parameters()))
+
+            # B: Missing weights explicitly raises FileNotFoundError
+            with self.assertRaises(FileNotFoundError):
+                FGDAdversarialTrainer(
+                    overrides={
+                        "model": "yolo11n.yaml",
+                        "data": str(self.data_yaml),
+                        "epochs": 1,
+                        "imgsz": 64,
+                        "batch": 2,
+                        "workers": 0,
+                        "device": "cpu",
+                        "use_fgd": True,
+                        "fgd_weights": str(self.temp_dir / "nonexistent_fgd.pt"),
+                    }
+                )
+
+        # 3. Phase 2 Shell script parameter construction
+        with self.subTest(scenario="phase2_shell_arg_construction"):
+            sh_path = repo_root / "train_adv_fgd_phase2_local.sh"
+            self.assertTrue(sh_path.exists())
+            sh_content = sh_path.read_text(encoding="utf-8")
+            self.assertNotIn("--seed", sh_content, "Phase 2 Shell script must not reference --seed")
+
+            # Test bash parameter construction for SEED unset, SEED=0, SEED=42
+            dummy_ckpt = self.temp_dir / "dummy_resume.pt"
+            dummy_ckpt.touch()
+            for seed_val in (None, "0", "42"):
+                env_prefix = f"SEED={seed_val}" if seed_val is not None else "unset SEED"
+                bash_script_eval = f"""
+                {env_prefix}
+                RESUME="{dummy_ckpt}"
+                WORKERS="0"
+                CACHE="False"
+                eval "$(sed -n '/ARGS=(--resume/,/LOG_PROJECT=/p' "{sh_path}" | sed '/LOG_PROJECT=/d')"
+                echo "${{ARGS[@]}}"
+                """
+                res = subprocess.run(["bash", "-c", bash_script_eval], capture_output=True, text=True, check=True)
+                args_output = res.stdout.strip().split()
+                self.assertNotIn("--seed", args_output)
+                self.assertIn("--workers", args_output)
+                self.assertIn("0", args_output)
+                self.assertIn("--cache", args_output)
+                self.assertIn("False", args_output)
+                parsed = train_adv_fgd_phase2_run.parse_args(args_output)
+                self.assertFalse(hasattr(parsed, "seed"))
+                self.assertEqual(parsed.resume, str(dummy_ckpt))
+                self.assertEqual(parsed.workers, 0)
+                self.assertEqual(parsed.cache, "False")
+
+        # 4. Plain adaptive real args.yaml writing and content assertion
+        with self.subTest(scenario="plain_adaptive_args_yaml"):
+            adaptive_dir = self.temp_dir / "runs_adaptive_yaml"
+            trainer_adaptive = DetectionTrainerAdvAdaptive(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 2,
+                    "batch": 2,
+                    "imgsz": 64,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "attack_name": ["worstk"],
+                    "attack_ratio": [0.5],
+                    "p_clean": 0.5,
+                    "eval_weights": [0.5, 0.5],
+                    "seed": 0,
+                    "project": str(adaptive_dir),
+                    "name": "exp",
+                }
+            )
+
+            def stop_adaptive_ep0(t):
+                if t.epoch == 0 and t.last.exists():
+                    raise KeyboardInterrupt("Simulate warm checkpoint after epoch 0")
+
+            trainer_adaptive.add_callback("on_fit_epoch_end", stop_adaptive_ep0)
+            try:
+                trainer_adaptive.train()
+            except KeyboardInterrupt:
+                pass
+
+            yaml_path = adaptive_dir / "exp" / "args.yaml"
+            self.assertTrue(yaml_path.exists(), "args.yaml must exist in adaptive save_dir")
+            yaml_content = YAML.load(yaml_path)
+            self.assertEqual(yaml_content.get("attack_name"), ["worstk"])
+            self.assertEqual(yaml_content.get("attack_ratio"), [0.5])
+            self.assertEqual(yaml_content.get("p_clean"), 0.5)
+            self.assertEqual(yaml_content.get("eval_weights"), [0.5, 0.5])
+            self.assertEqual(yaml_content.get("seed"), 0)
+
+            ckpt_path = adaptive_dir / "exp" / "weights" / "last.pt"
+            self.assertTrue(ckpt_path.exists(), "Warm checkpoint last.pt must exist")
+            ckpt_obj = torch.load(ckpt_path, weights_only=False)
+            train_args = ckpt_obj.get("train_args", {})
+            for key in ("attack_name", "attack_ratio", "p_clean", "eval_weights", "seed"):
+                self.assertEqual(
+                    yaml_content.get(key),
+                    train_args.get(key),
+                    f"args.yaml and checkpoint train_args mismatch for key: {key}",
+                )
 
 
 if __name__ == "__main__":

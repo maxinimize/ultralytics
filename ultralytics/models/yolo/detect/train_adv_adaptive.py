@@ -28,7 +28,7 @@ from ultralytics.data.dataset import YOLODataset
 from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
 from ultralytics.nn.tasks import DetectionModel
-from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, colorstr
+from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, YAML, colorstr
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import (
@@ -1129,6 +1129,9 @@ class DetectionTrainer(BaseTrainer):
         if self.world_size > 1:
             self._setup_ddp()
         self._setup_train()
+
+        if RANK in {-1, 0}:
+            YAML.save(self.save_dir / "args.yaml", vars(self.args))
 
         if self.resume:
             self._restore_resume_rng_and_attackers()

@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from ultralytics.attacks.attack_bridge import build_attacker
 from ultralytics.defenses.hgd_fgd import FGDDetectorWrapper, apply_fgd, load_fgd_denoiser
+from ultralytics.models.yolo.detect.train_adv_adaptive import _load_saved_args
 from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
 from ultralytics.models.yolo.detect.val_adv_fgd_phase2 import DetectionValidator
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, YAML
@@ -31,11 +32,9 @@ class FGDAdversarialTrainer(DetectionTrainer):
         self.denoiser = None
         super().__init__(cfg, overrides, _callbacks, attack_weights)
         if self.resume:
-            # Ultralytics strips research arguments from completed .pt files; keep the external config authoritative.
-            metadata = Path(self.args.resume).resolve().parent.parent / "phase2_fgd.yaml"
-            if metadata.is_file():
-                saved = YAML.load(metadata)
-                self.phase2.update({key: saved[key] for key in self.defaults if key in saved})
+            # Ultralytics strips research arguments from completed .pt files; keep external config authoritative.
+            saved = _load_saved_args(self.args.resume)
+            self.phase2.update({key: saved[key] for key in self.defaults if key in saved})
             self.phase2.update({key: getattr(self.args, key) for key in self.defaults if hasattr(self.args, key)})
             self.phase2.update(explicit)
         if self.phase2["use_fgd"]:
@@ -103,6 +102,8 @@ class FGDAdversarialTrainer(DetectionTrainer):
         """Check optimizer isolation and record the complete experiment after inherited setup."""
         super()._setup_train()
         if self.denoiser is None:
+            if RANK in {-1, 0}:
+                YAML.save(self.save_dir / "args.yaml", vars(self.args))
             return
         fgd_ids = {id(p) for p in self.denoiser.parameters()}
         assert not any(p.requires_grad for p in self.denoiser.parameters())

@@ -168,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
+        default=None,
         help="Random seed for reproducibility (default: inherited from cfg/default.yaml).",
     )
     parser.add_argument(

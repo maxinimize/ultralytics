@@ -32,7 +32,6 @@ if [[ -n "$RESUME" ]]; then
   if [[ -v AMP && -n "$AMP" ]]; then ARGS+=(--amp "$AMP"); fi
   if [[ -v PROJECT && -n "$PROJECT" ]]; then ARGS+=(--project "$PROJECT"); fi
   if [[ -v NAME && -n "$NAME" ]]; then ARGS+=(--name "$NAME"); fi
-  if [[ -v SEED && -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
   if [[ -v USE_FGD && -n "$USE_FGD" ]]; then ARGS+=(--use_fgd "$USE_FGD"); fi
   if [[ -v FRACTION && -n "$FRACTION" ]]; then ARGS+=(--fraction "$FRACTION"); fi
   if [[ -v CLASSES && -n "$CLASSES" ]]; then
