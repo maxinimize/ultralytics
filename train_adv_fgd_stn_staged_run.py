@@ -350,7 +350,7 @@ def main():
                 f"stage1_baseline_eval_{mode}" if getattr(args, "eval_only", False) else "stage1_clean_finetune"
             )
             default_epochs = 3
-            default_lr0 = 1e-6
+            default_lr0 = 1e-5
             default_lrf = 1.0
             default_warmup_epochs = 0.0
             default_warmup_bias_lr = 0.0
@@ -496,7 +496,7 @@ def main():
         overrides["seed"] = int(args.seed)
 
     trainer = DetectionTrainerAdvFGDSTNStaged(
-        overrides=overrides, attack_weights=getattr(args, "attack_weights", "current")
+        overrides=overrides, attack_weights=getattr(args, "attack_weights", None) or ""
     )
     if getattr(args, "eval_only", False):
         trainer.eval_only()

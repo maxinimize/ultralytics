@@ -34,12 +34,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
-import yaml
 from PIL import Image
 
 import train_adv_adaptive_run
+import train_adv_fgd_phase2_run
 import train_adv_fgd_stn_adaptive_run
 import train_adv_fgd_stn_staged_run
+import train_adv_test_run
 from ultralytics.attacks.art_pgd import ARTPGD
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.attacks.attack_utils import isolate_rng
@@ -47,6 +48,7 @@ from ultralytics.attacks.spatial_worst_of_k import SpatialWorstOfK
 from ultralytics.defenses.hgd_fgd import ResidualDenoiser
 from ultralytics.defenses.spatial_transformer import SpatialTransformer
 from ultralytics.models.yolo.detect.train_adv_adaptive import DetectionTrainer as DetectionTrainerAdvAdaptive
+from ultralytics.models.yolo.detect.train_adv_fgd_phase2 import FGDAdversarialTrainer
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_adaptive import DetectionTrainerAdvFGDSTNAdaptive
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_staged import DetectionTrainerAdvFGDSTNStaged
 from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
@@ -187,9 +189,9 @@ class InjectedFaultLoss(torch.autograd.Function):
 class FaultyPGD(ARTPGD):
     """Injected faulty PGD attacker to test numerical failures and state preservation."""
 
-    def __init__(self, *args, fault_mode: str = "nan_grad", **kwargs):
+    def __init__(self, *args, **kwargs):
+        self.fault_mode = kwargs.pop("fault_mode", "nan_grad")
         super().__init__(*args, **kwargs)
-        self.fault_mode = fault_mode
         self._wrap_loss()
 
     def _wrap_loss(self):
@@ -1525,6 +1527,9 @@ class TestResearchTrainingIntegration(unittest.TestCase):
         """
         ds_h1 = create_synthetic_dataset(self.temp_dir / "ds_h1", num_images=2, imgsz=64)
         m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        from ultralytics.cfg import DEFAULT_CFG, get_cfg
+
+        m.args = get_cfg(DEFAULT_CFG)
         m.eval()
         val_pt = self.temp_dir / "val_h1.pt"
         torch.save({"model": m}, val_pt)
@@ -1550,7 +1555,7 @@ class TestResearchTrainingIntegration(unittest.TestCase):
                 "img": torch.zeros((2, 3, 64, 64), dtype=torch.float32),
                 "cls": torch.zeros((2, 1)),
                 "bboxes": torch.zeros((2, 4)),
-                "batch_idx": 0,
+                "batch_idx": torch.zeros(2, dtype=torch.int64),
             }
             with self.assertRaises(RuntimeError) as ctx:
                 v.preprocess(batch)
@@ -1576,15 +1581,16 @@ class TestResearchTrainingIntegration(unittest.TestCase):
             v_nan.attackers = {"pgd": faulty_pgd}
             v_nan.batch_i = 1
             batch_nan = {
-                "img": torch.rand((2, 3, 64, 64), dtype=torch.float32),
+                "img": torch.rand((2, 3, 64, 64), dtype=torch.float32) * 255.0,
                 "cls": torch.zeros((2, 1)),
                 "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.5, 0.5, 0.2, 0.2]]),
-                "batch_idx": 1,
+                "batch_idx": torch.tensor([0, 1], dtype=torch.int64),
             }
             with self.assertRaises(RuntimeError) as ctx:
                 v_nan.preprocess(batch_nan)
             self.assertIn("pgd", str(ctx.exception))
             self.assertIn("batch 1", str(ctx.exception))
+            self.assertIn("Adversarial gradient is NaN/Inf", str(ctx.exception))
 
         # 3. Raw validation succeeds
         with self.subTest(scenario="raw_validation_succeeds"):
@@ -1627,6 +1633,7 @@ class TestResearchTrainingIntegration(unittest.TestCase):
                 "img": torch.zeros((2, 3, 64, 64), dtype=torch.float32),
                 "cls": torch.zeros((2, 1)),
                 "bboxes": torch.zeros((2, 4)),
+                "batch_idx": torch.zeros(2, dtype=torch.int64),
             }
             with self.assertRaises(RuntimeError) as ctx:
                 v_p2.preprocess(batch_p2)
@@ -1767,75 +1774,136 @@ class TestResearchTrainingIntegration(unittest.TestCase):
             self.assertEqual(type(attack2), type(m))
 
     def test_h3_resume_parameter_priority_and_inheritance(self):
-        """Test H3 (R3): Resume parameter priority and inheritance:
-        1. Staged resume without --stage inherits Stage 2 from checkpoint (does not inject Stage 1).
-        2. Staged resume with --stage 2 and omitted attack parameters inherits saved attacks/eval_weights.
-        3. Plain adaptive resume without --attack_name does not inject default 4 attacks.
+        """Test H3 (R3): Resume parameter priority, warm checkpoint inheritance, and CLI regression:
+        1. Plain adaptive resume from real warm checkpoint preserves single/custom attack configuration
+           (e.g. ['worstk'], [0.5], p_clean=0.5, [1.0]) without injecting default 4 attacks.
+        2. Staged resume from real warm checkpoint preserves fixed surrogate weights and Stage 2 without
+           falling back to 'current'.
+        3. Staged resume with conflicting --stage 1 on a Stage 2 checkpoint raises ValueError early.
+        4. train_adv_test_run and train_adv_fgd_phase2_run parse_args on resume do not inject fresh defaults
+           (batch=24, imgsz=640, cache=True, use_fgd=True) into overrides.
+        5. FGDAdversarialTrainer(use_fgd=False) real warm checkpoint resumes cleanly without requiring fgd_weights.
+        6. Stage 1 fresh Python CLI default lr0 is 1e-5 while Shell script explicitly specifies 1e-6.
         """
-        ds_h1 = create_synthetic_dataset(self.temp_dir / "ds_h3", num_images=2, imgsz=64)
-        m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
-        ckpt_dir = self.temp_dir / "ckpt_h3"
-        weights_dir = ckpt_dir / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        last_pt = weights_dir / "last.pt"
-        torch.save(
-            {
-                "epoch": 1,
-                "model": m,
-                "best_fitness": 0.5,
-                "train_args": {
-                    "data": str(ds_h1),
-                    "model": "yolo11n.yaml",
-                    "epochs": 5,
-                    "batch": 2,
-                    "imgsz": 64,
+
+        # Helper to produce real warm checkpoints by stopping after epoch 0
+        def _make_warm_checkpoint(trainer_cls, extra_overrides, name):
+            base = {
+                "model": "yolo11n.yaml",
+                "data": str(self.data_yaml),
+                "epochs": 5,
+                "imgsz": 64,
+                "batch": 2,
+                "workers": 0,
+                "device": "cpu",
+                "amp": False,
+                "project": str(self.temp_dir / f"runs_{name}"),
+                "name": "exp",
+                "plots": False,
+                "val": True,
+                "save": True,
+            }
+            base.update(extra_overrides)
+            tr = trainer_cls(overrides=base)
+
+            def stop_epoch0(t):
+                if t.epoch == 0 and t.last.exists():
+                    raise KeyboardInterrupt("Simulated training interruption for warm checkpoint")
+
+            tr.add_callback("on_fit_epoch_end", stop_epoch0)
+            try:
+                tr.train()
+            except KeyboardInterrupt:
+                pass
+            ckpt_path = Path(tr.last).resolve()
+            self.assertTrue(ckpt_path.exists(), f"Warm checkpoint {ckpt_path} was not created!")
+            return ckpt_path
+
+        # 1. Plain adaptive resume from real warm checkpoint
+        with self.subTest(scenario="plain_adaptive_warm_resume"):
+            warm_adaptive = _make_warm_checkpoint(
+                DetectionTrainerAdvAdaptive,
+                {
+                    "attack_name": ["worstk"],
+                    "attack_ratio": [0.5],
+                    "p_clean": 0.5,
+                    "eval_weights": [1.0],
                 },
-            },
-            last_pt,
-        )
+                "adaptive_h3",
+            )
+            parsed_ad = train_adv_adaptive_run.parse_args(["--resume", str(warm_adaptive)])
+            self.assertFalse(hasattr(parsed_ad, "attack_name"))
+            self.assertFalse(hasattr(parsed_ad, "eval_weights"))
+            t_ad = DetectionTrainerAdvAdaptive(overrides={"resume": str(warm_adaptive)})
+            self.assertEqual(t_ad.attack_names, ["worstk"])
+            self.assertEqual(t_ad.attack_ratios, [0.5])
+            self.assertEqual(t_ad.p_clean, 0.5)
+            self.assertEqual(t_ad.eval_weights, [1.0])
 
-        args_yaml = ckpt_dir / "args.yaml"
-        saved_config = {
-            "model": "yolo11n.yaml",
-            "data": str(ds_h1),
-            "stage": 2,
-            "attack_name": ["pgd", "bim"],
-            "attack_ratio": [0.4, 0.6],
-            "eval_weights": [0.3, 0.7],
-            "seed": 0,
-            "p_clean": 0.5,
-            "update_interval": 1,
-            "preprocess_mode": "none",
-        }
-        with open(args_yaml, "w", encoding="utf-8") as f:
-            yaml.dump(saved_config, f)
+        # 2. Staged resume preserves fixed surrogate and Stage 2
+        with self.subTest(scenario="staged_warm_resume_surrogate"):
+            surrogate_pt = self.temp_dir / "surrogate_h3.pt"
+            torch.save({"model": DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)}, surrogate_pt)
+            stage1_pt = self.temp_dir / "stage1_h3.pt"
+            torch.save({"model": DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)}, stage1_pt)
 
-        # 1. Staged resume without --stage inherits Stage 2 from checkpoint
-        with self.subTest(scenario="staged_resume_inherits_stage"):
-            args1 = train_adv_fgd_stn_staged_run.parse_args(["--resume", str(last_pt)])
-            self.assertFalse(hasattr(args1, "stage"), "Omitted --stage must not be in parsed args!")
-            t1 = DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(last_pt)})
-            self.assertEqual(t1.stage, 2, "Stage must be inherited from checkpoint as Stage 2!")
-            self.assertEqual(t1.attack_names, ["pgd", "bim"], "Attacks must be inherited from checkpoint!")
-            self.assertEqual(t1.eval_weights, [0.3, 0.7], "Eval weights must be inherited from checkpoint!")
+            warm_staged = _make_warm_checkpoint(
+                DetectionTrainerAdvFGDSTNStaged,
+                {
+                    "stage": 2,
+                    "stage1_weights": str(stage1_pt),
+                    "attack_weights": str(surrogate_pt),
+                    "preprocess_mode": "stn_fgd",
+                    "fgd_weights": str(self.fgd_path),
+                    "stn_weights": str(self.stn_path),
+                },
+                "staged_h3",
+            )
+            parsed_staged = train_adv_fgd_stn_staged_run.parse_args(["--resume", str(warm_staged)])
+            self.assertFalse(hasattr(parsed_staged, "attack_weights"))
+            self.assertFalse(hasattr(parsed_staged, "stage"))
 
-        # 2. Staged resume with --stage 2 and omitted attack parameters inherits saved attacks
-        with self.subTest(scenario="staged_resume_stage2_inherits_attacks"):
-            args2 = train_adv_fgd_stn_staged_run.parse_args(["--resume", str(last_pt), "--stage", "2"])
-            self.assertFalse(hasattr(args2, "attack_name"))
-            self.assertFalse(hasattr(args2, "eval_weights"))
-            t2 = DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(last_pt), "stage": 2})
-            self.assertEqual(t2.stage, 2)
-            self.assertEqual(t2.attack_names, ["pgd", "bim"], "Stage 2 resume must preserve saved attacks!")
-            self.assertEqual(t2.eval_weights, [0.3, 0.7], "Stage 2 resume must preserve saved eval weights!")
+            t_staged = DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(warm_staged)})
+            self.assertEqual(t_staged.stage, 2)
+            self.assertEqual(t_staged.args.attack_weights, str(surrogate_pt))
+            self.assertEqual(t_staged.attack_weights, str(surrogate_pt))
 
-        # 3. Plain adaptive resume without --attack_name does not inject default 4 attacks
-        with self.subTest(scenario="adaptive_resume_inherits_attacks"):
-            args3 = train_adv_adaptive_run.parse_args(["--resume", str(last_pt)])
-            self.assertFalse(hasattr(args3, "attack_name"))
-            self.assertFalse(hasattr(args3, "eval_weights"))
-            t3 = DetectionTrainerAdvAdaptive(overrides={"resume": str(last_pt)})
-            self.assertEqual(t3.attack_names, ["pgd", "bim"], "Adaptive resume must preserve saved attacks!")
+            # 3. Stage conflict rejection
+            with self.assertRaises(ValueError) as ctx_stage:
+                DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(warm_staged), "stage": 1})
+            self.assertIn("Cannot change stage from 2 to 1", str(ctx_stage.exception))
+
+        # 4. train_adv_test_run and train_adv_fgd_phase2_run CLI resume argument suppression
+        with self.subTest(scenario="cli_resume_arg_suppression"):
+            args_test = train_adv_test_run.parse_args(["--resume", str(warm_adaptive)])
+            self.assertNotIn("batch", vars(args_test))
+            self.assertNotIn("imgsz", vars(args_test))
+            self.assertNotIn("cache", vars(args_test))
+
+            args_p2 = train_adv_fgd_phase2_run.parse_args(["--resume", str(warm_adaptive)])
+            self.assertNotIn("batch", vars(args_p2))
+            self.assertNotIn("imgsz", vars(args_p2))
+            self.assertNotIn("cache", vars(args_p2))
+            self.assertNotIn("use_fgd", vars(args_p2))
+
+        # 5. Phase 2 resume with use_fgd=False does not require fgd_weights
+        with self.subTest(scenario="phase2_resume_use_fgd_false"):
+            warm_p2 = _make_warm_checkpoint(
+                FGDAdversarialTrainer,
+                {"use_fgd": False, "fgd_weights": None},
+                "phase2_h3",
+            )
+            resumed_p2 = FGDAdversarialTrainer(overrides={"resume": str(warm_p2), "use_fgd": False})
+            self.assertFalse(resumed_p2.phase2["use_fgd"])
+
+        # 6. Stage 1 default lr0: Python CLI (1e-5) vs Shell script (1e-6)
+        with self.subTest(scenario="stage1_lr0_python_vs_shell"):
+            repo_root = Path(__file__).resolve().parents[1]
+            staged_py = (repo_root / "train_adv_fgd_stn_staged_run.py").read_text(encoding="utf-8")
+            self.assertIn("default_lr0 = 1e-5", staged_py)
+
+            staged_sh = (repo_root / "train_adv_fgd_stn_staged_local.sh").read_text(encoding="utf-8")
+            self.assertIn('LR0="${LR0:-1e-6}"', staged_sh)
 
     def test_h4_workers_none_handling(self):
         """Test H4 (R4): workers=None handling across runners:
@@ -1865,7 +1933,8 @@ class TestResearchTrainingIntegration(unittest.TestCase):
 
     def test_h5_joint_training_job_seed_array(self):
         """Test H5 (R5): Verify train_fgd_stn_joint_job.sh appends --seed to TRAIN_ARGS not ARGS."""
-        job_script = Path("train_fgd_stn_joint_job.sh")
+        repo_root = Path(__file__).resolve().parents[1]
+        job_script = repo_root / "train_fgd_stn_joint_job.sh"
         self.assertTrue(job_script.exists())
         content = job_script.read_text(encoding="utf-8")
         self.assertIn('TRAIN_ARGS+=(--seed "$SEED")', content)
@@ -1877,9 +1946,10 @@ class TestResearchTrainingIntegration(unittest.TestCase):
         2. Later stages pass --model "${CURRENT_MODEL}".
         3. CURRENT_MODEL is updated only when stage output artifact exists ([ -f ... ]).
         """
+        repo_root = Path(__file__).resolve().parents[1]
         for script_name in ("run_hydra_adv_pipeline_local.sh", "run_hydra_adv_pipeline_job.sh"):
             with self.subTest(script=script_name):
-                script_path = Path(script_name)
+                script_path = repo_root / script_name
                 self.assertTrue(script_path.exists())
                 content = script_path.read_text(encoding="utf-8")
                 self.assertIn('CURRENT_MODEL="${INPUT_MODEL}"', content)

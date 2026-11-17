@@ -12,6 +12,55 @@ if [[ ! -f "$ROOT/train_adv_adaptive_run.py" || ! -f "$ROOT/.yolo_env/bin/activa
 fi
 source "$ROOT/.yolo_env/bin/activate"
 
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
+export PYTHONUNBUFFERED=1
+# Optional: override this variable externally if the allocator causes a CUDA issue.
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
+
+RESUME="${RESUME:-}"     # Must be an existing runs/.../weights/last.pt for a resume
+
+if [[ -n "$RESUME" ]]; then
+  if [[ ! -f "$RESUME" ]]; then
+    echo "ERROR: Resume checkpoint not found: $RESUME" >&2
+    exit 1
+  fi
+  ARGS=(--resume "$RESUME")
+  if [[ -v DEVICE && -n "$DEVICE" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -v WORKERS && -n "$WORKERS" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -v CACHE && -n "$CACHE" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -v PROJECT && -n "$PROJECT" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -v NAME && -n "$NAME" ]]; then ARGS+=(--name "$NAME"); fi
+  if [[ -v SEED && -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
+  if [[ -v CLASSES && -n "$CLASSES" ]]; then
+    read -r -a CLASS_IDS <<< "$CLASSES"
+    if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+  fi
+
+  LOG_PROJECT="${PROJECT:-$ROOT/runs}"
+  LOG_NAME="${NAME:-resume_$(basename "$RESUME" .pt)}"
+  mkdir -p "$ROOT/logs" "$LOG_PROJECT"
+  LOG_FILE="$ROOT/logs/${LOG_NAME}-$(date +%Y%m%d-%H%M%S).log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "[local dynamic adaptive adversarial train resume] $(date -Is)"
+  echo "Project root: $ROOT"
+  echo "Resume checkpoint: $RESUME"
+  echo "Log: $LOG_FILE"
+  python - <<'PY'
+import torch
+print('PyTorch:', torch.__version__, '| torch CUDA:', torch.version.cuda)
+assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
+print('GPU:', torch.cuda.get_device_name(0))
+PY
+
+  printf 'Command: python -u train_adv_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
+  python -u train_adv_adaptive_run.py "${ARGS[@]}"
+  echo "Training finished: $(date -Is)"
+  exit 0
+fi
+
 # Original job-script positionals, with environment variable overrides:
 #   bash train_adv_adaptive_local.sh [attack_weights] [data_yaml] [epochs] [attack_names] [attack_ratios]
 ATTACK_WEIGHTS="${ATTACK_WEIGHTS:-${1:-current}}"
@@ -35,15 +84,7 @@ DEVICE="${DEVICE:-0}"
 CACHE="${CACHE:-True}"  # RAM cache can be enabled explicitly after checking system RAM
 PROJECT="${PROJECT:-$ROOT/runs}"
 JOB_NAME="${JOB_NAME:-local_adv_adaptive}"
-RESUME="${RESUME:-}"     # Must be an existing runs/.../weights/last.pt for a resume
 CLASSES="${CLASSES:-0 1 2 3 5 6 7 9 11 12}"
-
-export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
-export PYTHONUNBUFFERED=1
-# Optional: override this variable externally if the allocator causes a CUDA issue.
-export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
 
 # Resolve the dataset YAML.
 if [[ -f "$DATA" ]]; then
@@ -55,10 +96,6 @@ else
   exit 1
 fi
 
-if [[ -n "$RESUME" && ! -f "$RESUME" ]]; then
-  echo "ERROR: Resume checkpoint not found: $RESUME" >&2
-  exit 1
-fi
 read -r -a ATTACK_NAMES <<< "$ATTACK_NAME"
 read -r -a ATTACK_RATIOS <<< "$ATTACK_RATIO"
 read -r -a CLASS_IDS <<< "$CLASSES"
@@ -91,37 +128,26 @@ assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
 print('GPU:', torch.cuda.get_device_name(0))
 PY
 
-if [[ -n "$RESUME" ]]; then
-  ARGS=(--resume "$RESUME")
-  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
-  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
-  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
-  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
-  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
-  if [[ -n "${SEED:-}" ]]; then ARGS+=(--seed "$SEED"); fi
-  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-else
-  ARGS=(
-    --model "$YOLO_WEIGHTS"
-    --attack_weights "$ATTACK_WEIGHTS"
-    --data "$DATA_ARG"
-    --imgsz "$IMGSZ"
-    --epochs "$EPOCHS"
-    --batch "$BATCH"
-    --device "$DEVICE"
-    --workers "$WORKERS"
-    --cache "$CACHE"
-    --attack_name "${ATTACK_NAMES[@]}"
-    --attack_ratio "${ATTACK_RATIOS[@]}"
-    --p_clean "$P_CLEAN"
-    --tau "$TAU"
-    --update_interval "$UPDATE_INTERVAL"
-    --project "$PROJECT"
-    --name "$NAME"
-  )
-  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-  if (( ${#EVAL_WEIGHTS_ARR[@]} > 0 )); then ARGS+=(--eval_weights "${EVAL_WEIGHTS_ARR[@]}"); fi
-fi
+ARGS=(
+  --model "$YOLO_WEIGHTS"
+  --attack_weights "$ATTACK_WEIGHTS"
+  --data "$DATA_ARG"
+  --imgsz "$IMGSZ"
+  --epochs "$EPOCHS"
+  --batch "$BATCH"
+  --device "$DEVICE"
+  --workers "$WORKERS"
+  --cache "$CACHE"
+  --attack_name "${ATTACK_NAMES[@]}"
+  --attack_ratio "${ATTACK_RATIOS[@]}"
+  --p_clean "$P_CLEAN"
+  --tau "$TAU"
+  --update_interval "$UPDATE_INTERVAL"
+  --project "$PROJECT"
+  --name "$NAME"
+)
+if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+if (( ${#EVAL_WEIGHTS_ARR[@]} > 0 )); then ARGS+=(--eval_weights "${EVAL_WEIGHTS_ARR[@]}"); fi
 
 printf 'Command: python -u train_adv_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
 python -u train_adv_adaptive_run.py "${ARGS[@]}"

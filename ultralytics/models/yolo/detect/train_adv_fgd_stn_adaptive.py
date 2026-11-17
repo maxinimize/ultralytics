@@ -30,9 +30,8 @@ from ultralytics.defenses.fgd_stn_pipeline import (
 )
 from ultralytics.models.yolo.detect.train_adv_adaptive import (
     DetectionTrainer as DetectionTrainerAdvAdaptive,
-)
-from ultralytics.models.yolo.detect.train_adv_adaptive import (
     DynamicAttackRatioController,
+    _load_saved_args,
 )
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_adaptive import (
     DetectionValidatorAdvFGDSTNAdaptive,
@@ -182,18 +181,7 @@ class DetectionTrainerAdvFGDSTNAdaptive(DetectionTrainerAdvAdaptive):
             overrides = {}
 
         # Extract research arguments
-        saved_args = {}
-        resume = overrides.get("resume", False)
-        if resume and isinstance(resume, (str, Path)) and str(resume).endswith(".pt"):
-            args_yaml = Path(resume).resolve().parent.parent / "args.yaml"
-            if args_yaml.exists():
-                try:
-                    import yaml
-
-                    with open(args_yaml, "r", encoding="utf-8") as f:
-                        saved_args = yaml.safe_load(f) or {}
-                except Exception as e:
-                    LOGGER.warning(f"Could not load saved configuration from {args_yaml}: {e}")
+        saved_args = _load_saved_args(overrides.get("resume", False))
 
         # Pop research options
         self._preprocess_mode_arg = canonicalize_mode(

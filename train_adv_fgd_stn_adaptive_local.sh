@@ -12,6 +12,56 @@ if [[ ! -f "$ROOT/train_adv_fgd_stn_adaptive_run.py" || ! -f "$ROOT/.yolo_env/bi
 fi
 source "$ROOT/.yolo_env/bin/activate"
 
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
+
+RESUME="${RESUME:-}"
+
+if [[ -n "$RESUME" ]]; then
+  if [[ ! -f "$RESUME" ]]; then
+    echo "ERROR: Resume checkpoint not found: $RESUME" >&2
+    exit 1
+  fi
+  ARGS=(--resume "$RESUME")
+  if [[ -v DEVICE && -n "$DEVICE" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -v WORKERS && -n "$WORKERS" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -v CACHE && -n "$CACHE" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -v AMP && -n "$AMP" ]]; then ARGS+=(--amp "$AMP"); fi
+  if [[ -v PROJECT && -n "$PROJECT" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -v NAME && -n "$NAME" ]]; then ARGS+=(--name "$NAME"); fi
+  if [[ -v SEED && -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
+  if [[ -v CLASSES && -n "$CLASSES" ]]; then
+    read -r -a CLASS_IDS <<< "$CLASSES"
+    if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+  fi
+
+  LOG_PROJECT="${PROJECT:-$ROOT/runs/train_adv_fgd_stn_adaptive}"
+  LOG_NAME="${NAME:-resume_$(basename "$RESUME" .pt)}"
+  mkdir -p "$ROOT/logs" "$LOG_PROJECT"
+  LOG_FILE="$ROOT/logs/${LOG_NAME}-$(date +%Y%m%d-%H%M%S).log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "[local FGD+STN Adaptive AT resume] $(date -Is)"
+  echo "Project root: $ROOT"
+  echo "Resume checkpoint: $RESUME"
+  echo "Log: $LOG_FILE"
+  python - <<'PY'
+import torch
+print('PyTorch:', torch.__version__, '| torch CUDA:', torch.version.cuda)
+assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
+print('GPU:', torch.cuda.get_device_name(0), '| BF16:', torch.cuda.is_bf16_supported())
+PY
+
+  printf 'Command: python -u train_adv_fgd_stn_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
+  python -u train_adv_fgd_stn_adaptive_run.py "${ARGS[@]}"
+  echo "Training finished: $(date -Is)"
+  exit 0
+fi
+
 # Configuration options with environment variable overrides:
 PREPROCESS_MODE="${PREPROCESS_MODE:-${1:-stn_fgd}}"
 ADAPTIVE_RATIO="${ADAPTIVE_RATIO:-${2:-true}}"
@@ -37,15 +87,7 @@ ATTACK_RATIOS="${ATTACK_RATIOS:-0.10 0.10 0.40 0.15}"
 EVAL_WEIGHTS="${EVAL_WEIGHTS:-0.25 0.25 0.25 0.25}"
 PROJECT="${PROJECT:-$ROOT/runs/train_adv_fgd_stn_adaptive}"
 JOB_NAME="${JOB_NAME:-local_adv_fgd_stn_adaptive}"
-RESUME="${RESUME:-}"
 CLASSES="${CLASSES:-0 1 2 3 5 6 7 9 11 12}"
-
-export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
-export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
-export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
 
 # Resolve dataset YAML
 if [[ -f "$DATA" ]]; then
@@ -86,45 +128,33 @@ assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
 print('GPU:', torch.cuda.get_device_name(0), '| BF16:', torch.cuda.is_bf16_supported())
 PY
 
-if [[ -n "$RESUME" ]]; then
-  ARGS=(--resume "$RESUME")
-  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
-  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
-  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
-  if [[ -n "${AMP:-}" ]]; then ARGS+=(--amp "$AMP"); fi
-  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
-  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
-  if [[ -n "${SEED:-}" ]]; then ARGS+=(--seed "$SEED"); fi
-  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-else
-  ARGS=(
-    --model "$YOLO_WEIGHTS"
-    --data "$DATA_ARG"
-    --preprocess_mode "$PREPROCESS_MODE"
-    --fgd_weights "$FGD_WEIGHTS"
-    --stn_weights "$STN_WEIGHTS"
-    --adaptive_ratio "$ADAPTIVE_RATIO"
-    --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
-    --p_clean "$P_CLEAN"
-    --tau "$TAU"
-    --update_interval "$UPDATE_INTERVAL"
-    --attack_weights "$ATTACK_WEIGHTS"
-    --imgsz "$IMGSZ"
-    --epochs "$EPOCHS"
-    --batch "$BATCH"
-    --device "$DEVICE"
-    --workers "$WORKERS"
-    --cache "$CACHE"
-    --amp "$AMP"
-    --fraction "$FRACTION"
-    --attack_name "${ATTACK_NAME_ARR[@]}"
-    --attack_ratio "${ATTACK_RATIO_ARR[@]}"
-    --eval_weights "${EVAL_WEIGHT_ARR[@]}"
-    --project "$PROJECT"
-    --name "$NAME"
-  )
-  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-fi
+ARGS=(
+  --model "$YOLO_WEIGHTS"
+  --data "$DATA_ARG"
+  --preprocess_mode "$PREPROCESS_MODE"
+  --fgd_weights "$FGD_WEIGHTS"
+  --stn_weights "$STN_WEIGHTS"
+  --adaptive_ratio "$ADAPTIVE_RATIO"
+  --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
+  --p_clean "$P_CLEAN"
+  --tau "$TAU"
+  --update_interval "$UPDATE_INTERVAL"
+  --attack_weights "$ATTACK_WEIGHTS"
+  --imgsz "$IMGSZ"
+  --epochs "$EPOCHS"
+  --batch "$BATCH"
+  --device "$DEVICE"
+  --workers "$WORKERS"
+  --cache "$CACHE"
+  --amp "$AMP"
+  --fraction "$FRACTION"
+  --attack_name "${ATTACK_NAME_ARR[@]}"
+  --attack_ratio "${ATTACK_RATIO_ARR[@]}"
+  --eval_weights "${EVAL_WEIGHT_ARR[@]}"
+  --project "$PROJECT"
+  --name "$NAME"
+)
+if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
 
 printf 'Command: python -u train_adv_fgd_stn_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
 python -u train_adv_fgd_stn_adaptive_run.py "${ARGS[@]}"

@@ -32,6 +32,7 @@ from ultralytics.defenses.fgd_stn_pipeline import (
     build_fgd_stn_pipeline,
     transform_batch_bboxes_for_stn,
 )
+from ultralytics.models.yolo.detect.train_adv_adaptive import _load_saved_args
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_adaptive import (
     AdaptiveAttackRatioController,
     DetectionTrainerAdvFGDSTNAdaptive,
@@ -232,18 +233,8 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
             overrides = {}
 
         # Parse saved args if resuming
-        saved_args = {}
+        saved_args = _load_saved_args(overrides.get("resume", False))
         resume = overrides.get("resume", False)
-        if resume and isinstance(resume, (str, Path)) and str(resume).endswith(".pt"):
-            args_yaml = Path(resume).resolve().parent.parent / "args.yaml"
-            if args_yaml.exists():
-                try:
-                    import yaml
-
-                    with open(args_yaml, "r", encoding="utf-8") as f:
-                        saved_args = yaml.safe_load(f) or {}
-                except (OSError, yaml.YAMLError) as e:
-                    LOGGER.warning(f"Could not load saved configuration from {args_yaml}: {e}")
 
         if resume and "seed" in overrides and overrides["seed"] is not None:
             saved_seed = saved_args.get("seed", None)
@@ -253,7 +244,20 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
                     "Start a new run to change seed."
                 )
 
-        # Stage configuration
+        # Stage configuration & conflict check
+        saved_stage = saved_args.get("stage")
+        if (
+            resume
+            and "stage" in overrides
+            and overrides["stage"] is not None
+            and saved_stage is not None
+            and int(overrides["stage"]) != int(saved_stage)
+        ):
+            raise ValueError(
+                f"Cannot change stage from {saved_stage} to {overrides['stage']} when resuming training. "
+                f"Checkpoint was trained with stage {saved_stage}, but requested stage {overrides['stage']}."
+            )
+
         raw_stage = overrides.pop("stage", saved_args.get("stage", 1))
         self.stage = int(raw_stage)
 
@@ -361,14 +365,28 @@ class DetectionTrainerAdvFGDSTNStaged(DetectionTrainerAdvFGDSTNAdaptive):
         overrides["strict_attacks"] = self.strict_attacks
 
         # Attack source
-        raw_att_w = overrides.get("attack_weights", attack_weights)
+        if "attack_weights" in overrides:
+            raw_att_w = overrides.pop("attack_weights")
+        elif attack_weights:
+            raw_att_w = attack_weights
+        elif resume and "attack_weights" in saved_args:
+            raw_att_w = saved_args["attack_weights"]
+        else:
+            raw_att_w = "current"
+
         if raw_att_w is not None and str(raw_att_w).strip().lower() in {"", "none", "current"}:
             overrides["attack_weights"] = "current"
             effective_attack_weights = "current"
         else:
-            effective_attack_weights = raw_att_w or "current"
+            overrides["attack_weights"] = str(raw_att_w)
+            effective_attack_weights = str(raw_att_w)
 
         super().__init__(cfg, overrides, _callbacks, attack_weights=effective_attack_weights)
+
+        # Ensure attack_weights attribute is explicitly preserved
+        self._attack_weights_arg = effective_attack_weights
+        self.attack_weights = effective_attack_weights
+        self.args.attack_weights = effective_attack_weights
 
         # Store staged attributes
         self.args.stage = self.stage

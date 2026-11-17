@@ -12,8 +12,59 @@ if [[ ! -f "$ROOT/train_adv_fgd_stn_staged_run.py" || ! -f "$ROOT/.yolo_env/bin/
 fi
 source "$ROOT/.yolo_env/bin/activate"
 
-# Stage parameter: 1 (Clean Fine-tuning) or 2 (Adaptive AT)
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
+
 EXPLICIT_STAGE="${STAGE:-${1:-}}"
+RESUME="${RESUME:-}"
+
+if [[ -n "$RESUME" ]]; then
+  if [[ ! -f "$RESUME" ]]; then
+    echo "ERROR: Resume checkpoint not found: $RESUME" >&2
+    exit 1
+  fi
+  ARGS=(--resume "$RESUME")
+  if [[ -n "$EXPLICIT_STAGE" ]]; then
+    ARGS+=(--stage "$EXPLICIT_STAGE")
+  fi
+  if [[ -v DEVICE && -n "$DEVICE" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -v WORKERS && -n "$WORKERS" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -v AMP && -n "$AMP" ]]; then ARGS+=(--amp "$AMP"); fi
+  if [[ -v CACHE && -n "$CACHE" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -v PROJECT && -n "$PROJECT" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -v NAME && -n "$NAME" ]]; then ARGS+=(--name "$NAME"); fi
+  if [[ -v SEED && -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
+  if [[ "${EVAL_ONLY:-}" == "true" || "${EVAL_ONLY:-}" == "1" ]]; then ARGS+=(--eval_only); fi
+  if [[ "${EVAL_EPOCH0:-}" == "true" || "${EVAL_EPOCH0:-}" == "1" ]]; then ARGS+=(--eval_epoch0); fi
+  if [[ -v CLASSES && -n "$CLASSES" ]]; then
+    read -r -a CLASS_IDS <<< "$CLASSES"
+    if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+  fi
+
+  LOG_PROJECT="${PROJECT:-$ROOT/runs/train_adv_fgd_stn_staged}"
+  LOG_NAME="${NAME:-resume_$(basename "$RESUME" .pt)}"
+  mkdir -p "$ROOT/logs" "$LOG_PROJECT"
+  LOG_FILE="$ROOT/logs/${LOG_NAME}-$(date +%Y%m%d-%H%M%S).log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "================================================================="
+  echo "[Staged FGD+STN Training Resume] $(date -Is)"
+  echo "Project root: $ROOT"
+  echo "Resume checkpoint: $RESUME"
+  echo "Log File: $LOG_FILE"
+  echo "================================================================="
+
+  printf 'Command: python -u train_adv_fgd_stn_staged_run.py'; printf ' %q' "${ARGS[@]}"; echo
+  python -u train_adv_fgd_stn_staged_run.py "${ARGS[@]}"
+  echo "Training finished: $(date -Is)"
+  exit 0
+fi
+
+# Stage parameter: 1 (Clean Fine-tuning) or 2 (Adaptive AT)
 STAGE="${EXPLICIT_STAGE:-2}"
 STAGE1_WEIGHTS="${STAGE1_WEIGHTS:-${2:-}}"
 
@@ -164,24 +215,8 @@ echo "GPU Device: $DEVICE | Workers: $WORKERS | AMP: $AMP | Cache: $CACHE"
 echo "Log File: $LOG_FILE"
 echo "================================================================="
 
-if [[ -n "$RESUME" ]]; then
-  ARGS=(--resume "$RESUME")
-  if [[ -n "$EXPLICIT_STAGE" ]]; then
-    ARGS+=(--stage "$EXPLICIT_STAGE")
-  fi
-  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
-  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
-  if [[ -n "${AMP:-}" ]]; then ARGS+=(--amp "$AMP"); fi
-  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
-  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
-  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
-  if [[ -n "${SEED:-}" ]]; then ARGS+=(--seed "$SEED"); fi
-  if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then ARGS+=(--eval_only); fi
-  if [[ "$EVAL_EPOCH0" == "true" || "$EVAL_EPOCH0" == "1" ]]; then ARGS+=(--eval_epoch0); fi
-  if [[ -n "${CLASS_IDS[*]:-}" ]]; then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-else
-  ARGS=(
-    --stage "$STAGE"
+ARGS=(
+  --stage "$STAGE"
     --preprocess_mode "$PREPROCESS_MODE"
     --fgd_weights "$FGD_WEIGHTS"
     --stn_weights "$STN_WEIGHTS"
@@ -264,7 +299,6 @@ else
       --eval_weights "${EVAL_WEIGHT_ARR[@]}"
     )
   fi
-fi
 
 echo "Executing: python train_adv_fgd_stn_staged_run.py ${ARGS[*]}"
 python train_adv_fgd_stn_staged_run.py "${ARGS[@]}"

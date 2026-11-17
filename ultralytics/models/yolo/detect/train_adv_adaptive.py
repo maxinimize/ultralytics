@@ -62,6 +62,89 @@ def parse_list_arg(val, type_conv=str):
     return [type_conv(p.strip()) for p in parts if p.strip()]
 
 
+def _load_saved_args(resume: Any) -> dict[str, Any]:
+    """Extract saved configuration from checkpoint and sidecar files on resume.
+
+    Priority:
+    1. Checkpoint train_args (highest authority for custom research arguments).
+    2. Sidecar phase2_fgd.yaml (for Phase 2 FGD runs).
+    3. Sidecar args.yaml (standard Ultralytics run configuration).
+    """
+    if not resume:
+        return {}
+
+    ckpt_path = None
+    if isinstance(resume, (str, Path)):
+        p = Path(resume)
+        if p.exists():
+            ckpt_path = p.resolve()
+        else:
+            try:
+                from ultralytics.utils.checks import check_file
+
+                ckpt_path = Path(check_file(str(resume))).resolve()
+            except Exception:
+                ckpt_path = None
+    elif resume is True:
+        try:
+            from ultralytics.utils.files import get_latest_run
+
+            ckpt_path = Path(get_latest_run()).resolve()
+        except Exception:
+            ckpt_path = None
+
+    if not ckpt_path or not ckpt_path.is_file():
+        return {}
+
+    saved_args: dict[str, Any] = {}
+
+    # 1. Read sidecar args.yaml if present
+    for parent in (ckpt_path.parent.parent, ckpt_path.parent):
+        args_yaml = parent / "args.yaml"
+        if args_yaml.is_file():
+            try:
+                import yaml
+
+                with open(args_yaml, "r", encoding="utf-8") as f:
+                    content = yaml.safe_load(f)
+                    if isinstance(content, dict):
+                        saved_args.update(content)
+                break
+            except Exception as e:
+                LOGGER.warning(f"Could not load saved configuration from {args_yaml}: {e}")
+
+    # 2. Read sidecar phase2_fgd.yaml if present
+    for parent in (ckpt_path.parent.parent, ckpt_path.parent):
+        phase2_yaml = parent / "phase2_fgd.yaml"
+        if phase2_yaml.is_file():
+            try:
+                import yaml
+
+                with open(phase2_yaml, "r", encoding="utf-8") as f:
+                    content = yaml.safe_load(f)
+                    if isinstance(content, dict):
+                        saved_args.update(content)
+                break
+            except Exception as e:
+                LOGGER.warning(f"Could not load saved configuration from {phase2_yaml}: {e}")
+
+    # 3. Read checkpoint train_args directly (highest priority)
+    try:
+        from ultralytics.nn.tasks import torch_safe_load
+
+        ckpt, _ = torch_safe_load(ckpt_path)
+        if isinstance(ckpt, dict):
+            train_args = ckpt.get("train_args")
+            if isinstance(train_args, dict):
+                saved_args.update(train_args)
+            if "stage" in ckpt and "stage" not in saved_args:
+                saved_args["stage"] = ckpt["stage"]
+    except Exception as e:
+        LOGGER.warning(f"Could not load train_args from checkpoint {ckpt_path}: {e}")
+
+    return saved_args
+
+
 class DynamicAttackRatioController:
     """Controller for dynamic attack ratio adversarial training based on validation mAP."""
 
@@ -504,34 +587,64 @@ class DetectionTrainer(BaseTrainer):
 
         overrides.setdefault("amp", "bf16")
 
-        saved_args = {}
-        resume = overrides.get("resume", False)
-        if resume and isinstance(resume, (str, Path)) and str(resume).endswith(".pt"):
-            args_yaml = Path(resume).resolve().parent.parent / "args.yaml"
-            if args_yaml.exists():
-                try:
-                    import yaml
-
-                    with open(args_yaml, "r") as f:
-                        saved_args = yaml.safe_load(f) or {}
-                except Exception as e:
-                    LOGGER.warning(f"Could not load attack configuration from {args_yaml}: {e}")
+        saved_args = _load_saved_args(overrides.get("resume", False))
 
         raw_strict = overrides.pop("strict_attacks", saved_args.get("strict_attacks", strict_attacks))
         self.strict_attacks = (
             raw_strict if isinstance(raw_strict, bool) else str(raw_strict).lower() in ("true", "1", "yes")
         )
 
-        popped_attack_weights = overrides.pop("attack_weights", saved_args.get("attack_weights", ""))
-        self._attack_weights_arg = attack_weights or popped_attack_weights
-        self._attack_name_arg = overrides.pop(
-            "attack_name", saved_args.get("attack_name", ["pgd", "bim", "mim", "worstk"])
-        )
-        self._attack_ratio_arg = overrides.pop("attack_ratio", saved_args.get("attack_ratio", [0.10, 0.10, 0.40, 0.15]))
-        self._p_clean_arg = overrides.pop("p_clean", saved_args.get("p_clean", 0.25))
-        self._tau_arg = overrides.pop("tau", saved_args.get("tau", 5.0))
-        self._update_interval_arg = overrides.pop("update_interval", saved_args.get("update_interval", 5))
-        self._eval_weights_arg = overrides.pop("eval_weights", saved_args.get("eval_weights", [0.25, 0.15, 0.15, 0.20]))
+        popped_attack_weights = overrides.pop("attack_weights", None)
+        if popped_attack_weights is not None:
+            self._attack_weights_arg = popped_attack_weights
+        elif attack_weights:
+            self._attack_weights_arg = attack_weights
+        elif "attack_weights" in saved_args:
+            self._attack_weights_arg = saved_args["attack_weights"]
+        else:
+            self._attack_weights_arg = ""
+
+        if "attack_name" in overrides:
+            self._attack_name_arg = overrides.pop("attack_name")
+        elif "attack_name" in saved_args:
+            self._attack_name_arg = saved_args["attack_name"]
+        else:
+            self._attack_name_arg = ["pgd", "bim", "mim", "worstk"]
+
+        if "attack_ratio" in overrides:
+            self._attack_ratio_arg = overrides.pop("attack_ratio")
+        elif "attack_ratio" in saved_args:
+            self._attack_ratio_arg = saved_args["attack_ratio"]
+        else:
+            self._attack_ratio_arg = [0.10, 0.10, 0.40, 0.15]
+
+        if "p_clean" in overrides:
+            self._p_clean_arg = overrides.pop("p_clean")
+        elif "p_clean" in saved_args:
+            self._p_clean_arg = saved_args["p_clean"]
+        else:
+            self._p_clean_arg = 0.25
+
+        if "tau" in overrides:
+            self._tau_arg = overrides.pop("tau")
+        elif "tau" in saved_args:
+            self._tau_arg = saved_args["tau"]
+        else:
+            self._tau_arg = 5.0
+
+        if "update_interval" in overrides:
+            self._update_interval_arg = overrides.pop("update_interval")
+        elif "update_interval" in saved_args:
+            self._update_interval_arg = saved_args["update_interval"]
+        else:
+            self._update_interval_arg = 5
+
+        if "eval_weights" in overrides:
+            self._eval_weights_arg = overrides.pop("eval_weights")
+        elif "eval_weights" in saved_args:
+            self._eval_weights_arg = saved_args["eval_weights"]
+        else:
+            self._eval_weights_arg = [0.25, 0.15, 0.15, 0.20]
         overrides.pop("attack_num", None)
 
         super().__init__(cfg, overrides, _callbacks)
