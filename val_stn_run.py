@@ -15,7 +15,7 @@ from ultralytics.data.utils import check_det_dataset
 from ultralytics.defenses.spatial_transformer import SpatialTransformer, load_stn_checkpoint
 from ultralytics.models.yolo.detect.val_stn import STNDetectionValidator
 from ultralytics.nn.tasks import load_checkpoint
-from ultralytics.utils import DEFAULT_CFG, LOGGER, IterableSimpleNamespace, colorstr
+from ultralytics.utils import DEFAULT_CFG, LOGGER, IterableSimpleNamespace
 from ultralytics.utils.checks import check_imgsz
 from ultralytics.utils.torch_utils import select_device
 
@@ -63,11 +63,8 @@ def parse_args(args=None):
     return parser.parse_args(args)
 
 
-def main():
-    """Run STN validation comparison across specified modes."""
-    args = parse_args()
-    device = select_device(args.device)
-
+def resolve_models(args, device: torch.device):
+    """Load guidance detector, STN defense, and attack model according to CLI args."""
     # 1. Load guidance detector
     guidance_model, _ = load_checkpoint(args.weights, device=device)
     guidance_model.eval().requires_grad_(False)
@@ -75,7 +72,8 @@ def main():
         guidance_model.args = IterableSimpleNamespace(**guidance_model.args)
 
     # 2. Load or instantiate STN defense
-    if args.stn_weights and Path(args.stn_weights).is_file():
+    stn_weights_str = str(args.stn_weights).strip() if args.stn_weights is not None else ""
+    if stn_weights_str and stn_weights_str.lower() not in {"", "none"}:
         stn, _ = load_stn_checkpoint(args.stn_weights, device=device)
     else:
         LOGGER.info("No stn_weights provided; using identity-initialized STN module.")
@@ -83,13 +81,24 @@ def main():
     stn.eval().requires_grad_(False)
 
     # 3. Load or reuse attack model
-    if args.attack_weights and Path(args.attack_weights).is_file():
+    attack_weights_str = str(args.attack_weights).strip() if args.attack_weights is not None else ""
+    if attack_weights_str and attack_weights_str.lower() not in {"", "none", "current", "baseline"}:
         attack_model, _ = load_checkpoint(args.attack_weights, device=device)
         attack_model.eval().requires_grad_(False)
         if hasattr(attack_model, "args") and isinstance(attack_model.args, dict):
             attack_model.args = IterableSimpleNamespace(**attack_model.args)
     else:
         attack_model = guidance_model
+
+    return guidance_model, stn, attack_model
+
+
+def main():
+    """Run STN validation comparison across specified modes."""
+    args = parse_args()
+    device = select_device(args.device)
+
+    guidance_model, stn, attack_model = resolve_models(args, device)
 
     # 4. Instantiate Worst-of-k attacker
     effective_seed = int(DEFAULT_CFG.seed) if args.seed is None else int(args.seed)

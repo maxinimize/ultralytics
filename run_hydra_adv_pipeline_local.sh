@@ -113,18 +113,21 @@ STAGE1_BEST="${PIPELINE_DIR}/stage1_score/weights/best.pt"
 STAGE2_BEST="${PIPELINE_DIR}/stage2_finetune/weights/best.pt"
 MATERIALIZED_MODEL="${PIPELINE_DIR}/pruned_materialized.pt"
 
+# Track the latest verified real artifact across stages
+CURRENT_MODEL="${INPUT_MODEL}"
+
 # ==============================================================================
 # Stage 1: Robust Score Search
 # ==============================================================================
 if [ "${RUN_STAGE1}" -eq 1 ]; then
-    if [ ! -f "${INPUT_MODEL}" ]; then
-        echo "Error: Input model '${INPUT_MODEL}' not found!" >&2
+    if [ ! -f "${CURRENT_MODEL}" ]; then
+        echo "Error: Stage 1 input model '${CURRENT_MODEL}' not found!" >&2
         exit 1
     fi
 
     echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 1: Robust Score Search (${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_prune.py \
-        --model "${INPUT_MODEL}" \
+        --model "${CURRENT_MODEL}" \
         --data "${DATA}" \
         --keep-ratio "${KEEP_RATIO}" \
         --pruning-mode "${PRUNING_MODE}" \
@@ -143,6 +146,7 @@ if [ "${RUN_STAGE1}" -eq 1 ]; then
         echo "Error: Stage 1 failed to generate expected model ${STAGE1_BEST}" >&2
         exit 1
     fi
+    CURRENT_MODEL="${STAGE1_BEST}"
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Stage 1 completed! Score weights saved to: ${STAGE1_BEST} <<<<<"
 else
     echo ">>>>> Skipping Stage 1 (RUN_STAGE1=${RUN_STAGE1}) <<<<<"
@@ -152,19 +156,14 @@ fi
 # Stage 2: Robust Fixed-Mask Fine-tuning
 # ==============================================================================
 if [ "${RUN_STAGE2}" -eq 1 ]; then
-    FINETUNE_INIT="${STAGE1_BEST}"
-    if [ "${RUN_STAGE1}" -eq 0 ]; then
-        FINETUNE_INIT="${INPUT_MODEL}"
-    fi
-
-    if [ ! -f "${FINETUNE_INIT}" ]; then
-        echo "Error: Stage 2 initialization model '${FINETUNE_INIT}' not found!" >&2
+    if [ ! -f "${CURRENT_MODEL}" ]; then
+        echo "Error: Stage 2 initialization model '${CURRENT_MODEL}' not found!" >&2
         exit 1
     fi
 
     echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 2: Fixed-Mask Fine-tuning (${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_finetune.py \
-        --model "${FINETUNE_INIT}" \
+        --model "${CURRENT_MODEL}" \
         --data "${DATA}" \
         --keep-ratio "${KEEP_RATIO}" \
         --pruning-mode "${PRUNING_MODE}" \
@@ -183,6 +182,7 @@ if [ "${RUN_STAGE2}" -eq 1 ]; then
         echo "Error: Stage 2 failed to generate expected model ${STAGE2_BEST}" >&2
         exit 1
     fi
+    CURRENT_MODEL="${STAGE2_BEST}"
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Stage 2 completed! Fine-tuned weights saved to: ${STAGE2_BEST} <<<<<"
 else
     echo ">>>>> Skipping Stage 2 (RUN_STAGE2=${RUN_STAGE2}) <<<<<"
@@ -192,19 +192,14 @@ fi
 # Stage 3: Materialization to Standard YOLO
 # ==============================================================================
 if [ "${RUN_STAGE3}" -eq 1 ]; then
-    EXPORT_INIT="${STAGE2_BEST}"
-    if [ "${RUN_STAGE2}" -eq 0 ]; then
-        EXPORT_INIT="${STAGE1_BEST:-"${INPUT_MODEL}"}"
-    fi
-
-    if [ ! -f "${EXPORT_INIT}" ]; then
-        echo "Error: Stage 3 input model '${EXPORT_INIT}' not found!" >&2
+    if [ ! -f "${CURRENT_MODEL}" ]; then
+        echo "Error: Stage 3 input model '${CURRENT_MODEL}' not found!" >&2
         exit 1
     fi
 
     echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 3: Model Materialization (${PRUNING_MODE}) <<<<<"
     python -u tools/hydra_export.py \
-        --model "${EXPORT_INIT}" \
+        --model "${CURRENT_MODEL}" \
         --output "${MATERIALIZED_MODEL}" \
         --pruning-mode "${PRUNING_MODE}" \
         --imgsz "${IMGSZ}" \
@@ -215,6 +210,7 @@ if [ "${RUN_STAGE3}" -eq 1 ]; then
         echo "Error: Stage 3 failed to generate materialized model ${MATERIALIZED_MODEL}" >&2
         exit 1
     fi
+    CURRENT_MODEL="${MATERIALIZED_MODEL}"
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Stage 3 completed! Materialized weights saved to: ${MATERIALIZED_MODEL} <<<<<"
 else
     echo ">>>>> Skipping Stage 3 (RUN_STAGE3=${RUN_STAGE3}) <<<<<"
@@ -224,14 +220,14 @@ fi
 # Stage 4: Clean and Adversarial Evaluation & Efficiency Benchmark
 # ==============================================================================
 if [ "${RUN_STAGE4}" -eq 1 ]; then
-    EVAL_TARGET="${MATERIALIZED_MODEL}"
-    if [ "${RUN_STAGE3}" -eq 0 ]; then
-        EVAL_TARGET="${STAGE2_BEST:-"${INPUT_MODEL}"}"
+    if [ ! -f "${CURRENT_MODEL}" ]; then
+        echo "Error: Stage 4 evaluation model '${CURRENT_MODEL}' not found!" >&2
+        exit 1
     fi
 
     echo -e "\n[$(date +'%Y-%m-%d %H:%M:%S')] >>>>> Starting Stage 4: Evaluation & Benchmark (${EVAL_DATA}) <<<<<"
     python -u tools/hydra_eval.py \
-        --model "${EVAL_TARGET}" \
+        --model "${CURRENT_MODEL}" \
         --data "${EVAL_DATA}" \
         --batch "${BATCH}" \
         --imgsz "${IMGSZ}" \
@@ -247,7 +243,7 @@ fi
 
 echo -e "\n========================================================================"
 echo "HYDRA pipeline completed successfully!"
-echo "Final materialized model: ${MATERIALIZED_MODEL}"
+echo "Final model path:         ${CURRENT_MODEL}"
 echo "Pipeline artifacts dir:   ${PIPELINE_DIR}"
 echo "Log file:                 ${LOG_FILE}"
 echo "========================================================================"

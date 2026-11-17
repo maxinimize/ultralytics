@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
-from copy import copy, deepcopy
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
-
-import json
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.engine.validator import BaseValidator
@@ -22,7 +22,6 @@ from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
 from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
 
 
 def parse_list_arg(val, type_conv=str):
@@ -40,8 +39,8 @@ def parse_list_arg(val, type_conv=str):
     if not val:
         return []
     # If it contains commas, split by comma; otherwise split by whitespace
-    if ',' in val:
-        parts = val.split(',')
+    if "," in val:
+        parts = val.split(",")
     else:
         parts = val.split()
     return [type_conv(p.strip()) for p in parts if p.strip()]
@@ -82,14 +81,22 @@ class DetectionValidator(BaseValidator):
         """
         attack_names = []
         attack_ratios = []
+        feature_distillation = False
         if isinstance(args, dict):
             raw_attack_name = args.pop("attack_name", None)
             raw_ratio = args.pop("ratio", None)
+            feature_distillation = bool(args.pop("feature_distillation", False))
             if raw_attack_name is not None:
                 attack_names = parse_list_arg(raw_attack_name, str)
             if raw_ratio is not None:
                 attack_ratios = parse_list_arg(raw_ratio, float)
         elif args is not None:
+            if hasattr(args, "feature_distillation"):
+                feature_distillation = bool(getattr(args, "feature_distillation", False))
+                try:
+                    delattr(args, "feature_distillation")
+                except AttributeError:
+                    pass
             if hasattr(args, "attack_name"):
                 raw_attack_name = getattr(args, "attack_name", None)
                 if raw_attack_name is not None:
@@ -117,6 +124,9 @@ class DetectionValidator(BaseValidator):
         self.metrics = DetMetrics()
         self.attack_names = attack_names
         self.attack_ratios = attack_ratios
+        self.feature_distillation = feature_distillation or bool(getattr(self.args, "feature_distillation", False))
+        self.fd = None
+        self._fd_checked = False
 
     def __call__(self, trainer=None, model=None):
         """Execute validation process, running inference on dataloader and computing performance metrics.
@@ -279,7 +289,11 @@ class DetectionValidator(BaseValidator):
                 ops.Profile(device=self.device),
                 ops.Profile(device=self.device),
             )
-            bar = TQDM(self.dataloader, desc=self.get_desc() + (f" ({run})" if len(unique_runs) > 1 else ""), total=len(self.dataloader))
+            bar = TQDM(
+                self.dataloader,
+                desc=self.get_desc() + (f" ({run})" if len(unique_runs) > 1 else ""),
+                total=len(self.dataloader),
+            )
             for batch_i, batch in enumerate(bar):
                 self.run_callbacks("on_val_batch_start")
                 self.batch_i = batch_i
@@ -403,6 +417,36 @@ class DetectionValidator(BaseValidator):
                     LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
                 return stats
 
+    def _check_fd_input(self, images: torch.Tensor) -> None:
+        """Validate that input tensor satisfies Feature Distillation requirements before first use."""
+        if not isinstance(images, torch.Tensor):
+            raise TypeError(f"Requirement 1 failed: Expected torch.Tensor, got {type(images)}")
+        if images.ndim != 4:
+            raise ValueError(
+                f"Requirement 1 failed: Expected 4D tensor with shape [B, 3, H, W], got {tuple(images.shape)}"
+            )
+        b, c, h, w = images.shape
+        if c != 3:
+            raise ValueError(
+                f"Requirement 1 failed: Expected 3 color channels (C=3), got C={c} in shape {tuple(images.shape)}"
+            )
+        if not images.is_floating_point():
+            raise TypeError(f"Requirement 1 failed: Expected floating-point tensor, got dtype={images.dtype}")
+        if not torch.isfinite(images).all():
+            raise ValueError("Requirement 1 failed: Input images contain NaN or Inf.")
+        img_min = float(images.min().item()) if images.numel() > 0 else 0.0
+        img_max = float(images.max().item()) if images.numel() > 0 else 0.0
+        tol = 1e-4
+        if img_min < -tol or img_max > 1.0 + tol:
+            raise ValueError(
+                f"Requirement 1 failed: Pixel range must be within [0, 1], but observed min={img_min:.6f}, max={img_max:.6f}."
+            )
+        if h % 8 != 0 or w % 8 != 0:
+            raise ValueError(
+                f"Requirement 2 failed: Both H and W must be divisible by 8. "
+                f"Received H={h} (H % 8 = {h % 8}), W={w} (W % 8 = {w % 8})."
+            )
+
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO validation."""
         for k, v in batch.items():
@@ -410,6 +454,7 @@ class DetectionValidator(BaseValidator):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = (batch["img"].half() if self.args.quantize == 16 else batch["img"].float()) / 255
 
+        batch_i = getattr(self, "batch_i", 0)
         attack_name = getattr(self, "current_attack", None) or getattr(self, "attack_name", None)
         if attack_name and attack_name.lower().strip() not in {"raw", "none", "clean"}:
             attacker = None
@@ -418,37 +463,79 @@ class DetectionValidator(BaseValidator):
             if attacker is None:
                 attacker = getattr(self, "attacker", None)
 
-            if attacker:
-                try:
-                    im_files = batch.get("im_file", [])
-                    if hasattr(attacker, "proxy_model"):
-                        attacker.proxy_model.current_paths = im_files
-                    if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
-                        attacker.estimator.model.current_paths = im_files
+            if attacker is None:
+                raise RuntimeError(
+                    f"Attacker for '{attack_name}' was not initialized at batch {batch_i}. Cannot substitute clean data."
+                )
 
-                    if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
-                        amp_ctx = autocast(torch.bfloat16, device=self.device.type)
-                    elif self.device.type == "cuda" and (
-                        getattr(self.args, "amp", False)
-                        or getattr(self.args, "half", False)
-                        or getattr(self.args, "quantize", None) == 16
-                    ):
-                        amp_ctx = autocast(True, device=self.device.type)
-                    else:
-                        amp_ctx = autocast(False, device=self.device.type)
+            has_targets = False
+            if (
+                batch.get("cls") is not None
+                and getattr(batch["cls"], "numel", lambda: 0)() > 0
+                or batch.get("bboxes") is not None
+                and getattr(batch["bboxes"], "numel", lambda: 0)() > 0
+            ):
+                has_targets = True
 
-                    adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
-                    with amp_ctx:
-                        imgs_adv = run_attack_on_batch(
-                            attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
+            try:
+                im_files = batch.get("im_file", [])
+                if hasattr(attacker, "proxy_model"):
+                    attacker.proxy_model.current_paths = im_files
+                if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
+                    attacker.estimator.model.current_paths = im_files
+
+                if self.device.type == "cuda" and getattr(self.args, "amp", None) == "bf16":
+                    amp_ctx = autocast(torch.bfloat16, device=self.device.type)
+                elif self.device.type == "cuda" and (
+                    getattr(self.args, "amp", False)
+                    or getattr(self.args, "half", False)
+                    or getattr(self.args, "quantize", None) == 16
+                ):
+                    amp_ctx = autocast(True, device=self.device.type)
+                else:
+                    amp_ctx = autocast(False, device=self.device.type)
+
+                adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
+                with amp_ctx:
+                    imgs_adv = run_attack_on_batch(
+                        attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
+                    )
+
+                if imgs_adv is not None:
+                    if not torch.isfinite(imgs_adv).all():
+                        raise RuntimeError(
+                            f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
                         )
-                    if imgs_adv is not None:
-                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                        batch["img"] = imgs_adv_cast
-                        del imgs_adv, imgs_adv_cast
+                    if imgs_adv.shape != batch["img"].shape:
+                        raise RuntimeError(
+                            f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
+                        )
+                    batch["img"] = imgs_adv.to(batch["img"].dtype).to(self.device)
+                    del imgs_adv
+                    if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                except Exception as e:
-                    LOGGER.warning(f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch.")
+                elif has_targets:
+                    raise RuntimeError(
+                        f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
+                    )
+            except Exception as e:
+                if isinstance(e, RuntimeError) and f"at batch {batch_i}" in str(e):
+                    raise
+                raise RuntimeError(
+                    f"Adversarial generation failed for attack '{attack_name}' at batch {batch_i}: {e}"
+                ) from e
+
+        # Feature Distillation defense (validation image -> attack -> Feature Distillation -> YOLO)
+        if getattr(self, "feature_distillation", False) or getattr(self.args, "feature_distillation", False):
+            if getattr(self, "fd", None) is None:
+                from ultralytics.defenses.feature_distillation import FeatureDistillation
+
+                self.fd = FeatureDistillation(allow_padding=False).to(self.device)
+                self.fd.eval()
+            if not getattr(self, "_fd_checked", False):
+                self._check_fd_input(batch["img"])
+                self._fd_checked = True
+            batch["img"] = self.fd(batch["img"])
 
         denoiser = getattr(self, "denoiser", None)
         if denoiser is not None:

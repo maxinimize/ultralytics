@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-import json
-
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.engine.validator import BaseValidator
@@ -22,7 +22,6 @@ from ultralytics.utils.checks import check_imgsz, check_requirements
 from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, box_iou
 from ultralytics.utils.plotting import plot_images
 from ultralytics.utils.torch_utils import attempt_compile, autocast, select_device, unwrap_model
-from ultralytics.attacks.attack_bridge import run_attack_on_batch
 
 
 def parse_list_arg(val, type_conv=str):
@@ -82,14 +81,22 @@ class DetectionValidator(BaseValidator):
         """
         attack_names = []
         attack_ratios = []
+        strict_attacks = False
         if isinstance(args, dict):
             raw_attack_name = args.pop("attack_name", None)
             raw_ratio = args.pop("ratio", None)
+            strict_attacks = bool(args.pop("strict_attacks", False))
             if raw_attack_name is not None:
                 attack_names = parse_list_arg(raw_attack_name, str)
             if raw_ratio is not None:
                 attack_ratios = parse_list_arg(raw_ratio, float)
         elif args is not None:
+            if hasattr(args, "strict_attacks"):
+                strict_attacks = bool(getattr(args, "strict_attacks", False))
+                try:
+                    delattr(args, "strict_attacks")
+                except AttributeError:
+                    pass
             if hasattr(args, "attack_name"):
                 raw_attack_name = getattr(args, "attack_name", None)
                 if raw_attack_name is not None:
@@ -117,6 +124,7 @@ class DetectionValidator(BaseValidator):
         self.metrics = DetMetrics()
         self.attack_names = attack_names
         self.attack_ratios = attack_ratios
+        self.strict_attacks = strict_attacks
 
     def __call__(self, trainer=None, model=None):
         """Execute validation process, running inference on dataloader and computing performance metrics.
@@ -420,6 +428,7 @@ class DetectionValidator(BaseValidator):
                 batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = (batch["img"].half() if self.args.quantize == 16 else batch["img"].float()) / 255
 
+        batch_i = getattr(self, "batch_i", 0)
         attack_name = getattr(self, "current_attack", None) or getattr(self, "attack_name", None)
         if attack_name and attack_name.lower().strip() not in {"raw", "none", "clean"}:
             attacker = None
@@ -428,7 +437,22 @@ class DetectionValidator(BaseValidator):
             if attacker is None:
                 attacker = getattr(self, "attacker", None)
 
-            if attacker:
+            strict = getattr(self, "strict_attacks", False) or getattr(self.args, "strict_attacks", False)
+            if attacker is None:
+                msg = f"Attacker for '{attack_name}' was not initialized at batch {batch_i}. Cannot substitute clean data."
+                LOGGER.error(msg)
+                if strict:
+                    raise RuntimeError(msg)
+            else:
+                has_targets = False
+                if (
+                    batch.get("cls") is not None
+                    and getattr(batch["cls"], "numel", lambda: 0)() > 0
+                    or batch.get("bboxes") is not None
+                    and getattr(batch["bboxes"], "numel", lambda: 0)() > 0
+                ):
+                    has_targets = True
+
                 try:
                     im_files = batch.get("im_file", [])
                     if hasattr(attacker, "proxy_model"):
@@ -453,13 +477,33 @@ class DetectionValidator(BaseValidator):
                             attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
                         )
                     if imgs_adv is not None:
-                        imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                        batch["img"] = imgs_adv_cast
-                        del imgs_adv, imgs_adv_cast
-                        torch.cuda.empty_cache()
+                        if not torch.isfinite(imgs_adv).all():
+                            msg = f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
+                            LOGGER.error(msg)
+                            if strict:
+                                raise RuntimeError(msg)
+                        elif imgs_adv.shape != batch["img"].shape:
+                            msg = f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
+                            LOGGER.error(msg)
+                            if strict:
+                                raise RuntimeError(msg)
+                        else:
+                            batch["img"] = imgs_adv.to(batch["img"].dtype).to(self.device)
+                            del imgs_adv
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    elif has_targets:
+                        msg = f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
+                        LOGGER.error(msg)
+                        if strict:
+                            raise RuntimeError(msg)
                 except Exception as e:
-                    if getattr(self, "strict_attacks", False):
-                        raise
+                    if strict:
+                        if isinstance(e, RuntimeError) and f"at batch {batch_i}" in str(e):
+                            raise
+                        raise RuntimeError(
+                            f"Adversarial generation failed for attack '{attack_name}' at batch {batch_i}: {e}"
+                        ) from e
                     LOGGER.warning(
                         f"Adversarial generation failed for {attack_name}: {e}. Skipping attack for this batch."
                     )

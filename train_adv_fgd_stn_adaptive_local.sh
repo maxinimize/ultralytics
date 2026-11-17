@@ -86,34 +86,45 @@ assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
 print('GPU:', torch.cuda.get_device_name(0), '| BF16:', torch.cuda.is_bf16_supported())
 PY
 
-ARGS=(
-  --model "$YOLO_WEIGHTS"
-  --data "$DATA_ARG"
-  --preprocess_mode "$PREPROCESS_MODE"
-  --fgd_weights "$FGD_WEIGHTS"
-  --stn_weights "$STN_WEIGHTS"
-  --adaptive_ratio "$ADAPTIVE_RATIO"
-  --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
-  --p_clean "$P_CLEAN"
-  --tau "$TAU"
-  --update_interval "$UPDATE_INTERVAL"
-  --attack_weights "$ATTACK_WEIGHTS"
-  --imgsz "$IMGSZ"
-  --epochs "$EPOCHS"
-  --batch "$BATCH"
-  --device "$DEVICE"
-  --workers "$WORKERS"
-  --cache "$CACHE"
-  --amp "$AMP"
-  --fraction "$FRACTION"
-  --attack_name "${ATTACK_NAME_ARR[@]}"
-  --attack_ratio "${ATTACK_RATIO_ARR[@]}"
-  --eval_weights "${EVAL_WEIGHT_ARR[@]}"
-  --project "$PROJECT"
-  --name "$NAME"
-)
-if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-if [[ -n "$RESUME" ]]; then ARGS+=(--resume "$RESUME"); fi
+if [[ -n "$RESUME" ]]; then
+  ARGS=(--resume "$RESUME")
+  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -n "${AMP:-}" ]]; then ARGS+=(--amp "$AMP"); fi
+  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
+  if [[ -n "${SEED:-}" ]]; then ARGS+=(--seed "$SEED"); fi
+  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+else
+  ARGS=(
+    --model "$YOLO_WEIGHTS"
+    --data "$DATA_ARG"
+    --preprocess_mode "$PREPROCESS_MODE"
+    --fgd_weights "$FGD_WEIGHTS"
+    --stn_weights "$STN_WEIGHTS"
+    --adaptive_ratio "$ADAPTIVE_RATIO"
+    --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
+    --p_clean "$P_CLEAN"
+    --tau "$TAU"
+    --update_interval "$UPDATE_INTERVAL"
+    --attack_weights "$ATTACK_WEIGHTS"
+    --imgsz "$IMGSZ"
+    --epochs "$EPOCHS"
+    --batch "$BATCH"
+    --device "$DEVICE"
+    --workers "$WORKERS"
+    --cache "$CACHE"
+    --amp "$AMP"
+    --fraction "$FRACTION"
+    --attack_name "${ATTACK_NAME_ARR[@]}"
+    --attack_ratio "${ATTACK_RATIO_ARR[@]}"
+    --eval_weights "${EVAL_WEIGHT_ARR[@]}"
+    --project "$PROJECT"
+    --name "$NAME"
+  )
+  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+fi
 
 printf 'Command: python -u train_adv_fgd_stn_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
 python -u train_adv_fgd_stn_adaptive_run.py "${ARGS[@]}"

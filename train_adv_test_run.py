@@ -1,25 +1,30 @@
 import argparse
+
 from ultralytics.models.yolo.detect.train_adv_test import DetectionTrainer
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='yolov8x.pt')
-    parser.add_argument('--data', default=None)
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--batch', type=int, default=24)
-    parser.add_argument('--attack_weights', default=None, help='Path to attack model weights')
-    parser.add_argument('--attack_name', nargs='+', default=None, help='Attack name or list of attack names')
-    parser.add_argument('--attack_ratio', nargs='+', default=None, help='Attack ratio or list of attack ratios')
-    parser.add_argument('--device', default='0,1')
-    parser.add_argument('--imgsz', type=int, default=640)
-    parser.add_argument('--workers', type=int, default=None)
-    parser.add_argument('--project', default='runs/train_adv', help='Project directory')
-    parser.add_argument('--name', default='exp', help='Experiment name')
-    parser.add_argument('--resume', nargs='?', const=True, default=False, help='Resume training from last checkpoint')
+    parser.add_argument("--model", default="yolov8x.pt")
+    parser.add_argument("--data", default=None)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch", type=int, default=24)
+    parser.add_argument("--attack_weights", default=None, help="Path to attack model weights")
+    parser.add_argument("--attack_name", nargs="+", default=None, help="Attack name or list of attack names")
+    parser.add_argument("--attack_ratio", nargs="+", default=None, help="Attack ratio or list of attack ratios")
+    parser.add_argument("--device", default="0,1")
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--project", default="runs/train_adv", help="Project directory")
+    parser.add_argument("--name", default="exp", help="Experiment name")
+    parser.add_argument("--resume", nargs="?", const=True, default=False, help="Resume training from last checkpoint")
     # parser.add_argument('--no_train_aug', action='store_true', help='Disable YOLO training augmentations for adversarial training.')
-    parser.add_argument('--classes', type=int, nargs='+', default=None, help='Filter dataset by class indices, e.g. --classes 1 2 3 5 7')
-    parser.add_argument('--cache', nargs='?', const=True, default=True, help='Cache dataset images in RAM (True/ram, disk, False)')
+    parser.add_argument(
+        "--classes", type=int, nargs="+", default=None, help="Filter dataset by class indices, e.g. --classes 1 2 3 5 7"
+    )
+    parser.add_argument(
+        "--cache", nargs="?", const=True, default=True, help="Cache dataset images in RAM (True/ram, disk, False)"
+    )
     args = parser.parse_args()
 
     cache_val = args.cache
@@ -35,13 +40,14 @@ def main():
         batch=args.batch,
         device=args.device,
         imgsz=args.imgsz,
-        workers=args.workers,
         project=args.project,
         name=args.name,
         resume=args.resume,
         classes=args.classes,
         cache=cache_val,
     )
+    if args.workers is not None:
+        overrides["workers"] = args.workers
     if args.data is not None:
         overrides["data"] = args.data
     elif not args.resume:
@@ -86,5 +92,5 @@ def main():
     trainer.train()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

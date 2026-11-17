@@ -59,13 +59,14 @@ def main():
         batch=args.batch,
         device=args.device,
         imgsz=args.imgsz,
-        workers=args.workers,
         project=args.project,
         name=args.name,
         resume=args.resume,
         classes=args.classes,
         cache=cache_val,
     )
+    if args.workers is not None:
+        overrides["workers"] = args.workers
     if args.data is not None:
         overrides["data"] = args.data
     elif not args.resume:

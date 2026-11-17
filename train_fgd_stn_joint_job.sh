@@ -173,7 +173,7 @@ TRAIN_ARGS=(
 )
 
 if [[ -n "${SEED:-}" ]]; then
-  ARGS+=(--seed "$SEED")
+  TRAIN_ARGS+=(--seed "$SEED")
 fi
 
 if [[ "$INIT" == "pretrained" ]]; then

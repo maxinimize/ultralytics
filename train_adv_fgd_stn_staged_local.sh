@@ -13,7 +13,8 @@ fi
 source "$ROOT/.yolo_env/bin/activate"
 
 # Stage parameter: 1 (Clean Fine-tuning) or 2 (Adaptive AT)
-STAGE="${STAGE:-${1:-2}}"
+EXPLICIT_STAGE="${STAGE:-${1:-}}"
+STAGE="${EXPLICIT_STAGE:-2}"
 STAGE1_WEIGHTS="${STAGE1_WEIGHTS:-${2:-}}"
 
 # Shared configuration
@@ -163,94 +164,106 @@ echo "GPU Device: $DEVICE | Workers: $WORKERS | AMP: $AMP | Cache: $CACHE"
 echo "Log File: $LOG_FILE"
 echo "================================================================="
 
-ARGS=(
-  --stage "$STAGE"
-  --preprocess_mode "$PREPROCESS_MODE"
-  --fgd_weights "$FGD_WEIGHTS"
-  --stn_weights "$STN_WEIGHTS"
-  --train_head_only "$TRAIN_HEAD_ONLY"
-  --freeze_bn "$FREEZE_BN"
-  --freeze_all_bn "$FREEZE_ALL_BN"
-  --data "$DATA_ARG"
-  --epochs "$EPOCHS"
-  --batch "$BATCH"
-  --imgsz "$IMGSZ"
-  --optimizer "$OPTIMIZER"
-  --lr0 "$LR0"
-  --lrf "$LRF"
-  --warmup_epochs "$WARMUP_EPOCHS"
-  --warmup_bias_lr "$WARMUP_BIAS_LR"
-  --mosaic "$MOSAIC"
-  --scale "$SCALE"
-  --translate "$TRANSLATE"
-  --fliplr "$FLIPLR"
-  --flipud "$FLIPUD"
-  --hsv_h "$HSV_H"
-  --hsv_s "$HSV_S"
-  --hsv_v "$HSV_V"
-  --mixup "$MIXUP"
-  --cutmix "$CUTMIX"
-  --copy_paste "$COPY_PASTE"
-  --close_mosaic "$CLOSE_MOSAIC"
-  --save_period "$SAVE_PERIOD"
-  --device "$DEVICE"
-  --workers "$WORKERS"
-  --amp "$AMP"
-  --cache "$CACHE"
-  --fraction "$FRACTION"
-  --project "$PROJECT"
-  --name "$NAME"
-  --strict_attacks "$STRICT_ATTACKS"
-)
-
-if [[ -n "${SEED:-}" ]]; then
-  ARGS+=(--seed "$SEED")
-fi
-
-if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then
-  ARGS+=(--eval_only)
-fi
-
-if [[ "$EVAL_EPOCH0" == "true" || "$EVAL_EPOCH0" == "1" ]]; then
-  ARGS+=(--eval_epoch0)
-fi
-
-if [[ -n "${CLASS_IDS[*]:-}" ]]; then
-  ARGS+=(--classes "${CLASS_IDS[@]}")
-fi
-
 if [[ -n "$RESUME" ]]; then
-  ARGS+=(--resume "$RESUME")
-fi
-
-if [[ "$STAGE" -eq 1 ]]; then
-  ARGS+=(
-    --model "$YOLO_WEIGHTS"
-    --p_clean 1.0
-    --adaptive_ratio false
+  ARGS=(--resume "$RESUME")
+  if [[ -n "$EXPLICIT_STAGE" ]]; then
+    ARGS+=(--stage "$EXPLICIT_STAGE")
+  fi
+  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -n "${AMP:-}" ]]; then ARGS+=(--amp "$AMP"); fi
+  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
+  if [[ -n "${SEED:-}" ]]; then ARGS+=(--seed "$SEED"); fi
+  if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then ARGS+=(--eval_only); fi
+  if [[ "$EVAL_EPOCH0" == "true" || "$EVAL_EPOCH0" == "1" ]]; then ARGS+=(--eval_epoch0); fi
+  if [[ -n "${CLASS_IDS[*]:-}" ]]; then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+else
+  ARGS=(
+    --stage "$STAGE"
+    --preprocess_mode "$PREPROCESS_MODE"
+    --fgd_weights "$FGD_WEIGHTS"
+    --stn_weights "$STN_WEIGHTS"
+    --train_head_only "$TRAIN_HEAD_ONLY"
+    --freeze_bn "$FREEZE_BN"
+    --freeze_all_bn "$FREEZE_ALL_BN"
+    --data "$DATA_ARG"
+    --epochs "$EPOCHS"
+    --batch "$BATCH"
+    --imgsz "$IMGSZ"
+    --optimizer "$OPTIMIZER"
+    --lr0 "$LR0"
+    --lrf "$LRF"
+    --warmup_epochs "$WARMUP_EPOCHS"
+    --warmup_bias_lr "$WARMUP_BIAS_LR"
+    --mosaic "$MOSAIC"
+    --scale "$SCALE"
+    --translate "$TRANSLATE"
+    --fliplr "$FLIPLR"
+    --flipud "$FLIPUD"
+    --hsv_h "$HSV_H"
+    --hsv_s "$HSV_S"
+    --hsv_v "$HSV_V"
+    --mixup "$MIXUP"
+    --cutmix "$CUTMIX"
+    --copy_paste "$COPY_PASTE"
+    --close_mosaic "$CLOSE_MOSAIC"
+    --save_period "$SAVE_PERIOD"
+    --device "$DEVICE"
+    --workers "$WORKERS"
+    --amp "$AMP"
+    --cache "$CACHE"
+    --fraction "$FRACTION"
+    --project "$PROJECT"
+    --name "$NAME"
+    --strict_attacks "$STRICT_ATTACKS"
   )
-elif [[ "$STAGE" -eq 2 ]]; then
-  if [[ -n "$STAGE1_WEIGHTS" ]]; then
-    ARGS+=(--stage1_weights "$STAGE1_WEIGHTS")
-  else
-    ARGS+=(--model "$YOLO_WEIGHTS")
+
+  if [[ -n "${SEED:-}" ]]; then
+    ARGS+=(--seed "$SEED")
   fi
 
-  read -r -a ATTACK_NAME_ARR <<< "$ATTACK_NAMES"
-  read -r -a ATTACK_RATIO_ARR <<< "$ATTACK_RATIOS"
-  read -r -a EVAL_WEIGHT_ARR <<< "$EVAL_WEIGHTS"
+  if [[ "$EVAL_ONLY" == "true" || "$EVAL_ONLY" == "1" ]]; then
+    ARGS+=(--eval_only)
+  fi
 
-  ARGS+=(
-    --p_clean "$P_CLEAN"
-    --adaptive_ratio "$ADAPTIVE_RATIO"
-    --tau "$TAU"
-    --update_interval "$UPDATE_INTERVAL"
-    --attack_weights "$ATTACK_WEIGHTS"
-    --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
-    --attack_name "${ATTACK_NAME_ARR[@]}"
-    --attack_ratio "${ATTACK_RATIO_ARR[@]}"
-    --eval_weights "${EVAL_WEIGHT_ARR[@]}"
-  )
+  if [[ "$EVAL_EPOCH0" == "true" || "$EVAL_EPOCH0" == "1" ]]; then
+    ARGS+=(--eval_epoch0)
+  fi
+
+  if [[ -n "${CLASS_IDS[*]:-}" ]]; then
+    ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+
+  if [[ "$STAGE" -eq 1 ]]; then
+    ARGS+=(
+      --model "$YOLO_WEIGHTS"
+      --p_clean 1.0
+      --adaptive_ratio false
+    )
+  elif [[ "$STAGE" -eq 2 ]]; then
+    if [[ -n "$STAGE1_WEIGHTS" ]]; then
+      ARGS+=(--stage1_weights "$STAGE1_WEIGHTS")
+    else
+      ARGS+=(--model "$YOLO_WEIGHTS")
+    fi
+
+    read -r -a ATTACK_NAME_ARR <<< "$ATTACK_NAMES"
+    read -r -a ATTACK_RATIO_ARR <<< "$ATTACK_RATIOS"
+    read -r -a EVAL_WEIGHT_ARR <<< "$EVAL_WEIGHTS"
+
+    ARGS+=(
+      --p_clean "$P_CLEAN"
+      --adaptive_ratio "$ADAPTIVE_RATIO"
+      --tau "$TAU"
+      --update_interval "$UPDATE_INTERVAL"
+      --attack_weights "$ATTACK_WEIGHTS"
+      --attack_through_preprocess "$ATTACK_THROUGH_PREPROCESS"
+      --attack_name "${ATTACK_NAME_ARR[@]}"
+      --attack_ratio "${ATTACK_RATIO_ARR[@]}"
+      --eval_weights "${EVAL_WEIGHT_ARR[@]}"
+    )
+  fi
 fi
 
 echo "Executing: python train_adv_fgd_stn_staged_run.py ${ARGS[*]}"

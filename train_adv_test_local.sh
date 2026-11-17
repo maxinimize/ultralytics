@@ -82,23 +82,32 @@ assert torch.cuda.is_available(), 'CUDA is not available in .yolo_env'
 print('GPU:', torch.cuda.get_device_name(0))
 PY
 
-ARGS=(
-  --model "$YOLO_WEIGHTS"
-  --attack_weights "$ATTACK_WEIGHTS"
-  --data "$DATA_ARG"
-  --imgsz "$IMGSZ"
-  --epochs "$EPOCHS"
-  --batch "$BATCH"
-  --device "$DEVICE"
-  --workers "$WORKERS"
-  --cache "$CACHE"
-  --attack_name "${ATTACK_NAMES[@]}"
-  --attack_ratio "${ATTACK_RATIOS[@]}"
-  --project "$PROJECT"
-  --name "$NAME"
-)
-if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
-if [[ -n "$RESUME" ]]; then ARGS+=(--resume "$RESUME"); fi
+if [[ -n "$RESUME" ]]; then
+  ARGS=(--resume "$RESUME")
+  if [[ -n "${DEVICE:-}" ]]; then ARGS+=(--device "$DEVICE"); fi
+  if [[ -n "${WORKERS:-}" ]]; then ARGS+=(--workers "$WORKERS"); fi
+  if [[ -n "${CACHE:-}" ]]; then ARGS+=(--cache "$CACHE"); fi
+  if [[ -n "${PROJECT:-}" ]]; then ARGS+=(--project "$PROJECT"); fi
+  if [[ -n "${NAME:-}" ]]; then ARGS+=(--name "$NAME"); fi
+  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+else
+  ARGS=(
+    --model "$YOLO_WEIGHTS"
+    --attack_weights "$ATTACK_WEIGHTS"
+    --data "$DATA_ARG"
+    --imgsz "$IMGSZ"
+    --epochs "$EPOCHS"
+    --batch "$BATCH"
+    --device "$DEVICE"
+    --workers "$WORKERS"
+    --cache "$CACHE"
+    --attack_name "${ATTACK_NAMES[@]}"
+    --attack_ratio "${ATTACK_RATIOS[@]}"
+    --project "$PROJECT"
+    --name "$NAME"
+  )
+  if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
+fi
 
 printf 'Command: python -u train_adv_test_run.py'; printf ' %q' "${ARGS[@]}"; echo
 python -u train_adv_test_run.py "${ARGS[@]}"

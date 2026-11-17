@@ -3,77 +3,114 @@ import argparse
 from ultralytics.models.yolo.detect.train_adv_adaptive import DetectionTrainer
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Dynamic Attack Ratio Adversarial Training")
-    parser.add_argument("--model", default="yolov8x.pt", help="Base model checkpoint or yaml")
-    parser.add_argument("--data", default=None, help="Dataset YAML path")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    parser.add_argument("--batch", type=int, default=24, help="Batch size")
-    parser.add_argument("--attack_weights", default=None, help="Path to attack model weights")
-    parser.add_argument("--attack_name", nargs="+", default=None, help="Attack names (default: pgd bim mim worstk)")
-    parser.add_argument(
-        "--attack_ratio", nargs="+", default=None, help="Initial attack ratios (default: 0.10 0.10 0.40 0.15)"
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for Dynamic Attack Ratio Adversarial Training."""
+    parser = argparse.ArgumentParser(
+        description="Dynamic Attack Ratio Adversarial Training",
+        argument_default=argparse.SUPPRESS,
     )
-    parser.add_argument("--p_clean", type=float, default=0.25, help="Clean training ratio (default: 0.25)")
-    parser.add_argument(
-        "--tau", type=float, default=5.0, help="Softmax temperature tau for dynamic updates (default: 5.0)"
-    )
-    parser.add_argument("--update_interval", type=int, default=5, help="Epoch interval for ratio update (default: 5)")
-    parser.add_argument(
-        "--eval_weights", nargs="+", default=None, help="Fixed evaluation weights (default: 0.25 0.15 0.15 0.20)"
-    )
-    parser.add_argument("--device", default="0,1", help="Device string (e.g. 0 or 0,1)")
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size")
-    parser.add_argument("--workers", type=int, default=None, help="DataLoader workers")
-    parser.add_argument("--project", default="runs/train_adv", help="Project directory")
-    parser.add_argument("--name", default="exp", help="Experiment name")
+    parser.add_argument("--model", help="Base model checkpoint or yaml (default: yolov8x.pt)")
+    parser.add_argument("--data", help="Dataset YAML path (default: coco128.yaml)")
+    parser.add_argument("--epochs", type=int, help="Number of epochs (default: 5)")
+    parser.add_argument("--batch", type=int, help="Batch size (default: 24)")
+    parser.add_argument("--attack_weights", help="Path to attack model weights")
+    parser.add_argument("--attack_name", nargs="+", help="Attack names (default: pgd bim mim worstk)")
+    parser.add_argument("--attack_ratio", nargs="+", help="Initial attack ratios (default: 0.10 0.10 0.40 0.15)")
+    parser.add_argument("--p_clean", type=float, help="Clean training ratio (default: 0.25)")
+    parser.add_argument("--tau", type=float, help="Softmax temperature tau for dynamic updates (default: 5.0)")
+    parser.add_argument("--update_interval", type=int, help="Epoch interval for ratio update (default: 5)")
+    parser.add_argument("--eval_weights", nargs="+", help="Fixed evaluation weights (default: 0.25 0.15 0.15 0.20)")
+    parser.add_argument("--device", help="Device string (e.g. 0 or 0,1, default: 0,1)")
+    parser.add_argument("--imgsz", type=int, help="Image size (default: 640)")
+    parser.add_argument("--workers", type=int, help="DataLoader workers")
+    parser.add_argument("--project", help="Project directory (default: runs/train_adv)")
+    parser.add_argument("--name", help="Experiment name (default: exp)")
     parser.add_argument("--resume", nargs="?", const=True, default=False, help="Resume training from last checkpoint")
-    parser.add_argument(
-        "--seed", type=int, default=None, help="Random seed for reproducibility (default: None, inherits default)"
-    )
-    parser.add_argument("--classes", type=int, nargs="+", default=None, help="Filter dataset by class indices")
-    parser.add_argument(
-        "--cache", nargs="?", const=True, default=True, help="Cache dataset images in RAM (True/ram, disk, False)"
-    )
-    args = parser.parse_args()
+    parser.add_argument("--seed", type=int, help="Random seed for reproducibility (default: None, inherits default)")
+    parser.add_argument("--classes", type=int, nargs="+", help="Filter dataset by class indices")
+    parser.add_argument("--cache", nargs="?", const=True, help="Cache dataset images in RAM (True/ram, disk, False)")
+    return parser
 
-    cache_val = args.cache
+
+def parse_args(args=None):
+    """Parse CLI arguments."""
+    return build_parser().parse_args(args)
+
+
+def main():
+    args = parse_args()
+
+    cache_val = getattr(args, "cache", True)
     if isinstance(cache_val, str):
         if cache_val.lower() in ("true", "1", "ram"):
             cache_val = "ram"
         elif cache_val.lower() in ("false", "0", "none"):
             cache_val = False
 
-    overrides = dict(
-        model=args.model,
-        epochs=args.epochs,
-        batch=args.batch,
-        device=args.device,
-        imgsz=args.imgsz,
-        workers=args.workers,
-        project=args.project,
-        name=args.name,
-        resume=args.resume,
-        classes=args.classes,
-        cache=cache_val,
-        p_clean=args.p_clean,
-        tau=args.tau,
-        update_interval=args.update_interval,
-    )
-    if args.data is not None:
-        overrides["data"] = args.data
-    elif not args.resume:
-        overrides["data"] = "coco128.yaml"
-    if args.seed is not None:
+    is_resume = bool(getattr(args, "resume", False))
+    if is_resume:
+        overrides = dict(resume=args.resume)
+        if hasattr(args, "model"):
+            overrides["model"] = args.model
+        if hasattr(args, "data"):
+            overrides["data"] = args.data
+        if hasattr(args, "epochs"):
+            overrides["epochs"] = args.epochs
+        if hasattr(args, "batch"):
+            overrides["batch"] = args.batch
+        if hasattr(args, "device"):
+            overrides["device"] = args.device
+        if hasattr(args, "imgsz"):
+            overrides["imgsz"] = args.imgsz
+        if hasattr(args, "project"):
+            overrides["project"] = args.project
+        if hasattr(args, "name"):
+            overrides["name"] = args.name
+        if hasattr(args, "classes"):
+            overrides["classes"] = args.classes
+        if hasattr(args, "cache"):
+            overrides["cache"] = cache_val
+        if hasattr(args, "p_clean"):
+            overrides["p_clean"] = args.p_clean
+        if hasattr(args, "tau"):
+            overrides["tau"] = args.tau
+        if hasattr(args, "update_interval"):
+            overrides["update_interval"] = args.update_interval
+        if hasattr(args, "attack_name"):
+            overrides["attack_name"] = args.attack_name
+        if hasattr(args, "attack_ratio"):
+            overrides["attack_ratio"] = args.attack_ratio
+        if hasattr(args, "eval_weights"):
+            overrides["eval_weights"] = args.eval_weights
+    else:
+        overrides = dict(
+            model=getattr(args, "model", "yolov8x.pt"),
+            data=getattr(args, "data", "coco128.yaml"),
+            epochs=getattr(args, "epochs", 5),
+            batch=getattr(args, "batch", 24),
+            device=getattr(args, "device", "0,1"),
+            imgsz=getattr(args, "imgsz", 640),
+            project=getattr(args, "project", "runs/train_adv"),
+            name=getattr(args, "name", "exp"),
+            resume=False,
+            classes=getattr(args, "classes", None),
+            cache=cache_val,
+            p_clean=getattr(args, "p_clean", 0.25),
+            tau=getattr(args, "tau", 5.0),
+            update_interval=getattr(args, "update_interval", 5),
+            attack_name=getattr(args, "attack_name", ["pgd", "bim", "mim", "worstk"]),
+            attack_ratio=getattr(args, "attack_ratio", [0.10, 0.10, 0.40, 0.15]),
+            eval_weights=getattr(args, "eval_weights", [0.25, 0.15, 0.15, 0.20]),
+        )
+
+    if hasattr(args, "workers") and args.workers is not None:
+        overrides["workers"] = args.workers
+    if hasattr(args, "seed") and args.seed is not None:
         overrides["seed"] = int(args.seed)
-    if args.attack_weights is not None:
+    if hasattr(args, "attack_weights") and args.attack_weights is not None:
         overrides["attack_weights"] = args.attack_weights
 
-    overrides["attack_name"] = args.attack_name if args.attack_name is not None else ["pgd", "bim", "mim", "worstk"]
-    overrides["attack_ratio"] = args.attack_ratio if args.attack_ratio is not None else [0.10, 0.10, 0.40, 0.15]
-    overrides["eval_weights"] = args.eval_weights if args.eval_weights is not None else [0.25, 0.15, 0.15, 0.20]
-
-    trainer = DetectionTrainer(overrides=overrides, attack_weights=args.attack_weights)
+    trainer = DetectionTrainer(overrides=overrides, attack_weights=getattr(args, "attack_weights", None))
     trainer.train()
 
 

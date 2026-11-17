@@ -34,8 +34,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import yaml
 from PIL import Image
 
+import train_adv_adaptive_run
+import train_adv_fgd_stn_adaptive_run
+import train_adv_fgd_stn_staged_run
 from ultralytics.attacks.art_pgd import ARTPGD
 from ultralytics.attacks.attack_bridge import run_attack_on_batch
 from ultralytics.attacks.attack_utils import isolate_rng
@@ -46,8 +50,12 @@ from ultralytics.models.yolo.detect.train_adv_adaptive import DetectionTrainer a
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_adaptive import DetectionTrainerAdvFGDSTNAdaptive
 from ultralytics.models.yolo.detect.train_adv_fgd_stn_staged import DetectionTrainerAdvFGDSTNStaged
 from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
+from ultralytics.models.yolo.detect.val_adv_fgd_phase2 import DetectionValidator as Phase2DetectionValidator
 from ultralytics.models.yolo.detect.val_adv_fgd_stn_staged import DetectionValidatorAdvFGDSTNStaged
+from ultralytics.models.yolo.detect.val_adv_multi import DetectionValidator as MultiAdvDetectionValidator
 from ultralytics.nn.tasks import DetectionModel
+from val_fgd_stn_run import resolve_models_and_pipeline as resolve_fgd_stn_models
+from val_stn_run import resolve_models as resolve_stn_models
 
 
 def create_synthetic_dataset(root_dir: Path, num_images: int = 4, imgsz: int = 64) -> Path:
@@ -1502,6 +1510,383 @@ class TestResearchTrainingIntegration(unittest.TestCase):
             self.assertTrue((trainer_h.wdir / "best.pt").exists(), "Healthy run must save best.pt!")
             self.assertTrue((trainer_h.wdir / "last.pt").exists(), "Healthy run must save last.pt!")
             self.assertEqual(len(trainer_h.adaptive_controller.history), 1)
+
+    def test_h1_legacy_validator_fault_handling_and_feature_distillation(self):
+        """Test H1 (R1 & R7): Legacy validator fault handling and feature distillation:
+        1. MultiAdvDetectionValidator with missing attacker raises explicit RuntimeError with attack name & batch idx.
+        2. MultiAdvDetectionValidator with injected backward NaN PGD raises explicit RuntimeError.
+        3. MultiAdvDetectionValidator with raw evaluation succeeds and returns valid metrics.
+        4. Phase2DetectionValidator with strict_attacks=True raises on missing attacker or invalid output.
+        5. Feature Distillation pipeline:
+           - Shape and [0, 1] range preservation.
+           - _check_fd_input validates input tensor structure on first call.
+           - Reuses single FD instance across batches without recreation.
+           - Injected NaN triggers RuntimeError.
+        """
+        ds_h1 = create_synthetic_dataset(self.temp_dir / "ds_h1", num_images=2, imgsz=64)
+        m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        m.eval()
+        val_pt = self.temp_dir / "val_h1.pt"
+        torch.save({"model": m}, val_pt)
+
+        # 1. Missing attacker raises explicit RuntimeError
+        with self.subTest(scenario="missing_attacker_raises"):
+            v = MultiAdvDetectionValidator(
+                args={
+                    "model": str(val_pt),
+                    "data": str(ds_h1),
+                    "imgsz": 64,
+                    "batch": 2,
+                    "device": "cpu",
+                    "workers": 0,
+                    "plots": False,
+                }
+            )
+            v.device = torch.device("cpu")
+            v.attack_name = "pgd"
+            v.attackers = {}
+            v.batch_i = 0
+            batch = {
+                "img": torch.zeros((2, 3, 64, 64), dtype=torch.float32),
+                "cls": torch.zeros((2, 1)),
+                "bboxes": torch.zeros((2, 4)),
+                "batch_idx": 0,
+            }
+            with self.assertRaises(RuntimeError) as ctx:
+                v.preprocess(batch)
+            self.assertIn("pgd", str(ctx.exception))
+            self.assertIn("batch 0", str(ctx.exception))
+
+        # 2. Injected backward NaN PGD raises explicit RuntimeError
+        with self.subTest(scenario="injected_nan_backward_raises"):
+            faulty_pgd = FaultyPGD(m, fault_mode="nan_grad", epsilon=8 / 255, lr=2 / 255, epoch=3, img_size=64)
+            v_nan = MultiAdvDetectionValidator(
+                args={
+                    "model": str(val_pt),
+                    "data": str(ds_h1),
+                    "imgsz": 64,
+                    "batch": 2,
+                    "device": "cpu",
+                    "workers": 0,
+                    "plots": False,
+                }
+            )
+            v_nan.device = torch.device("cpu")
+            v_nan.attack_name = "pgd"
+            v_nan.attackers = {"pgd": faulty_pgd}
+            v_nan.batch_i = 1
+            batch_nan = {
+                "img": torch.rand((2, 3, 64, 64), dtype=torch.float32),
+                "cls": torch.zeros((2, 1)),
+                "bboxes": torch.tensor([[0.5, 0.5, 0.2, 0.2], [0.5, 0.5, 0.2, 0.2]]),
+                "batch_idx": 1,
+            }
+            with self.assertRaises(RuntimeError) as ctx:
+                v_nan.preprocess(batch_nan)
+            self.assertIn("pgd", str(ctx.exception))
+            self.assertIn("batch 1", str(ctx.exception))
+
+        # 3. Raw validation succeeds
+        with self.subTest(scenario="raw_validation_succeeds"):
+            v_raw = MultiAdvDetectionValidator(
+                args={
+                    "model": str(val_pt),
+                    "data": str(ds_h1),
+                    "imgsz": 64,
+                    "batch": 2,
+                    "device": "cpu",
+                    "workers": 0,
+                    "plots": False,
+                    "save_json": False,
+                }
+            )
+            metrics = v_raw(model=str(val_pt))
+            self.assertIsInstance(metrics, dict)
+            self.assertIn("fitness", metrics)
+
+        # 4. Phase2 DetectionValidator strict attacks
+        with self.subTest(scenario="phase2_strict_attacks_raises"):
+            v_p2 = Phase2DetectionValidator(
+                args={
+                    "model": str(val_pt),
+                    "data": str(ds_h1),
+                    "imgsz": 64,
+                    "batch": 2,
+                    "device": "cpu",
+                    "workers": 0,
+                    "plots": False,
+                    "attack_name": "pgd",
+                    "strict_attacks": True,
+                }
+            )
+            v_p2.device = torch.device("cpu")
+            v_p2.attack_name = "pgd"
+            v_p2.attackers = {}
+            v_p2.batch_i = 0
+            batch_p2 = {
+                "img": torch.zeros((2, 3, 64, 64), dtype=torch.float32),
+                "cls": torch.zeros((2, 1)),
+                "bboxes": torch.zeros((2, 4)),
+            }
+            with self.assertRaises(RuntimeError) as ctx:
+                v_p2.preprocess(batch_p2)
+            self.assertIn("pgd", str(ctx.exception))
+
+        # 5. Feature Distillation pipeline
+        with self.subTest(scenario="feature_distillation_pipeline"):
+            v_fd = MultiAdvDetectionValidator(
+                args={
+                    "model": str(val_pt),
+                    "data": str(ds_h1),
+                    "imgsz": 64,
+                    "batch": 2,
+                    "device": "cpu",
+                    "workers": 0,
+                    "plots": False,
+                    "feature_distillation": True,
+                }
+            )
+            v_fd.attack_name = "raw"
+            v_fd.device = torch.device("cpu")
+            batch1 = {"img": torch.rand((2, 3, 64, 64), dtype=torch.float32) * 255.0}
+            out1 = v_fd.preprocess(batch1)
+            fd_instance_1 = v_fd.fd
+            self.assertIsNotNone(fd_instance_1)
+            self.assertEqual(out1["img"].shape, (2, 3, 64, 64))
+            self.assertTrue(torch.isfinite(out1["img"]).all())
+
+            # Second call must reuse the same FD instance
+            batch2 = {"img": torch.rand((2, 3, 64, 64), dtype=torch.float32) * 255.0}
+            v_fd.preprocess(batch2)
+            self.assertIs(v_fd.fd, fd_instance_1, "FD instance must not be recreated per batch!")
+
+            # Input validation checks
+            with self.assertRaises((ValueError, RuntimeError)):
+                v_fd._check_fd_input(torch.zeros((3, 64, 64)))  # not 4D
+            with self.assertRaises((ValueError, RuntimeError)):
+                v_fd._check_fd_input(torch.full((2, 3, 64, 64), -1.0))  # negative values
+            with self.assertRaises((ValueError, RuntimeError)):
+                v_fd._check_fd_input(torch.full((2, 3, 64, 64), float("nan")))  # NaN input
+
+    def test_h2_explicit_weight_loading_failures_and_defaults(self):
+        """Test H2 (R2): Explicit weight loading failures and defaults:
+        1. val_stn_run:
+           - Explicit non-existent --stn_weights raises FileNotFoundError.
+           - Omitted --stn_weights creates identity STN.
+           - Explicit non-existent --attack_weights raises FileNotFoundError.
+           - Omitted --attack_weights reuses guidance detector.
+        2. val_fgd_stn_run:
+           - Explicit non-existent --stn_weights raises FileNotFoundError.
+           - Explicit non-existent --attack_weights raises FileNotFoundError.
+           - Omitted --attack_weights reuses guidance detector.
+        """
+        val_pt = self.temp_dir / "val_h2.pt"
+        m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        m.eval()
+        torch.save({"model": m}, val_pt)
+        missing_pt = self.temp_dir / "non_existent_weights.pt"
+
+        # 1. val_stn_run
+        with self.subTest(scenario="val_stn_run_weights"):
+            # Explicit non-existent stn_weights raises FileNotFoundError
+            args_missing_stn = SimpleNamespace(
+                weights=str(val_pt),
+                stn_weights=str(missing_pt),
+                attack_weights=None,
+                degrees=30.0,
+                translate=0.1,
+            )
+            with self.assertRaises(FileNotFoundError):
+                resolve_stn_models(args_missing_stn, torch.device("cpu"))
+
+            # Explicit non-existent attack_weights raises FileNotFoundError
+            args_missing_att = SimpleNamespace(
+                weights=str(val_pt),
+                stn_weights=None,
+                attack_weights=str(missing_pt),
+                degrees=30.0,
+                translate=0.1,
+            )
+            with self.assertRaises(FileNotFoundError):
+                resolve_stn_models(args_missing_att, torch.device("cpu"))
+
+            # Omitted weights create identity STN and reuse guidance detector
+            args_default = SimpleNamespace(
+                weights=str(val_pt),
+                stn_weights=None,
+                attack_weights=None,
+                degrees=30.0,
+                translate=0.1,
+            )
+            guidance, stn, attack = resolve_stn_models(args_default, torch.device("cpu"))
+            self.assertIsInstance(stn, SpatialTransformer)
+            self.assertIs(attack, guidance)
+
+        # 2. val_fgd_stn_run
+        with self.subTest(scenario="val_fgd_stn_run_weights"):
+            # Explicit non-existent stn_weights raises FileNotFoundError
+            args_fgd_missing_stn = SimpleNamespace(
+                weights=str(val_pt),
+                preprocess_mode="stn",
+                stn_weights=str(missing_pt),
+                fgd_weights=None,
+                attack_weights=None,
+                imgsz=64,
+                degrees=30.0,
+                translate=0.1,
+            )
+            with self.assertRaises(FileNotFoundError):
+                resolve_fgd_stn_models(args_fgd_missing_stn, torch.device("cpu"))
+
+            # Explicit non-existent attack_weights raises FileNotFoundError
+            args_fgd_missing_att = SimpleNamespace(
+                weights=str(val_pt),
+                preprocess_mode="none",
+                stn_weights=None,
+                fgd_weights=None,
+                attack_weights=str(missing_pt),
+                imgsz=64,
+                degrees=30.0,
+                translate=0.1,
+            )
+            with self.assertRaises(FileNotFoundError):
+                resolve_fgd_stn_models(args_fgd_missing_att, torch.device("cpu"))
+
+            # Omitted attack_weights reuses guidance detector
+            args_fgd_default = SimpleNamespace(
+                weights=str(val_pt),
+                preprocess_mode="none",
+                stn_weights=None,
+                fgd_weights=None,
+                attack_weights=None,
+                imgsz=64,
+                degrees=30.0,
+                translate=0.1,
+            )
+            _guidance2, attack2, _pipeline2 = resolve_fgd_stn_models(args_fgd_default, torch.device("cpu"))
+            self.assertEqual(type(attack2), type(m))
+
+    def test_h3_resume_parameter_priority_and_inheritance(self):
+        """Test H3 (R3): Resume parameter priority and inheritance:
+        1. Staged resume without --stage inherits Stage 2 from checkpoint (does not inject Stage 1).
+        2. Staged resume with --stage 2 and omitted attack parameters inherits saved attacks/eval_weights.
+        3. Plain adaptive resume without --attack_name does not inject default 4 attacks.
+        """
+        ds_h1 = create_synthetic_dataset(self.temp_dir / "ds_h3", num_images=2, imgsz=64)
+        m = DetectionModel("yolo11n.yaml", ch=3, nc=1, verbose=False)
+        ckpt_dir = self.temp_dir / "ckpt_h3"
+        weights_dir = ckpt_dir / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        last_pt = weights_dir / "last.pt"
+        torch.save(
+            {
+                "epoch": 1,
+                "model": m,
+                "best_fitness": 0.5,
+                "train_args": {
+                    "data": str(ds_h1),
+                    "model": "yolo11n.yaml",
+                    "epochs": 5,
+                    "batch": 2,
+                    "imgsz": 64,
+                },
+            },
+            last_pt,
+        )
+
+        args_yaml = ckpt_dir / "args.yaml"
+        saved_config = {
+            "model": "yolo11n.yaml",
+            "data": str(ds_h1),
+            "stage": 2,
+            "attack_name": ["pgd", "bim"],
+            "attack_ratio": [0.4, 0.6],
+            "eval_weights": [0.3, 0.7],
+            "seed": 0,
+            "p_clean": 0.5,
+            "update_interval": 1,
+            "preprocess_mode": "none",
+        }
+        with open(args_yaml, "w", encoding="utf-8") as f:
+            yaml.dump(saved_config, f)
+
+        # 1. Staged resume without --stage inherits Stage 2 from checkpoint
+        with self.subTest(scenario="staged_resume_inherits_stage"):
+            args1 = train_adv_fgd_stn_staged_run.parse_args(["--resume", str(last_pt)])
+            self.assertFalse(hasattr(args1, "stage"), "Omitted --stage must not be in parsed args!")
+            t1 = DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(last_pt)})
+            self.assertEqual(t1.stage, 2, "Stage must be inherited from checkpoint as Stage 2!")
+            self.assertEqual(t1.attack_names, ["pgd", "bim"], "Attacks must be inherited from checkpoint!")
+            self.assertEqual(t1.eval_weights, [0.3, 0.7], "Eval weights must be inherited from checkpoint!")
+
+        # 2. Staged resume with --stage 2 and omitted attack parameters inherits saved attacks
+        with self.subTest(scenario="staged_resume_stage2_inherits_attacks"):
+            args2 = train_adv_fgd_stn_staged_run.parse_args(["--resume", str(last_pt), "--stage", "2"])
+            self.assertFalse(hasattr(args2, "attack_name"))
+            self.assertFalse(hasattr(args2, "eval_weights"))
+            t2 = DetectionTrainerAdvFGDSTNStaged(overrides={"resume": str(last_pt), "stage": 2})
+            self.assertEqual(t2.stage, 2)
+            self.assertEqual(t2.attack_names, ["pgd", "bim"], "Stage 2 resume must preserve saved attacks!")
+            self.assertEqual(t2.eval_weights, [0.3, 0.7], "Stage 2 resume must preserve saved eval weights!")
+
+        # 3. Plain adaptive resume without --attack_name does not inject default 4 attacks
+        with self.subTest(scenario="adaptive_resume_inherits_attacks"):
+            args3 = train_adv_adaptive_run.parse_args(["--resume", str(last_pt)])
+            self.assertFalse(hasattr(args3, "attack_name"))
+            self.assertFalse(hasattr(args3, "eval_weights"))
+            t3 = DetectionTrainerAdvAdaptive(overrides={"resume": str(last_pt)})
+            self.assertEqual(t3.attack_names, ["pgd", "bim"], "Adaptive resume must preserve saved attacks!")
+
+    def test_h4_workers_none_handling(self):
+        """Test H4 (R4): workers=None handling across runners:
+        1. Omitted --workers must not place 'workers': None into overrides.
+        2. Explicit --workers 0 must preserve 'workers': 0.
+        """
+        # 1. train_adv_adaptive_run
+        with self.subTest(runner="train_adv_adaptive_run"):
+            args_none = train_adv_adaptive_run.parse_args([])
+            self.assertFalse(hasattr(args_none, "workers"))
+            args_zero = train_adv_adaptive_run.parse_args(["--workers", "0"])
+            self.assertEqual(args_zero.workers, 0)
+
+        # 2. train_adv_fgd_stn_adaptive_run
+        with self.subTest(runner="train_adv_fgd_stn_adaptive_run"):
+            args_none = train_adv_fgd_stn_adaptive_run.parse_args([])
+            self.assertFalse(hasattr(args_none, "workers"))
+            args_zero = train_adv_fgd_stn_adaptive_run.parse_args(["--workers", "0"])
+            self.assertEqual(args_zero.workers, 0)
+
+        # 3. train_adv_fgd_stn_staged_run
+        with self.subTest(runner="train_adv_fgd_stn_staged_run"):
+            args_none = train_adv_fgd_stn_staged_run.parse_args([])
+            self.assertFalse(hasattr(args_none, "workers"))
+            args_zero = train_adv_fgd_stn_staged_run.parse_args(["--workers", "0"])
+            self.assertEqual(args_zero.workers, 0)
+
+    def test_h5_joint_training_job_seed_array(self):
+        """Test H5 (R5): Verify train_fgd_stn_joint_job.sh appends --seed to TRAIN_ARGS not ARGS."""
+        job_script = Path("train_fgd_stn_joint_job.sh")
+        self.assertTrue(job_script.exists())
+        content = job_script.read_text(encoding="utf-8")
+        self.assertIn('TRAIN_ARGS+=(--seed "$SEED")', content)
+        self.assertNotIn('\n  ARGS+=(--seed "$SEED")', content)
+
+    def test_h6_hydra_pipeline_model_propagation(self):
+        """Test H6 (R6): HYDRA pipeline model artifact propagation across skipped stages:
+        1. run_hydra_adv_pipeline_local.sh and run_hydra_adv_pipeline_job.sh initialize CURRENT_MODEL="${INPUT_MODEL}".
+        2. Later stages pass --model "${CURRENT_MODEL}".
+        3. CURRENT_MODEL is updated only when stage output artifact exists ([ -f ... ]).
+        """
+        for script_name in ("run_hydra_adv_pipeline_local.sh", "run_hydra_adv_pipeline_job.sh"):
+            with self.subTest(script=script_name):
+                script_path = Path(script_name)
+                self.assertTrue(script_path.exists())
+                content = script_path.read_text(encoding="utf-8")
+                self.assertIn('CURRENT_MODEL="${INPUT_MODEL}"', content)
+                self.assertIn('CURRENT_MODEL="${STAGE1_BEST}"', content)
+                self.assertIn('CURRENT_MODEL="${STAGE2_BEST}"', content)
+                self.assertIn('CURRENT_MODEL="${MATERIALIZED_MODEL}"', content)
+                self.assertIn('--model "${CURRENT_MODEL}"', content)
 
 
 if __name__ == "__main__":

@@ -6,20 +6,16 @@ from __future__ import annotations
 import argparse
 import copy
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import torch
 
 from ultralytics.attacks.attack_bridge import build_attacker
-from ultralytics.attacks.attack_utils import setup_attack_model
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.defenses.fgd_stn_pipeline import (
-    MODE_DESCRIPTIONS,
-    VALID_MODES,
     build_fgd_stn_pipeline,
-    canonicalize_mode,
 )
 from ultralytics.models.yolo.detect.val_fgd_stn import (
     SUPPORTED_ATTACKS,
@@ -255,13 +251,8 @@ def resolve_models_and_pipeline(args, device: torch.device):
         guidance_model.args = IterableSimpleNamespace(**guidance_model.args)
 
     # 3. Setup attack model for black-box/transfer or white-box attack generation
-    has_custom_attack_weights = (
-        args.attack_weights
-        and str(args.attack_weights).strip().lower() not in {"", "none", "current"}
-        and Path(args.attack_weights).is_file()
-    )
-
-    if has_custom_attack_weights:
+    attack_weights_str = str(args.attack_weights).strip() if args.attack_weights is not None else ""
+    if attack_weights_str and attack_weights_str.lower() not in {"", "none", "current", "baseline"}:
         LOGGER.info(f"Loading separate black-box attack model from {args.attack_weights}...")
         attack_model, _ = load_checkpoint(args.attack_weights, device=device)
         attack_model.eval().requires_grad_(False)
@@ -279,7 +270,7 @@ def resolve_models_and_pipeline(args, device: torch.device):
     return guidance_model, attack_model, pipeline
 
 
-def build_attackers_map(args, attack_model: torch.nn.Module, imgsz: int, seed: int) -> Dict[str, Any]:
+def build_attackers_map(args, attack_model: torch.nn.Module, imgsz: int, seed: int) -> dict[str, Any]:
     """Instantiate attacker objects for requested attacks."""
     attackers = {}
 
