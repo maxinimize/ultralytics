@@ -34,6 +34,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import torch
 from PIL import Image
@@ -59,6 +60,7 @@ from ultralytics.models.yolo.detect.val_adv_fgd_stn_staged import DetectionValid
 from ultralytics.models.yolo.detect.val_adv_multi import DetectionValidator as MultiAdvDetectionValidator
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import YAML
+from ultralytics.utils.callbacks.base import default_callbacks
 from val_fgd_stn_run import resolve_models_and_pipeline as resolve_fgd_stn_models
 from val_stn_run import resolve_models as resolve_stn_models
 
@@ -1962,8 +1964,8 @@ class TestResearchTrainingIntegration(unittest.TestCase):
                 self.assertIn('--model "${CURRENT_MODEL}"', content)
 
     def test_h7_phase2_fresh_cli_and_adaptive_yaml(self):
-        """Test H7: Verify Phase 2 fresh false CLI roundtrip, fresh true control,
-        Phase 2 Shell argument construction, and plain adaptive args.yaml writing."""
+        """Test H7: Verify Phase 2 fresh false CLI roundtrip, validation strictness on fresh and resume,
+        error boundaries, training non-strict fallback, fresh true control, Shell args, and adaptive args.yaml."""
         repo_root = Path(__file__).resolve().parents[1]
 
         # 1. Phase 2 fresh false CLI execution -> warm checkpoint -> resume roundtrip
@@ -2072,7 +2074,333 @@ class TestResearchTrainingIntegration(unittest.TestCase):
             )
             self.assertNotIn("is not a valid YOLO argument", res_resume.stderr)
 
-        # 2. Phase 2 fresh true control and defenses
+        # 2. Phase 2 fresh false validation NaN gradient strictly rejects and saves no checkpoint
+        with self.subTest(scenario="phase2_fresh_false_val_nan_grad_fails_strictly"):
+            p2_fault_dir = self.temp_dir / "runs_p2_fresh_fault"
+            cmd_fault = [
+                "train_adv_fgd_phase2_run.py",
+                "--use_fgd",
+                "false",
+                "--model",
+                "yolo11n.yaml",
+                "--data",
+                str(self.data_yaml),
+                "--epochs",
+                "1",
+                "--batch",
+                "2",
+                "--imgsz",
+                "64",
+                "--workers",
+                "0",
+                "--device",
+                "cpu",
+                "--cache",
+                "false",
+                "--amp",
+                "fp32",
+                "--attack_name",
+                "pgd",
+                "--attack_ratio",
+                "0.5",
+                "--project",
+                str(p2_fault_dir),
+                "--name",
+                "fresh_fault",
+            ]
+            backward_calls = []
+            forward_finite = []
+            observed_trainer_strict = []
+            observed_validator_strict = []
+
+            def on_val_batch(validator):
+                observed_validator_strict.append(getattr(validator, "strict_attacks", None))
+                tr = getattr(validator, "trainer", None)
+                if tr is not None:
+                    observed_trainer_strict.append(getattr(tr, "strict_attacks", None))
+                atk = getattr(validator, "attacker", None)
+                if atk is None and hasattr(validator, "attackers") and isinstance(validator.attackers, dict):
+                    atk = validator.attackers.get("pgd")
+                if atk is not None and not getattr(atk, "_fault_injected", False):
+                    orig_loss = atk.wrapped_model._loss_fn
+
+                    def faulty_loss(batch, preds):
+                        loss, items = orig_loss(batch, preds)
+                        forward_finite.append(bool(torch.isfinite(loss).all().item()))
+
+                        class TrackedLoss(torch.autograd.Function):
+                            @staticmethod
+                            def forward(ctx, l):
+                                return l.clone()
+
+                            @staticmethod
+                            def backward(ctx, grad_output):
+                                backward_calls.append(True)
+                                return torch.full_like(grad_output, float("nan"))
+
+                        return TrackedLoss.apply(loss), items
+
+                    atk.wrapped_model._loss_fn = faulty_loss
+                    atk._fault_injected = True
+
+            default_callbacks["on_val_batch_start"].append(on_val_batch)
+            raised = False
+            try:
+                with patch.object(sys, "argv", cmd_fault):
+                    train_adv_fgd_phase2_run.main()
+            except RuntimeError as e:
+                raised = True
+                self.assertIn("pgd", str(e))
+                self.assertIn("batch 0", str(e))
+                self.assertIn("Adversarial gradient is NaN/Inf", str(e))
+                self.assertIsInstance(e.__cause__, FloatingPointError)
+            finally:
+                default_callbacks["on_val_batch_start"].remove(on_val_batch)
+
+            self.assertTrue(raised, "Fresh run must raise RuntimeError on validation attack NaN gradient")
+            self.assertTrue(all(forward_finite) and len(forward_finite) > 0, "Forward loss must be finite")
+            self.assertTrue(len(backward_calls) > 0, "Backward pass must have executed")
+            self.assertIn(True, observed_validator_strict, "Validator strict_attacks must be True")
+            if observed_trainer_strict:
+                self.assertIn(False, observed_trainer_strict, "Trainer training strict_attacks must be False")
+            last_pt = p2_fault_dir / "fresh_fault" / "weights" / "last.pt"
+            best_pt = p2_fault_dir / "fresh_fault" / "weights" / "best.pt"
+            self.assertFalse(last_pt.exists(), "last.pt must not be saved on failed validation")
+            self.assertFalse(best_pt.exists(), "best.pt must not be saved on failed validation")
+
+        # 3. Phase 2 resume with omitted --use_fgd strictly rejects validation fault and protects checkpoint
+        with self.subTest(scenario="phase2_resume_false_val_nan_grad_protects_checkpoint"):
+            p2_resume_dir = self.temp_dir / "runs_p2_resume_fault"
+            trainer_warm = FGDAdversarialTrainer(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 2,
+                    "batch": 2,
+                    "imgsz": 64,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": "fp32",
+                    "cache": False,
+                    "use_fgd": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [0.5],
+                    "project": str(p2_resume_dir),
+                    "name": "warm_fault_run",
+                }
+            )
+
+            def stop_ep0_fault(t):
+                if t.epoch == 0 and t.last.exists():
+                    raise KeyboardInterrupt("Simulate warm checkpoint after epoch 0")
+
+            trainer_warm.add_callback("on_fit_epoch_end", stop_ep0_fault)
+            try:
+                trainer_warm.train()
+            except KeyboardInterrupt:
+                pass
+
+            warm_ckpt = p2_resume_dir / "warm_fault_run" / "weights" / "last.pt"
+            best_ckpt = p2_resume_dir / "warm_fault_run" / "weights" / "best.pt"
+            self.assertTrue(warm_ckpt.exists() and best_ckpt.exists())
+            warm_bytes_before = warm_ckpt.read_bytes()
+            best_bytes_before = best_ckpt.read_bytes()
+
+            cmd_resume_fault = [
+                "train_adv_fgd_phase2_run.py",
+                "--resume",
+                str(warm_ckpt),
+                "--device",
+                "cpu",
+                "--amp",
+                "fp32",
+            ]
+            resume_backward_calls = []
+            resume_forward_finite = []
+            observed_resume_val_strict = []
+
+            def on_resume_val_batch(validator):
+                observed_resume_val_strict.append(getattr(validator, "strict_attacks", None))
+                atk = getattr(validator, "attacker", None)
+                if atk is None and hasattr(validator, "attackers") and isinstance(validator.attackers, dict):
+                    atk = validator.attackers.get("pgd")
+                if atk is not None and not getattr(atk, "_fault_injected", False):
+                    orig_loss = atk.wrapped_model._loss_fn
+
+                    def faulty_loss(batch, preds):
+                        loss, items = orig_loss(batch, preds)
+                        resume_forward_finite.append(bool(torch.isfinite(loss).all().item()))
+
+                        class TrackedLoss(torch.autograd.Function):
+                            @staticmethod
+                            def forward(ctx, l):
+                                return l.clone()
+
+                            @staticmethod
+                            def backward(ctx, grad_output):
+                                resume_backward_calls.append(True)
+                                return torch.full_like(grad_output, float("nan"))
+
+                        return TrackedLoss.apply(loss), items
+
+                    atk.wrapped_model._loss_fn = faulty_loss
+                    atk._fault_injected = True
+
+            default_callbacks["on_val_batch_start"].append(on_resume_val_batch)
+            resume_raised = False
+            try:
+                with patch.object(sys, "argv", cmd_resume_fault):
+                    train_adv_fgd_phase2_run.main()
+            except RuntimeError as e:
+                resume_raised = True
+                self.assertIn("pgd", str(e))
+                self.assertIn("batch 0", str(e))
+                self.assertIn("Adversarial gradient is NaN/Inf", str(e))
+                self.assertIsInstance(e.__cause__, FloatingPointError)
+            finally:
+                default_callbacks["on_val_batch_start"].remove(on_resume_val_batch)
+
+            self.assertTrue(resume_raised, "Resume run must raise on validation attack failure")
+            self.assertTrue(all(resume_forward_finite) and len(resume_forward_finite) > 0)
+            self.assertTrue(len(resume_backward_calls) > 0)
+            self.assertIn(True, observed_resume_val_strict, "Validator on resume must be strict")
+            self.assertEqual(warm_ckpt.read_bytes(), warm_bytes_before, "last.pt must be protected on error")
+            self.assertEqual(best_ckpt.read_bytes(), best_bytes_before, "best.pt must be protected on error")
+
+        # 4. Phase 2 validator error boundaries and state preservation
+        with self.subTest(scenario="phase2_validator_error_boundaries"):
+            p2_bounds_dir = self.temp_dir / "runs_p2_bounds"
+            trainer_b = FGDAdversarialTrainer(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "imgsz": 64,
+                    "batch": 2,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": False,
+                    "use_fgd": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [0.5],
+                    "project": str(p2_bounds_dir),
+                    "name": "bounds_exp",
+                }
+            )
+            trainer_b._setup_train()
+            self.assertIs(trainer_b.strict_attacks, False, "Trainer training strict_attacks must be False")
+            self.assertIsNone(trainer_b.denoiser, "Denoiser must be None when use_fgd=False")
+
+            v = trainer_b.get_validator()
+            v.device = torch.device("cpu")
+            self.assertIs(v.strict_attacks, True, "Validator strict_attacks must be True")
+            self.assertIs(getattr(v.args, "strict_attacks", None), True)
+            self.assertIsNone(v.denoiser)
+
+            # Get a real batch from the dataloader
+            real_batch = next(iter(trainer_b.test_loader))
+            self.assertIn("img", real_batch)
+            self.assertIn("cls", real_batch)
+
+            # A. Missing attacker raises
+            v.attack_name = "pgd"
+            v.attackers = {}
+            v.attacker = None
+            v.batch_i = 0
+            with self.assertRaises(RuntimeError) as ctx:
+                v.preprocess(dict(real_batch))
+            self.assertIn("pgd", str(ctx.exception))
+            self.assertIn("batch 0", str(ctx.exception))
+            self.assertIn("Cannot substitute clean data", str(ctx.exception))
+
+            # B. Attacker returning None on batch with targets raises
+            with patch("ultralytics.models.yolo.detect.val_adv_fgd_phase2.run_attack_on_batch", return_value=None):
+                v.attackers = {"pgd": object()}
+                v.attacker = v.attackers["pgd"]
+                with self.assertRaises(RuntimeError) as ctx:
+                    v.preprocess(dict(real_batch))
+                self.assertIn("returned None", str(ctx.exception))
+                self.assertIn("batch 0", str(ctx.exception))
+
+            # C. Legitimate no-target batch returning None does NOT raise
+            no_targets_batch = dict(real_batch)
+            no_targets_batch["cls"] = torch.zeros((0, 1))
+            no_targets_batch["bboxes"] = torch.zeros((0, 4))
+            no_targets_batch["batch_idx"] = torch.zeros(0, dtype=torch.int64)
+            with patch("ultralytics.models.yolo.detect.val_adv_fgd_phase2.run_attack_on_batch", return_value=None):
+                out = v.preprocess(no_targets_batch)
+                self.assertIsNotNone(out)
+
+            # D. Non-finite (NaN/Inf) tensor raises
+            nan_tensor = torch.full((real_batch["img"].shape[0], 3, 64, 64), float("nan"), dtype=torch.float32)
+            with patch(
+                "ultralytics.models.yolo.detect.val_adv_fgd_phase2.run_attack_on_batch", return_value=nan_tensor
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    v.preprocess(dict(real_batch))
+                self.assertIn("produced NaN or Inf", str(ctx.exception))
+                self.assertIn("batch 0", str(ctx.exception))
+
+            # E. Mismatched shape raises
+            wrong_shape = torch.zeros((real_batch["img"].shape[0], 3, 32, 32), dtype=torch.float32)
+            with patch(
+                "ultralytics.models.yolo.detect.val_adv_fgd_phase2.run_attack_on_batch", return_value=wrong_shape
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    v.preprocess(dict(real_batch))
+                self.assertIn("mismatch", str(ctx.exception))
+                self.assertIn("batch 0", str(ctx.exception))
+
+            # F. Raw validation works normally
+            v.attack_name = "raw"
+            out_raw = v.preprocess(dict(real_batch))
+            self.assertIsNotNone(out_raw)
+
+            # G. Validator strict_attacks remains True after calls
+            self.assertIs(v.strict_attacks, True)
+
+        # 5. Training non-strict fallback remains functional when use_fgd=False
+        with self.subTest(scenario="phase2_training_non_strict_remains"):
+            p2_train_fault_dir = self.temp_dir / "runs_p2_train_fault"
+            trainer_tf = FGDAdversarialTrainer(
+                overrides={
+                    "model": "yolo11n.yaml",
+                    "data": str(self.data_yaml),
+                    "epochs": 1,
+                    "batch": 2,
+                    "imgsz": 64,
+                    "workers": 0,
+                    "device": "cpu",
+                    "amp": "fp32",
+                    "cache": False,
+                    "use_fgd": False,
+                    "attack_name": ["pgd"],
+                    "attack_ratio": [0.5],
+                    "project": str(p2_train_fault_dir),
+                    "name": "train_fault_exp",
+                }
+            )
+            self.assertIs(trainer_tf.strict_attacks, False, "Training policy must be non-strict when use_fgd=False")
+            v_tf = trainer_tf.get_validator()
+            self.assertIs(v_tf.strict_attacks, True, "Validation policy must be strict")
+
+            trainer_tf._setup_train()
+            pgd_atk = trainer_tf.attackers.get("pgd")
+            orig_train_loss = pgd_atk.wrapped_model._loss_fn
+
+            def faulty_train_loss(batch, preds):
+                raise FloatingPointError("Simulated training numerical failure")
+
+            pgd_atk.wrapped_model._loss_fn = faulty_train_loss
+
+            def restore_val(t):
+                pgd_atk.wrapped_model._loss_fn = orig_train_loss
+
+            trainer_tf.add_callback("on_train_epoch_end", restore_val)
+            # Should complete 1 epoch without raising, logging warning and falling back to raw images
+            trainer_tf.train()
+
+        # 6. Phase 2 fresh true control and defenses
         with self.subTest(scenario="phase2_fresh_true_control_and_defense"):
             # A: Explicit valid FGD weights loads denoiser and freezes it
             trainer_true = FGDAdversarialTrainer(

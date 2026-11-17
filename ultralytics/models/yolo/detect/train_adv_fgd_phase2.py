@@ -92,7 +92,12 @@ class FGDAdversarialTrainer(DetectionTrainer):
         validator.attacker, validator.attackers = self.attacker, self.attackers
         validator.attack_names, validator.attack_ratios = self.attack_names, self.attack_ratios
         validator.denoiser = self.denoiser
-        validator.strict_attacks = self.strict_attacks
+        validator.strict_attacks = True
+        if hasattr(validator, "args") and validator.args is not None:
+            if isinstance(validator.args, dict):
+                validator.args["strict_attacks"] = True
+            else:
+                validator.args.strict_attacks = True
         if self.phase2["use_fgd"]:
             validator.attack_builder = self.build_attacker
             validator.whitebox = self.attack_model is None
