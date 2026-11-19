@@ -1377,7 +1377,12 @@ class DetectionTrainer(BaseTrainer):
                                                     imgs_adv = sub_batch["img"]
                                                 else:
                                                     imgs_adv = run_attack_on_batch(
-                                                        attacker, sub_batch, label_policy="largest_box"
+                                                        attacker,
+                                                        sub_batch,
+                                                        label_policy="largest_box",
+                                                        strict=self.strict_attacks,
+                                                        attack_name=att,
+                                                        batch_i=i,
                                                     )
                                         else:
                                             with torch.amp.autocast(device_type="cuda", enabled=False):
@@ -1388,7 +1393,12 @@ class DetectionTrainer(BaseTrainer):
                                                     imgs_adv = sub_batch["img"]
                                                 else:
                                                     imgs_adv = run_attack_on_batch(
-                                                        attacker, sub_batch, label_policy="largest_box"
+                                                        attacker,
+                                                        sub_batch,
+                                                        label_policy="largest_box",
+                                                        strict=self.strict_attacks,
+                                                        attack_name=att,
+                                                        batch_i=i,
                                                     )
 
                                         if imgs_adv is None:
