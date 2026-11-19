@@ -389,12 +389,121 @@ def slice_batch_indices(batch: dict, indices: list[int]) -> dict:
     return sub_batch
 
 
+def validate_batch_annotations(batch: dict, batch_size: int, classes: Optional[Sequence[int]] = None) -> torch.Tensor:
+    """Validate batch annotations and return boolean mask of shape [batch_size] indicating which images have targets."""
+    batch_idx = batch.get("batch_idx")
+    cls = batch.get("cls")
+    bboxes = batch.get("bboxes")
+
+    if batch_idx is None or cls is None or bboxes is None:
+        raise ValueError(
+            f"Batch annotations corrupted: missing batch_idx, cls, or bboxes in batch keys {list(batch.keys())}"
+        )
+    if not (torch.is_tensor(batch_idx) and torch.is_tensor(cls) and torch.is_tensor(bboxes)):
+        raise ValueError("Batch annotations corrupted: batch_idx, cls, and bboxes must be torch.Tensor")
+
+    bi = batch_idx.squeeze(-1) if batch_idx.ndim > 1 else batch_idx
+    c = cls.squeeze(-1) if cls.ndim > 1 else cls
+    b = bboxes
+
+    if not (bi.ndim == 1 and c.ndim == 1 and b.ndim == 2 and b.shape[-1] == 4):
+        raise ValueError(
+            f"Batch annotations corrupted: shape mismatch bi={tuple(bi.shape)}, c={tuple(c.shape)}, b={tuple(b.shape)}"
+        )
+    if not (bi.shape[0] == c.shape[0] == b.shape[0]):
+        raise ValueError(
+            f"Batch annotations corrupted: length mismatch bi={bi.shape[0]}, c={c.shape[0]}, b={b.shape[0]}"
+        )
+    if not (torch.isfinite(bi).all() and torch.isfinite(c).all() and torch.isfinite(b).all()):
+        raise ValueError("Batch annotations corrupted: non-finite values found in annotations")
+    if bi.numel() > 0:
+        min_bi = int(bi.min().item())
+        max_bi = int(bi.max().item())
+        if min_bi < 0 or max_bi >= batch_size:
+            raise ValueError(
+                f"Batch annotations corrupted: batch_idx out of bounds [0, {batch_size - 1}], got [{min_bi}, {max_bi}]"
+            )
+
+    has_targets = torch.zeros((batch_size,), dtype=torch.bool, device=bi.device)
+    if bi.numel() > 0:
+        if classes is not None:
+            cls_set = torch.tensor(list(classes), device=c.device)
+            valid_cls_mask = (c.unsqueeze(-1) == cls_set).any(dim=-1)
+        else:
+            valid_cls_mask = torch.ones_like(c, dtype=torch.bool)
+
+        valid_bi = bi[valid_cls_mask]
+        if valid_bi.numel() > 0:
+            has_targets.scatter_(0, valid_bi.long(), True)
+
+    return has_targets
+
+
+def _check_attack_output(adv: Any, batch: dict, attack_name: str, batch_i: int = -1, sub_idx: int = 0) -> None:
+    """Strict validation of attack generation output on sub-batches with valid targets."""
+    im_files = batch.get("im_file", [])
+    has_targets = False
+    if (
+        "cls" in batch
+        and batch["cls"] is not None
+        and batch["cls"].numel() > 0
+        or "bboxes" in batch
+        and batch["bboxes"] is not None
+        and batch["bboxes"].numel() > 0
+    ):
+        has_targets = True
+
+    if not has_targets:
+        return
+
+    if adv is None:
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker returned None for batch with targets. Relevant image paths: {im_files}"
+        )
+    if not torch.is_tensor(adv):
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker returned non-tensor output of type {type(adv)}. Relevant image paths: {im_files}"
+        )
+    if not adv.is_floating_point():
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker returned non-floating point tensor with dtype {adv.dtype}. Relevant image paths: {im_files}"
+        )
+    expected_shape = batch["img"].shape
+    if adv.shape != expected_shape:
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker output shape {tuple(adv.shape)} does not match expected shape {tuple(expected_shape)}. "
+            f"Relevant image paths: {im_files}"
+        )
+    if not torch.isfinite(adv).all():
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker output contains NaN or Inf values. Relevant image paths: {im_files}"
+        )
+    min_val = adv.amin().item()
+    max_val = adv.amax().item()
+    if min_val < -1e-6 or max_val > 1.0 + 1e-6:
+        raise RuntimeError(
+            f"Attack '{attack_name}' failed at batch {batch_i}, sub-batch {sub_idx}: "
+            f"Attacker output pixels out of [0, 1] bounds (min: {min_val}, max: {max_val}, tolerance 1e-6). "
+            f"Relevant image paths: {im_files}"
+        )
+
+
 def run_attack_on_batch(
     attacker,
     batch: dict,
     *,
     label_policy: str = "largest_box",
     max_batch_size: Optional[int] = None,
+    strict: bool = False,
+    attack_name: str = "attack",
+    batch_i: int = -1,
+    sub_idx: int = 0,
+    **kwargs: Any,
 ) -> Optional[torch.Tensor]:
     """
     Apply an attacker to a training/validation batch.
@@ -445,7 +554,27 @@ def run_attack_on_batch(
                     attacker.proxy_model.current_paths = im_files
                 if hasattr(attacker, "estimator") and hasattr(attacker.estimator, "model"):
                     attacker.estimator.model.current_paths = im_files
-                adv_sub = run_attack_on_batch(attacker, sub_batch, label_policy=label_policy, max_batch_size=None)
+                try:
+                    adv_sub = run_attack_on_batch(
+                        attacker,
+                        sub_batch,
+                        label_policy=label_policy,
+                        max_batch_size=None,
+                        strict=strict,
+                        attack_name=attack_name,
+                        batch_i=batch_i,
+                        sub_idx=start_idx,
+                    )
+                except Exception:
+                    if strict:
+                        raise
+                    adv_sub = None
+
+                if strict:
+                    _check_attack_output(
+                        adv_sub, sub_batch, attack_name=attack_name, batch_i=batch_i, sub_idx=start_idx
+                    )
+
                 if adv_sub is not None:
                     adv_imgs[start_idx:end_idx] = adv_sub.to(adv_imgs.dtype)
 
@@ -506,7 +635,14 @@ def run_attack_on_batch(
         # returns an image tensor, preserving the existing caller contract.
         forward_batch = getattr(attacker, "forward_batch", None)
         if callable(forward_batch) and bool(getattr(attacker, "batch_aware", False)):
-            adv = forward_batch(batch)
+            try:
+                adv = forward_batch(batch)
+            except Exception:
+                if strict:
+                    raise
+                return None
+            if strict:
+                _check_attack_output(adv, batch, attack_name=attack_name, batch_i=batch_i, sub_idx=sub_idx)
             return adv.to(imgs.dtype)
 
         mode = infer_attack_mode(attacker)
@@ -515,8 +651,15 @@ def run_attack_on_batch(
             targets = build_detector_targets(batch)
             if targets is None or targets.numel() == 0:
                 return None
-            adv = attacker.forward(imgs.float(), targets)
+            try:
+                adv = attacker.forward(imgs.float(), targets)
+            except Exception:
+                if strict:
+                    raise
+                return None
             del targets
+            if strict:
+                _check_attack_output(adv, batch, attack_name=attack_name, batch_i=batch_i, sub_idx=sub_idx)
             res_adv = adv.to(imgs.dtype)
             del adv
             return res_adv
@@ -525,9 +668,23 @@ def run_attack_on_batch(
         if labels is None or attacked_idx is None or attacked_idx.numel() == 0:
             return None
 
+        try:
+            adv_subset = attacker.forward(imgs[attacked_idx].float(), labels)
+        except Exception:
+            if strict:
+                raise
+            return None
+
+        if strict:
+            sub_b = {"img": imgs[attacked_idx], "cls": labels}
+            if batch.get("im_file"):
+                sub_b["im_file"] = [batch["im_file"][i] for i in attacked_idx.tolist()]
+            _check_attack_output(adv_subset, sub_b, attack_name=attack_name, batch_i=batch_i, sub_idx=sub_idx)
+
         adv_imgs = imgs.clone()
-        adv_subset = attacker.forward(imgs[attacked_idx].float(), labels)
         adv_imgs[attacked_idx] = adv_subset.to(imgs.dtype)
+        del adv_subset, labels, attacked_idx
+        return adv_imgs
         del adv_subset, labels, attacked_idx
         return adv_imgs
     finally:

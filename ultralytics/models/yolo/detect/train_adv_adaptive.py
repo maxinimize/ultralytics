@@ -29,6 +29,7 @@ from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models.yolo.detect.val_adv_adaptive import DetectionValidator as DetectionValidatorAdvAdaptive
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import DEFAULT_CFG, GIT, LOGGER, RANK, TQDM, YAML, colorstr
+from ultralytics.utils.files import increment_path
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import (
@@ -40,6 +41,8 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+
+EVAL_PROTOCOL_VERSION: str = "2.0"
 
 
 def parse_list_arg(val, type_conv=str):
@@ -164,7 +167,7 @@ class DynamicAttackRatioController:
         self.update_interval = int(update_interval)
         self.save_dir = Path(save_dir) if save_dir else None
 
-        default_eval = {"pgd": 0.25, "bim": 0.15, "mim": 0.15, "worstk": 0.20}
+        default_eval = {"pgd": 0.25, "bim": 0.25, "mim": 0.25, "worstk": 0.25}
         if isinstance(eval_weights, dict):
             self.eval_weights = {str(k).lower().strip(): float(v) for k, v in eval_weights.items()}
         elif eval_weights is not None:
@@ -705,13 +708,15 @@ class DetectionTrainer(BaseTrainer):
                 batch,
                 self.data,
                 mode=mode,
-                rect=mode == "val",
+                rect=getattr(self.args, "rect", False),
                 stride=gs,
                 attack_names=self.attack_names,
                 attack_ratios=ratios,
                 p_clean=self.p_clean,
             )
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == "val", stride=gs)
+        val_cfg = copy(self.args)
+        val_cfg.rect = False
+        return build_yolo_dataset(val_cfg, img_path, batch, self.data, mode=mode, rect=False, stride=gs)
 
     def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = 0, mode: str = "train"):
         """Construct and return dataloader."""
@@ -840,6 +845,42 @@ class DetectionTrainer(BaseTrainer):
     def _load_checkpoint_state(self, ckpt):
         """Load optimizer, scaler, EMA, best_fitness, adaptive_state, and live training model from checkpoint."""
         super()._load_checkpoint_state(ckpt)
+        ckpt_proto = ckpt.get("eval_protocol_version") if ckpt else None
+        is_resume = getattr(self, "resume", False) or getattr(self.args, "resume", False)
+        if is_resume and ckpt and ckpt_proto != EVAL_PROTOCOL_VERSION:
+            LOGGER.info(
+                f"Resumed checkpoint eval protocol ({ckpt_proto}) differs from current protocol ({EVAL_PROTOCOL_VERSION}). "
+                "Preserving model, optimizer, and training progress, but resetting best_fitness, best epoch, and early stopping."
+            )
+            self.best_fitness = None
+            self.best_epoch = getattr(self, "epoch", 0)
+            if hasattr(self, "stopper") and self.stopper is not None:
+                self.stopper.possible_stop = False
+                self.stopper.best_fitness = None
+                self.stopper.epoch = 0
+
+            resume_path = getattr(self.args, "resume", None)
+            if isinstance(resume_path, (str, Path)) and Path(resume_path).is_file():
+                old_dir = Path(resume_path).resolve().parent.parent
+                if self.save_dir.resolve() == old_dir:
+                    new_save_dir = increment_path(self.save_dir, exist_ok=False)
+                    LOGGER.info(
+                        f"Rerouting run directory to preserve old checkpoint best.pt: {self.save_dir} -> {new_save_dir}"
+                    )
+                    self.save_dir = new_save_dir
+                    self.wdir = self.save_dir / "weights"
+                    self.wdir.mkdir(parents=True, exist_ok=True)
+                    self.last = self.wdir / "last.pt"
+                    self.best = self.wdir / "best.pt"
+                    self.csv = self.save_dir / "results.csv"
+            elif self.save_dir:
+                new_save_dir = increment_path(self.save_dir, exist_ok=False)
+                self.save_dir = new_save_dir
+                self.wdir = self.save_dir / "weights"
+                self.wdir.mkdir(parents=True, exist_ok=True)
+                self.last = self.wdir / "last.pt"
+                self.best = self.wdir / "best.pt"
+                self.csv = self.save_dir / "results.csv"
         if ckpt and "strict_attacks" in ckpt:
             self.strict_attacks = bool(ckpt["strict_attacks"])
             self.args.strict_attacks = self.strict_attacks
@@ -947,6 +988,17 @@ class DetectionTrainer(BaseTrainer):
             ),
         }
 
+        eval_settings = {
+            "imgsz": getattr(self.args, "imgsz", 640),
+            "rect": False,
+            "conf": getattr(self.args, "conf", 0.001),
+            "iou": getattr(self.args, "iou", 0.60),
+            "max_det": getattr(self.args, "max_det", 300),
+            "multi_label": True,
+            "classes": getattr(self.args, "classes", None),
+            "eval_weights": getattr(self, "eval_weights", None),
+        }
+
         buffer = io.BytesIO()
         torch.save(
             {
@@ -965,6 +1017,8 @@ class DetectionTrainer(BaseTrainer):
                 "attacker_state": attacker_states,
                 "random_state": random_state,
                 "strict_attacks": getattr(self, "strict_attacks", True),
+                "eval_protocol_version": EVAL_PROTOCOL_VERSION,
+                "eval_settings": eval_settings,
                 "date": datetime.now().astimezone().isoformat(),
                 "version": __version__,
                 "git": {
@@ -994,6 +1048,19 @@ class DetectionTrainer(BaseTrainer):
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
 
         validator_args = copy(self.args)
+        validator_args.rect = False
+        if not hasattr(validator_args, "conf") or validator_args.conf is None or validator_args.conf == 0.25:
+            validator_args.conf = getattr(self.args, "conf", 0.001)
+            if validator_args.conf == 0.25:
+                validator_args.conf = 0.001
+        if not hasattr(validator_args, "iou") or validator_args.iou is None or validator_args.iou == 0.7:
+            validator_args.iou = getattr(self.args, "iou", 0.60)
+            if validator_args.iou == 0.7:
+                validator_args.iou = 0.60
+        if not hasattr(validator_args, "max_det") or validator_args.max_det is None:
+            validator_args.max_det = getattr(self.args, "max_det", 300)
+        validator_args.classes = getattr(self.args, "classes", None)
+
         for arg in [
             "attack_weights",
             "attack_name",

@@ -19,9 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p_clean", type=float, help="Clean training ratio (default: 0.25)")
     parser.add_argument("--tau", type=float, help="Softmax temperature tau for dynamic updates (default: 5.0)")
     parser.add_argument("--update_interval", type=int, help="Epoch interval for ratio update (default: 5)")
-    parser.add_argument("--eval_weights", nargs="+", help="Fixed evaluation weights (default: 0.25 0.15 0.15 0.20)")
+    parser.add_argument("--eval_weights", nargs="+", help="Fixed evaluation weights (default: 0.25 0.25 0.25 0.25)")
     parser.add_argument("--device", help="Device string (e.g. 0 or 0,1, default: 0,1)")
     parser.add_argument("--imgsz", type=int, help="Image size (default: 640)")
+    parser.add_argument("--conf", type=float, help="Validation confidence threshold (default: 0.001)")
+    parser.add_argument("--iou", type=float, help="Validation NMS IoU threshold (default: 0.60)")
+    parser.add_argument("--max_det", type=int, help="Validation maximum detections per image (default: 300)")
     parser.add_argument("--workers", type=int, help="DataLoader workers")
     parser.add_argument("--project", help="Project directory (default: runs/train_adv)")
     parser.add_argument("--name", help="Experiment name (default: exp)")
@@ -82,6 +85,12 @@ def main():
             overrides["attack_ratio"] = args.attack_ratio
         if hasattr(args, "eval_weights"):
             overrides["eval_weights"] = args.eval_weights
+        if hasattr(args, "conf"):
+            overrides["conf"] = args.conf
+        if hasattr(args, "iou"):
+            overrides["iou"] = args.iou
+        if hasattr(args, "max_det"):
+            overrides["max_det"] = args.max_det
     else:
         overrides = dict(
             model=getattr(args, "model", "yolov8x.pt"),
@@ -90,6 +99,9 @@ def main():
             batch=getattr(args, "batch", 24),
             device=getattr(args, "device", "0,1"),
             imgsz=getattr(args, "imgsz", 640),
+            conf=getattr(args, "conf", 0.001),
+            iou=getattr(args, "iou", 0.60),
+            max_det=getattr(args, "max_det", 300),
             project=getattr(args, "project", "runs/train_adv"),
             name=getattr(args, "name", "exp"),
             resume=False,
@@ -100,7 +112,7 @@ def main():
             update_interval=getattr(args, "update_interval", 5),
             attack_name=getattr(args, "attack_name", ["pgd", "bim", "mim", "worstk"]),
             attack_ratio=getattr(args, "attack_ratio", [0.10, 0.10, 0.40, 0.15]),
-            eval_weights=getattr(args, "eval_weights", [0.25, 0.15, 0.15, 0.20]),
+            eval_weights=getattr(args, "eval_weights", [0.25, 0.25, 0.25, 0.25]),
         )
 
     if hasattr(args, "workers") and args.workers is not None:

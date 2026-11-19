@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from ultralytics.attacks.attack_bridge import run_attack_on_batch
+from ultralytics.attacks.attack_bridge import run_attack_on_batch, slice_batch_indices, validate_batch_annotations
 from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.defenses.fgd_stn_pipeline import (
     MODE_DESCRIPTIONS,
@@ -115,6 +115,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
         self.mode_stats: Dict[str, Dict[str, List[torch.Tensor]]] = {}
         self.mode_seen: Dict[str, int] = {}
         self.mode_diagnostics: Dict[str, Dict[str, List[float]]] = {}
+        self.attack_diagnostics: Dict[str, Dict[str, int]] = {}
 
     def postprocess(self, preds: Any) -> List[torch.Tensor]:
         """Perform Non-Maximum Suppression (NMS) on detector predictions.
@@ -128,13 +129,14 @@ class UnifiedFGDSTNValidator(BaseValidator):
         conf_thres = getattr(self.args, "conf", 0.001)
         iou_thres = getattr(self.args, "iou", 0.6)
         classes = getattr(self.args, "classes", None)
+        max_det = getattr(self.args, "max_det", 300)
         return non_max_suppression(
             preds,
             conf_thres=conf_thres,
             iou_thres=iou_thres,
             classes=classes,
             multi_label=True,
-            max_det=300,
+            max_det=max_det,
         )
 
     def _process_batch(
@@ -226,7 +228,9 @@ class UnifiedFGDSTNValidator(BaseValidator):
             for k in stats:
                 stats[k].append(stat[k])
 
-    def generate_attacked_batch(self, attack: str, batch: dict) -> dict:
+    def generate_attacked_batch(
+        self, attack: str, batch: dict, batch_i: int = -1, return_stats: bool = False
+    ) -> dict | Tuple[dict, Tuple[int, int, int, int]]:
         """Generate adversarial sample batch once, independent of defense preprocessing.
 
         Preserves existing Worst-of-K ground-truth transformations while ensuring
@@ -235,37 +239,100 @@ class UnifiedFGDSTNValidator(BaseValidator):
         Args:
             attack (str): Canonical attack name.
             batch (dict): Preprocessed batch dictionary with images in [0, 1].
+            batch_i (int): Batch index for logging and error reporting.
+            return_stats (bool): If True, returns (att_batch, (seen, generated, skipped, failed)).
 
         Returns:
-            dict: Attacked batch dictionary.
+            dict | Tuple[dict, Tuple[int, int, int, int]]: Attacked batch, optionally with generation statistics.
         """
-        # Shallow copy batch with cloned tensors to isolate downstream pipelines
-        att_batch = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch.items()}
+        b_size = batch["img"].shape[0]
+        eval_classes = getattr(self.args, "classes", None)
 
+        # 1. Strict annotation verification
+        has_targets = validate_batch_annotations(batch, b_size, classes=eval_classes)
+
+        # 2. Clean evaluation
         if attack == "clean":
-            return att_batch
+            att_batch = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch.items()}
+            stats = (b_size, b_size, 0, 0)
+            return (att_batch, stats) if return_stats else att_batch
 
+        # 3. Worst-of-K spatial attack
         if attack == "worstk":
             attacker = self.attackers.get("worstk")
-            if attacker is not None and callable(getattr(attacker, "forward_batch", None)):
-                attacker.forward_batch(att_batch)
-            return att_batch
+            if attacker is None or not callable(getattr(attacker, "forward_batch", None)):
+                raise ValueError("Requested attack 'worstk' has no attacker or is missing forward_batch.")
 
+            att_batch = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch.items()}
+            try:
+                attacker.forward_batch(att_batch)
+            except Exception as e:
+                LOGGER.error(f"Worst-of-K forward_batch failed at batch {batch_i}: {e}")
+                raise
+
+            out_img = att_batch.get("img")
+            if out_img is None or not torch.is_tensor(out_img):
+                raise RuntimeError(f"Worst-of-K failed to produce image tensor at batch {batch_i}")
+            if out_img.shape != batch["img"].shape:
+                raise RuntimeError(
+                    f"Worst-of-K output shape {out_img.shape} != input {batch['img'].shape} at batch {batch_i}"
+                )
+            if not torch.isfinite(out_img).all():
+                raise RuntimeError(f"Worst-of-K produced NaN or Inf values at batch {batch_i}")
+            min_v = out_img.amin().item()
+            max_v = out_img.amax().item()
+            if min_v < -1e-6 or max_v > 1.0 + 1e-6:
+                raise RuntimeError(f"Worst-of-K pixels out of [0, 1] range: [{min_v}, {max_v}] at batch {batch_i}")
+
+            gt_m = att_batch.get("gt_matrix")
+            if gt_m is None or not torch.is_tensor(gt_m):
+                raise RuntimeError(f"Worst-of-K missing gt_matrix in attacked batch at batch {batch_i}")
+            if gt_m.shape != (b_size, 3, 3):
+                raise RuntimeError(
+                    f"Worst-of-K gt_matrix shape {gt_m.shape} != expected ({b_size}, 3, 3) at batch {batch_i}"
+                )
+            if not torch.isfinite(gt_m).all():
+                raise RuntimeError(f"Worst-of-K gt_matrix contains non-finite values at batch {batch_i}")
+
+            validate_batch_annotations(att_batch, b_size, classes=eval_classes)
+            stats = (b_size, b_size, 0, 0)
+            return (att_batch, stats) if return_stats else att_batch
+
+        # 4. Pixel attacks: PGD, BIM, MIM
         if attack in {"pgd", "bim", "mim"}:
             attacker = self.attackers.get(attack)
-            if attacker is not None:
-                adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
-                imgs_adv = run_attack_on_batch(
-                    attacker,
-                    att_batch,
-                    label_policy="largest_box",
-                    max_batch_size=adv_batch_size,
-                )
-                if imgs_adv is not None:
-                    att_batch["img"] = imgs_adv.to(att_batch["img"].dtype).to(self.device)
-            return att_batch
+            if attacker is None:
+                raise ValueError(f"Requested attack '{attack}' has no attacker configured.")
 
-        return att_batch
+            target_indices = [j for j in range(b_size) if has_targets[j].item()]
+            bg_indices = [j for j in range(b_size) if not has_targets[j].item()]
+            n_skipped = len(bg_indices)
+            n_generated = len(target_indices)
+
+            att_batch = {k: v.clone() if torch.is_tensor(v) else copy(v) for k, v in batch.items()}
+            if n_generated == 0:
+                stats = (b_size, 0, n_skipped, 0)
+                return (att_batch, stats) if return_stats else att_batch
+
+            sub_batch = slice_batch_indices(batch, target_indices)
+            adv_batch_size = int(getattr(self.args, "adv_val_batch", 16))
+            adv_sub = run_attack_on_batch(
+                attacker,
+                sub_batch,
+                label_policy="largest_box",
+                max_batch_size=adv_batch_size,
+                strict=True,
+                attack_name=attack,
+                batch_i=batch_i,
+            )
+
+            for local_k, orig_k in enumerate(target_indices):
+                att_batch["img"][orig_k] = adv_sub[local_k].to(att_batch["img"].dtype)
+
+            stats = (b_size, n_generated, n_skipped, 0)
+            return (att_batch, stats) if return_stats else att_batch
+
+        raise ValueError(f"Unsupported attack: {attack}")
 
     def compute_mode_metrics(self, mode: str) -> Dict[str, float]:
         """Compute final mAP50 and mAP50-95 for a specific mode from accumulated statistics.
@@ -362,13 +429,24 @@ class UnifiedFGDSTNValidator(BaseValidator):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
 
-        if attack == "worstk" and "worstk" in self.attackers:
-            wk_att = self.attackers["worstk"]
+        # 1. Attacker availability verification
+        if attack == "clean":
+            pass
+        elif attack in {"pgd", "bim", "mim"}:
+            if self.attackers.get(attack) is None:
+                raise ValueError(f"Requested attack '{attack}' has no attacker configured.")
+        elif attack == "worstk":
+            wk_att = self.attackers.get("worstk")
+            if wk_att is None or not callable(getattr(wk_att, "forward_batch", None)):
+                raise ValueError("Requested attack 'worstk' has no attacker or is missing forward_batch.")
             if hasattr(wk_att, "reset_seed"):
                 wk_att.reset_seed(int(seed))
             elif hasattr(wk_att, "_generator"):
                 wk_att._generator.manual_seed(int(seed))
+        else:
+            raise ValueError(f"Unsupported attack: {attack}")
 
+        self.attack_diagnostics[attack] = {"seen": 0, "generated": 0, "skipped_no_target": 0, "failed": 0}
         self._reset_mode_stats(modes)
         desc = f"Evaluating [{attack.upper()}] across modes ({', '.join(modes)})"
         bar = TQDM(self.dataloader, desc=desc, total=len(self.dataloader))
@@ -387,7 +465,22 @@ class UnifiedFGDSTNValidator(BaseValidator):
             batch["clean_img"] = batch["img"].clone()
 
             # 1. Generate attacked batch ONCE per batch (independent of defense mode)
-            att_batch = self.generate_attacked_batch(attack, batch)
+            try:
+                att_batch, (b_seen, b_gen, b_skip, b_fail) = self.generate_attacked_batch(
+                    attack, batch, batch_i=batch_i, return_stats=True
+                )
+            except Exception as e:
+                self.attack_diagnostics[attack]["failed"] += batch["img"].shape[0]
+                LOGGER.error(f"[{attack.upper()}] Generation failed at batch {batch_i}: {e}")
+                raise
+
+            self.attack_diagnostics[attack]["seen"] += b_seen
+            self.attack_diagnostics[attack]["generated"] += b_gen
+            self.attack_diagnostics[attack]["skipped_no_target"] += b_skip
+            self.attack_diagnostics[attack]["failed"] += b_fail
+            if b_fail > 0:
+                raise RuntimeError(f"[{attack.upper()}] Generation recorded failures at batch {batch_i}")
+
             _, _, h, w = att_batch["img"].shape
             gt_matrix = att_batch.get("gt_matrix")
 
@@ -416,6 +509,23 @@ class UnifiedFGDSTNValidator(BaseValidator):
 
                 # Update metrics comparing predictions with ground truth boxes
                 self.update_mode_metrics(mode, preds, att_batch)
+
+        # Integrity check and diagnostics reporting
+        diag = self.attack_diagnostics[attack]
+        LOGGER.info(
+            f"[{attack.upper()}] Diagnostics: seen={diag['seen']}, generated={diag['generated']}, "
+            f"skipped_no_target={diag['skipped_no_target']}, failed={diag['failed']}"
+        )
+        if attack != "clean" and diag["generated"] == 0:
+            raise RuntimeError(
+                f"Attack '{attack}' evaluated 0 perturbed samples (all {diag['seen']} images were skipped_no_target). "
+                "Formal evaluation results cannot be generated."
+            )
+        if diag["failed"] > 0 or diag["seen"] != (diag["generated"] + diag["skipped_no_target"]):
+            raise RuntimeError(
+                f"Attack '{attack}' diagnostic integrity failure: seen={diag['seen']}, "
+                f"generated={diag['generated']}, skipped={diag['skipped_no_target']}, failed={diag['failed']}."
+            )
 
         # Compute detection mAP for each mode
         attack_results: Dict[str, Dict[str, float]] = {}
@@ -498,6 +608,23 @@ class UnifiedFGDSTNValidator(BaseValidator):
         LOGGER.info(f"Selected Attacks: {sel_attacks}")
         LOGGER.info(f"Evaluation Seed: {seed}")
 
+        actual_data = (
+            (self.data.get(getattr(self.args, "split", "val")) or self.data.get("path"))
+            if getattr(self, "data", None)
+            else getattr(self.args, "data", "unknown")
+        )
+        conf_val = getattr(self.args, "conf", 0.001)
+        iou_val = getattr(self.args, "iou", 0.60)
+        max_det_val = getattr(self.args, "max_det", 300)
+        imgsz_val = getattr(self.args, "imgsz", 640)
+        classes_val = getattr(self.args, "classes", None)
+        prec_str = f"{self.device.type.upper()} FP32"
+        LOGGER.info(
+            f"[Eval Settings] Data: {actual_data} | Input shape: ({imgsz_val}, {imgsz_val}) | "
+            f"dataset.rect: False | NMS: conf={conf_val}, iou={iou_val}, max_det={max_det_val}, "
+            f"multi_label=True | classes: {classes_val} | Precision: {prec_str}"
+        )
+
         # Ensure guidance model and defenses are in eval mode and frozen
         self.guidance_model.eval().requires_grad_(False)
         if self.pipeline.denoiser is not None:
@@ -567,6 +694,7 @@ class UnifiedFGDSTNValidator(BaseValidator):
             "raw_results": raw_results,
             "mode_table": mode_table,
             "flat_results": flat_results,
+            "attack_diagnostics": getattr(self, "attack_diagnostics", {}),
         }
 
     def print_summary_table(self, summary: Dict[str, Any]) -> None:

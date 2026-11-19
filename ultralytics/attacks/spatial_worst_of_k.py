@@ -397,7 +397,7 @@ class SpatialWorstOfK(Attacker):
         height: int,
         width: int,
     ) -> torch.Tensor:
-        """Transform normalized YOLO xywh targets for all B*k candidates."""
+        """Transform normalized YOLO xywh targets for all B*k candidates using Sutherland-Hodgman clipping."""
         if targets.numel() == 0:
             return targets.new_zeros((0, 6))
 
@@ -428,30 +428,178 @@ class SpatialWorstOfK(Attacker):
         )  # [M,4,3]
 
         k = int(matrices.shape[1])
+        m_boxes = targets.shape[0]
 
         # Pick each object's image-specific k transforms: [M,k,3,3].
         object_matrices = matrices.index_select(0, img_idx)
         transformed = torch.einsum("mkij,mpj->mkpi", object_matrices, corners)
         xy = transformed[..., :2]  # [M,k,4,2]
 
-        new_x1 = xy[..., 0].amin(dim=2).clamp(0.0, float(width))
-        new_y1 = xy[..., 1].amin(dim=2).clamp(0.0, float(height))
-        new_x2 = xy[..., 0].amax(dim=2).clamp(0.0, float(width))
-        new_y2 = xy[..., 1].amax(dim=2).clamp(0.0, float(height))
+        total_candidates = m_boxes * k
+        xy_flat = xy.reshape(total_candidates, 4, 2)
+        device = targets.device
+        dtype_fp = torch.float32
+        xy_fp = xy_flat.to(dtype=dtype_fp)
+
+        # 1. Shoelace area before clipping for the 4 transformed corners
+        x_init = xy_fp[..., 0]
+        y_init = xy_fp[..., 1]
+        area_before = 0.5 * torch.abs(
+            x_init[:, 0] * y_init[:, 1]
+            - y_init[:, 0] * x_init[:, 1]
+            + x_init[:, 1] * y_init[:, 2]
+            - y_init[:, 1] * x_init[:, 2]
+            + x_init[:, 2] * y_init[:, 3]
+            - y_init[:, 2] * x_init[:, 3]
+            + x_init[:, 3] * y_init[:, 0]
+            - y_init[:, 3] * x_init[:, 0]
+        )
+
+        # 2. Sutherland-Hodgman polygon clipping against canvas [0, width] x [0, height]
+        max_v = 12
+        cur_v = torch.zeros((total_candidates, max_v, 2), dtype=dtype_fp, device=device)
+        cur_v[:, :4, :] = xy_fp
+        cur_n = torch.full((total_candidates,), 4, dtype=torch.long, device=device)
+
+        planes = [
+            (1.0, 0.0, 0.0),  # x >= 0
+            (-1.0, 0.0, float(width)),  # x <= width
+            (0.0, 1.0, 0.0),  # y >= 0
+            (0.0, -1.0, float(height)),  # y <= height
+        ]
+
+        for a, b, c in planes:
+            out_v = torch.zeros_like(cur_v)
+            out_n = torch.zeros_like(cur_n)
+            max_k = int(cur_n.max().item())
+            if max_k == 0:
+                cur_v, cur_n = out_v, out_n
+                break
+
+            for i in range(max_k):
+                active = i < cur_n
+                v1 = cur_v[:, i, :]
+                next_i = torch.remainder(torch.full_like(cur_n, i + 1), torch.clamp(cur_n, min=1))
+                v2 = torch.gather(cur_v, 1, next_i.view(total_candidates, 1, 1).expand(-1, 1, 2)).squeeze(1)
+
+                d1 = a * v1[:, 0] + b * v1[:, 1] + c
+                d2 = a * v2[:, 0] + b * v2[:, 1] + c
+
+                in1 = (d1 >= -1e-6) & active
+                in2 = (d2 >= -1e-6) & active
+
+                crossing = (in1 != in2) & active
+                diff = d1 - d2
+                safe_diff = torch.where(diff != 0, diff, torch.ones_like(diff))
+                t = torch.where(crossing, d1 / safe_diff, torch.zeros_like(d1))
+                inter = v1 + t.unsqueeze(-1) * (v2 - v1)
+
+                add_inter = crossing & active
+                if add_inter.any():
+                    idx = torch.clamp(out_n, max=max_v - 1)
+                    mask = add_inter.view(total_candidates, 1, 1)
+                    target_slot = idx.view(total_candidates, 1, 1).expand(-1, 1, 2)
+                    curr_val = torch.gather(out_v, 1, target_slot)
+                    new_val = torch.where(mask, inter.view(total_candidates, 1, 2), curr_val)
+                    out_v.scatter_(1, target_slot, new_val)
+                    out_n = out_n + add_inter.long()
+
+                add_v2 = in2 & active
+                if add_v2.any():
+                    idx = torch.clamp(out_n, max=max_v - 1)
+                    mask = add_v2.view(total_candidates, 1, 1)
+                    target_slot = idx.view(total_candidates, 1, 1).expand(-1, 1, 2)
+                    curr_val = torch.gather(out_v, 1, target_slot)
+                    new_val = torch.where(mask, v2.view(total_candidates, 1, 2), curr_val)
+                    out_v.scatter_(1, target_slot, new_val)
+                    out_n = out_n + add_v2.long()
+
+            cur_v = out_v
+            cur_n = out_n
+
+        # 3. Deduplicate consecutive duplicate vertices (including wrap-around edge)
+        dedup_v = torch.zeros_like(cur_v)
+        dedup_n = torch.zeros_like(cur_n)
+        max_k = int(cur_n.max().item())
+        if max_k > 0:
+            for i in range(max_k):
+                active = i < cur_n
+                v_curr = cur_v[:, i, :]
+                next_i = torch.remainder(torch.full_like(cur_n, i + 1), torch.clamp(cur_n, min=1))
+                v_next = torch.gather(cur_v, 1, next_i.view(total_candidates, 1, 1).expand(-1, 1, 2)).squeeze(1)
+
+                diff = torch.norm(v_curr - v_next, dim=-1)
+                keep = (diff > 1e-5) & active
+
+                if keep.any():
+                    idx = torch.clamp(dedup_n, max=max_v - 1)
+                    mask = keep.view(total_candidates, 1, 1)
+                    target_slot = idx.view(total_candidates, 1, 1).expand(-1, 1, 2)
+                    curr_val = torch.gather(dedup_v, 1, target_slot)
+                    new_val = torch.where(mask, v_curr.view(total_candidates, 1, 2), curr_val)
+                    dedup_v.scatter_(1, target_slot, new_val)
+                    dedup_n = dedup_n + keep.long()
+            cur_v, cur_n = dedup_v, dedup_n
+
+        # 4. Shoelace area after clipping
+        area_after = torch.zeros((total_candidates,), dtype=dtype_fp, device=device)
+        max_k = int(cur_n.max().item())
+        if max_k >= 3:
+            for i in range(max_k):
+                active = (i < cur_n) & (cur_n >= 3)
+                v1 = cur_v[:, i, :]
+                next_i = torch.remainder(torch.full_like(cur_n, i + 1), torch.clamp(cur_n, min=1))
+                v2 = torch.gather(cur_v, 1, next_i.view(total_candidates, 1, 1).expand(-1, 1, 2)).squeeze(1)
+                cross = v1[:, 0] * v2[:, 1] - v2[:, 0] * v1[:, 1]
+                area_after = area_after + torch.where(active, cross, torch.zeros_like(cross))
+            area_after = 0.5 * torch.abs(area_after)
+
+        # 5. Tight bounding box over the clipped polygon
+        mask = (torch.arange(max_v, device=device).unsqueeze(0) < cur_n.unsqueeze(1)) & (cur_n.unsqueeze(1) >= 3)
+        x_pts = cur_v[..., 0]
+        y_pts = cur_v[..., 1]
+        x_for_min = torch.where(mask, x_pts, torch.full_like(x_pts, float("inf")))
+        y_for_min = torch.where(mask, y_pts, torch.full_like(y_pts, float("inf")))
+        x_for_max = torch.where(mask, x_pts, torch.full_like(x_pts, float("-inf")))
+        y_for_max = torch.where(mask, y_pts, torch.full_like(y_pts, float("-inf")))
+
+        min_x = x_for_min.min(dim=-1).values
+        min_y = y_for_min.min(dim=-1).values
+        max_x = x_for_max.max(dim=-1).values
+        max_y = y_for_max.max(dim=-1).values
+
+        new_x1 = min_x.clamp(0.0, float(width))
+        new_y1 = min_y.clamp(0.0, float(height))
+        new_x2 = max_x.clamp(0.0, float(width))
+        new_y2 = max_y.clamp(0.0, float(height))
 
         new_w = (new_x2 - new_x1).clamp(min=0.0)
         new_h = (new_y2 - new_y1).clamp(min=0.0)
-        new_area = new_w * new_h
-        old_area = (bw * bh).clamp(min=1e-6).unsqueeze(1)
 
-        valid = (
-            (new_w >= self.min_box_size) & (new_h >= self.min_box_size) & ((new_area / old_area) >= self.min_area_ratio)
+        safe_ab = torch.where(area_before > 1e-7, area_before, torch.ones_like(area_before))
+        area_ratio = area_after / safe_ab
+
+        valid_flat = (
+            (area_before > 1e-7)
+            & (cur_n >= 3)
+            & (area_after > 1e-7)
+            & (area_ratio >= self.min_area_ratio)
+            & (new_w >= self.min_box_size)
+            & (new_h >= self.min_box_size)
         )
 
-        new_xc = (new_x1 + new_x2) / 2.0 / width
-        new_yc = (new_y1 + new_y2) / 2.0 / height
-        new_wn = new_w / width
-        new_hn = new_h / height
+        valid = valid_flat.view(m_boxes, k)
+        new_x1 = new_x1.view(m_boxes, k)
+        new_y1 = new_y1.view(m_boxes, k)
+        new_x2 = new_x2.view(m_boxes, k)
+        new_y2 = new_y2.view(m_boxes, k)
+        new_w = new_w.view(m_boxes, k)
+        new_h = new_h.view(m_boxes, k)
+
+        new_xc = ((new_x1 + new_x2) / 2.0 / width).to(dtype=targets.dtype)
+        new_yc = ((new_y1 + new_y2) / 2.0 / height).to(dtype=targets.dtype)
+        new_wn = (new_w / width).to(dtype=targets.dtype)
+        new_hn = (new_h / height).to(dtype=targets.dtype)
 
         # Candidate batch index: original image i, candidate j -> i*k + j.
         candidate_j = torch.arange(k, device=targets.device).view(1, k)

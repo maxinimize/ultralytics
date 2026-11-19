@@ -12,7 +12,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_bridge import (
+    build_attacker,
+    run_attack_on_batch,
+    slice_batch_indices,
+    validate_batch_annotations,
+)
 from ultralytics.attacks.attack_utils import extract_detection_model, isolate_rng, setup_attack_model
 from ultralytics.data import build_dataloader, build_yolo_dataset, converter
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
@@ -201,7 +206,15 @@ class DetectionValidator(BaseValidator):
         self.is_coco = False
         self.is_lvis = False
         self.class_map = None
+        self.end2end = False
         self.args.task = "detect"
+        self.args.rect = False
+        if not hasattr(self.args, "conf") or self.args.conf is None or self.args.conf == 0.25:
+            self.args.conf = 0.001
+        if not hasattr(self.args, "iou") or self.args.iou is None or self.args.iou == 0.7:
+            self.args.iou = 0.60
+        if not hasattr(self.args, "max_det") or self.args.max_det is None:
+            self.args.max_det = 300
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = AdversarialDetMetrics()
@@ -959,10 +972,9 @@ class DetectionValidator(BaseValidator):
                     raise RuntimeError(msg)
                 return batch
 
-            has_targets = "bboxes" in batch and batch["bboxes"] is not None and batch["bboxes"].numel() > 0
-            if not has_targets and attack_name != "worstk":
-                # Legitimate skip due to no targets
-                return batch
+            b_size = batch["img"].shape[0]
+            eval_classes = getattr(self.args, "classes", None)
+            has_targets = validate_batch_annotations(batch, b_size, classes=eval_classes)
 
             try:
                 im_files = batch.get("im_file", [])
@@ -986,28 +998,32 @@ class DetectionValidator(BaseValidator):
                 with amp_ctx:
                     if attack_name == "worstk" and callable(getattr(attacker, "forward_batch", None)):
                         attacker.forward_batch(batch)
-                        imgs_adv = batch["img"]
+                        if self.strict_attacks:
+                            out_img = batch.get("img")
+                            if out_img is None or not torch.is_tensor(out_img) or not torch.isfinite(out_img).all():
+                                raise RuntimeError(f"Worst-of-K produced invalid image tensor at batch {batch_i}")
+                            min_v, max_v = out_img.amin().item(), out_img.amax().item()
+                            if min_v < -1e-6 or max_v > 1.0 + 1e-6:
+                                raise RuntimeError(
+                                    f"Worst-of-K pixels out of [0, 1] range: [{min_v}, {max_v}] at batch {batch_i}"
+                                )
+                            validate_batch_annotations(batch, b_size, classes=eval_classes)
                     else:
-                        imgs_adv = run_attack_on_batch(
-                            attacker, batch, label_policy="largest_box", max_batch_size=adv_batch_size
-                        )
+                        target_indices = [j for j in range(b_size) if has_targets[j].item()]
+                        if len(target_indices) > 0:
+                            sub_batch = slice_batch_indices(batch, target_indices)
+                            imgs_adv = run_attack_on_batch(
+                                attacker,
+                                sub_batch,
+                                label_policy="largest_box",
+                                max_batch_size=adv_batch_size,
+                                strict=self.strict_attacks,
+                                attack_name=attack_name,
+                                batch_i=batch_i,
+                            )
+                            for local_k, orig_k in enumerate(target_indices):
+                                batch["img"][orig_k] = imgs_adv[local_k].to(batch["img"].dtype).to(self.device)
 
-                if imgs_adv is None:
-                    raise RuntimeError(
-                        f"Adversarial generation returned None for attack '{attack_name}' at batch {batch_i} on batch with targets."
-                    )
-                if not torch.isfinite(imgs_adv).all():
-                    raise RuntimeError(
-                        f"Adversarial generation produced NaN or Inf for attack '{attack_name}' at batch {batch_i}."
-                    )
-                if imgs_adv.shape != batch["img"].shape:
-                    raise RuntimeError(
-                        f"Adversarial generation output shape {imgs_adv.shape} mismatch with input {batch['img'].shape} for attack '{attack_name}' at batch {batch_i}."
-                    )
-
-                imgs_adv_cast = imgs_adv.to(batch["img"].dtype).to(self.device)
-                batch["img"] = imgs_adv_cast
-                del imgs_adv, imgs_adv_cast
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception as e:
@@ -1052,6 +1068,20 @@ class DetectionValidator(BaseValidator):
         self.metrics.clear_stats()
         self.confusion_matrix = ConfusionMatrix(names=model.names, save_matches=self.args.plots and self.args.visualize)
 
+        actual_data = getattr(self.args, "data", self.data.get("yaml_file", "unknown"))
+        conf_val = getattr(self.args, "conf", 0.001)
+        iou_val = getattr(self.args, "iou", 0.60)
+        max_det_val = getattr(self.args, "max_det", 300)
+        imgsz_val = getattr(self.args, "imgsz", 640)
+        classes_val = getattr(self.args, "classes", None)
+        dev = getattr(self, "device", torch.device("cpu"))
+        prec_str = f"{dev.type.upper()} FP32"
+        LOGGER.info(
+            f"[Eval Settings] Data: {actual_data} | Input shape: ({imgsz_val}, {imgsz_val}) | "
+            f"dataset.rect: False | NMS: conf={conf_val}, iou={iou_val}, max_det={max_det_val}, "
+            f"multi_label=True | classes: {classes_val} | Precision: {prec_str}"
+        )
+
     def get_desc(self) -> str:
         """Return a formatted string summarizing class metrics of YOLO model."""
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
@@ -1070,6 +1100,7 @@ class DetectionValidator(BaseValidator):
             preds,
             self.args.conf,
             self.args.iou,
+            classes=self.args.classes,
             nc=0 if self.args.task == "detect" else self.nc,
             multi_label=True,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
@@ -1253,7 +1284,9 @@ class DetectionValidator(BaseValidator):
         Returns:
             (Dataset): YOLO dataset.
         """
-        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, stride=self.stride)
+        val_cfg = copy(self.args)
+        val_cfg.rect = False
+        return build_yolo_dataset(val_cfg, img_path, batch, self.data, mode=mode, rect=False, stride=self.stride)
 
     def get_dataloader(self, dataset_path: str, batch_size: int) -> torch.utils.data.DataLoader:
         """Construct and return dataloader.

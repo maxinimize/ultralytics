@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import torch
 
@@ -193,6 +193,7 @@ def parse_args(args=None):
     parser.add_argument("--workers", type=int, default=4, help="DataLoader workers (default: 4).")
     parser.add_argument("--conf", type=float, default=0.001, help="Confidence threshold (default: 0.001).")
     parser.add_argument("--iou", type=float, default=0.6, help="NMS IoU threshold (default: 0.6).")
+    parser.add_argument("--max_det", type=int, default=300, help="Maximum detections per image (default: 300).")
     parser.add_argument(
         "--seed",
         type=int,
@@ -351,6 +352,7 @@ def main():
     dataset_cfg.task = "detect"
     dataset_cfg.imgsz = imgsz
     dataset_cfg.classes = args.classes
+    dataset_cfg.rect = False
 
     img_path = data_dict.get(args.split)
     if not img_path:
@@ -380,7 +382,10 @@ def main():
         task="detect",
         conf=args.conf,
         iou=args.iou,
+        max_det=args.max_det,
         classes=args.classes,
+        imgsz=imgsz,
+        split=args.split,
         data=args.data,
         save_json=args.save_json,
     )

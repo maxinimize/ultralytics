@@ -33,6 +33,9 @@ if [[ -n "$RESUME" ]]; then
   if [[ -v PROJECT && -n "$PROJECT" ]]; then ARGS+=(--project "$PROJECT"); fi
   if [[ -v NAME && -n "$NAME" ]]; then ARGS+=(--name "$NAME"); fi
   if [[ -v SEED && -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
+  if [[ -v CONF && -n "$CONF" ]]; then ARGS+=(--conf "$CONF"); fi
+  if [[ -v NMS_IOU && -n "$NMS_IOU" ]]; then ARGS+=(--iou "$NMS_IOU"); fi
+  if [[ -v MAX_DET && -n "$MAX_DET" ]]; then ARGS+=(--max_det "$MAX_DET"); fi
   if [[ -v CLASSES && -n "$CLASSES" ]]; then
     read -r -a CLASS_IDS <<< "$CLASSES"
     if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
@@ -148,6 +151,9 @@ ARGS=(
 )
 if (( ${#CLASS_IDS[@]} > 0 )); then ARGS+=(--classes "${CLASS_IDS[@]}"); fi
 if (( ${#EVAL_WEIGHTS_ARR[@]} > 0 )); then ARGS+=(--eval_weights "${EVAL_WEIGHTS_ARR[@]}"); fi
+if [[ -v CONF && -n "$CONF" ]]; then ARGS+=(--conf "$CONF"); fi
+if [[ -v NMS_IOU && -n "$NMS_IOU" ]]; then ARGS+=(--iou "$NMS_IOU"); fi
+if [[ -v MAX_DET && -n "$MAX_DET" ]]; then ARGS+=(--max_det "$MAX_DET"); fi
 
 printf 'Command: python -u train_adv_adaptive_run.py'; printf ' %q' "${ARGS[@]}"; echo
 python -u train_adv_adaptive_run.py "${ARGS[@]}"

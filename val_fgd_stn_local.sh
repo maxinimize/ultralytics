@@ -14,7 +14,8 @@ STN_WEIGHTS="${2:-"${STN_WEIGHTS:-runs/detect/runs/train_stn/stn_train_yolo12l_c
 # MODEL="${3:-"${MODEL:-runs/local_adv_adaptive_current_coco_train_traffic5k_ep100_pgd_bim_mim_worstk_0.10_0.10_0.40_0.15/weights/best.pt}"}"
 MODEL="${3:-"${MODEL:-yolo12l.pt}"}"
 # MODEL="${3:-"${MODEL:-runs/train_adv_fgd_stn_adaptive/local_adv_fgd_stn_adaptive_stn_fgd_adapttrue_current_coco_train_traffic5k_ep100-2/weights/best.pt}"}"
-DATA="${4:-"${DATA:-coco.yaml}"}"
+# MODEL="${3:-"${MODEL:-runs/local_adv_adaptive_current_coco_train_traffic5k_ep100_pgd_bim_mim_worstk_0.10_0.10_0.40_0.15-2/weights/best.pt}"}"
+DATA="${4:-"${DATA:-coco_train_traffic5k_test.yaml}"}"
 ATTACK_WEIGHTS="${ATTACK_WEIGHTS:-"current"}"
 MODES="${MODES:-all}"
 ATTACKS="${ATTACKS:-all}"
@@ -73,6 +74,18 @@ VAL_ARGS=(
 
 if [[ -n "${SEED:-}" ]]; then
   VAL_ARGS+=(--seed "$SEED")
+fi
+
+if [[ -n "${CONF:-}" ]]; then
+  VAL_ARGS+=(--conf "$CONF")
+fi
+
+if [[ -n "${NMS_IOU:-}" ]]; then
+  VAL_ARGS+=(--iou "$NMS_IOU")
+fi
+
+if [[ -n "${MAX_DET:-}" ]]; then
+  VAL_ARGS+=(--max_det "$MAX_DET")
 fi
 
 if [[ -n "$ATTACK_WEIGHTS" ]]; then
