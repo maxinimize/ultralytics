@@ -53,6 +53,7 @@ from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
     ModelEMA,
+    autocast,
     unwrap_model,
 )
 
@@ -248,8 +249,8 @@ class JointFGDSTNModel(nn.Module):
         if self.lambda_det > 0.0:
             batch_det = {k: v.clone() if torch.is_tensor(v) else copy.copy(v) for k, v in batch.items()}
             batch_det["img"] = processed_images
-            with torch.no_grad():
-                batch_det = transform_batch_bboxes_for_stn(batch_det, pred_matrices.detach(), height=h, width=w)
+            with torch.no_grad(), autocast(False, device=processed_images.device.type):
+                batch_det = transform_batch_bboxes_for_stn(batch_det, pred_matrices.detach().float(), height=h, width=w)
             det_preds = self.guidance_model(processed_images, augment=False)
             det_loss_items, _ = unwrap_model(self.guidance_model).loss(batch_det, det_preds)
             loss_det = det_loss_items.sum() / processed_images.shape[0]
@@ -334,51 +335,113 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         # Parse and normalize configuration
         if not self.resume:
-            self.preprocess_mode = canonicalize_mode(self.joint_cfg["preprocess_mode"])
-            self.init_mode = str(self.joint_cfg["init"]).strip().lower()
-            self.fgd_weights = self.joint_cfg["fgd_weights"]
-            self.stn_weights = self.joint_cfg["stn_weights"]
-            self.attack_through_preprocess = bool(self.joint_cfg["attack_through_preprocess"])
-            self.attack_weights = self.joint_cfg["attack_weights"]
-            self.attack_names = parse_list_arg(self.joint_cfg["attack_name"])
-            ratios = self.joint_cfg["attack_ratio"]
-            self.attack_ratios = [float(x) for x in parse_list_arg(ratios, float)] if ratios is not None else []
-            self.p_clean = float(self.joint_cfg["p_clean"])
-            self.worstk_k = int(self.joint_cfg["worstk_k"])
-            self.degrees = float(self.joint_cfg["degrees"])
-            self.translate = float(self.joint_cfg["translate"])
-            self.lambda_fgd = float(self.joint_cfg["lambda_fgd"])
-            self.lambda_geom = float(self.joint_cfg["lambda_geom"])
-            self.lambda_recon = float(self.joint_cfg["lambda_recon"])
-            self.lambda_det = float(self.joint_cfg["lambda_det"])
-            self.lambda_identity = float(self.joint_cfg["lambda_identity"])
-            self.lr_fgd = float(self.joint_cfg["lr_fgd"])
-            self.lr_stn = float(self.joint_cfg["lr_stn"])
-            self.val_interval = int(self.joint_cfg["val_interval"])
+            default_eval = [0.20, 0.20, 0.20, 0.20, 0.20]
+            raw_ew = self.joint_cfg.get("eval_weights")
+            self.eval_weights = (
+                [float(x) for x in parse_list_arg(raw_ew, float)] if raw_ew is not None else default_eval
+            )
+            self.joint_cfg["eval_weights"] = self.eval_weights
+            self.joint_cfg["stn_architecture"] = {
+                "max_degrees": float(self.joint_cfg["degrees"]) * 1.5,
+                "max_translate": float(self.joint_cfg["translate"]) * 1.5,
+                "fill": 114.0 / 255.0,
+            }
         else:
             j_cfg = self.joint_checkpoint.get("joint_training_config", {})
-            self.preprocess_mode = canonicalize_mode(j_cfg.get("preprocess_mode", "stn_fgd"))
-            self.init_mode = str(j_cfg.get("init", "pretrained")).strip().lower()
-            self.fgd_weights = j_cfg.get("fgd_weights")
-            self.stn_weights = j_cfg.get("stn_weights")
             atk_cfg = self.joint_checkpoint.get("attack_configuration", {})
-            self.attack_through_preprocess = bool(atk_cfg.get("attack_through_preprocess", True))
-            self.attack_weights = atk_cfg.get("attack_weights")
-            self.attack_names = atk_cfg.get("attack_name", ["pgd", "bim", "mim", "worstk"])
-            self.attack_ratios = [float(x) for x in atk_cfg.get("attack_ratio", [0.10, 0.10, 0.40, 0.15])]
-            self.p_clean = float(atk_cfg.get("p_clean", 0.25))
-            stn_c = j_cfg.get("stn", {})
-            self.worstk_k = int(stn_c.get("worstk_k", 10))
-            self.degrees = float(stn_c.get("degrees", 30.0))
-            self.translate = float(stn_c.get("translate", 0.10))
-            self.lambda_fgd = float(j_cfg.get("lambda_fgd", 1.0))
-            self.lambda_geom = float(j_cfg.get("lambda_geom", 1.0))
-            self.lambda_recon = float(j_cfg.get("lambda_recon", 1.0))
-            self.lambda_det = float(j_cfg.get("lambda_det", 0.0))
-            self.lambda_identity = float(j_cfg.get("lambda_identity", 0.1))
-            self.lr_fgd = float(j_cfg.get("lr_fgd", 1e-5))
-            self.lr_stn = float(j_cfg.get("lr_stn", 1e-4))
-            self.val_interval = int(j_cfg.get("val_interval", 5))
+            stn_cfg = j_cfg.get("stn", {})
+
+            self.joint_cfg["preprocess_mode"] = j_cfg.get("preprocess_mode", "stn_fgd")
+            self.joint_cfg["init"] = j_cfg.get("init", "pretrained")
+            self.joint_cfg["fgd_weights"] = j_cfg.get("fgd_weights", None)
+            self.joint_cfg["stn_weights"] = j_cfg.get("stn_weights", None)
+            self.joint_cfg["attack_through_preprocess"] = bool(atk_cfg.get("attack_through_preprocess", True))
+            self.joint_cfg["attack_weights"] = atk_cfg.get("attack_weights", None)
+            self.joint_cfg["attack_name"] = atk_cfg.get("attack_name", ["pgd", "bim", "mim", "worstk"])
+            self.joint_cfg["attack_ratio"] = [float(x) for x in atk_cfg.get("attack_ratio", [0.10, 0.10, 0.40, 0.15])]
+            self.joint_cfg["p_clean"] = float(atk_cfg.get("p_clean", 0.25))
+
+            self.joint_cfg["worstk_k"] = int(j_cfg.get("worstk_k", stn_cfg.get("worstk_k", 10)))
+            self.joint_cfg["degrees"] = float(j_cfg.get("degrees", stn_cfg.get("degrees", 30.0)))
+            self.joint_cfg["translate"] = float(j_cfg.get("translate", stn_cfg.get("translate", 0.10)))
+
+            self.joint_cfg["lambda_fgd"] = float(j_cfg.get("lambda_fgd", 1.0))
+            self.joint_cfg["lambda_geom"] = float(j_cfg.get("lambda_geom", 1.0))
+            self.joint_cfg["lambda_recon"] = float(j_cfg.get("lambda_recon", 1.0))
+            self.joint_cfg["lambda_det"] = float(j_cfg.get("lambda_det", 0.0))
+            self.joint_cfg["lambda_identity"] = float(j_cfg.get("lambda_identity", 0.1))
+
+            self.joint_cfg["lr_fgd"] = float(j_cfg.get("lr_fgd", j_cfg.get("fgd", {}).get("lr", 1e-5)))
+            self.joint_cfg["lr_stn"] = float(j_cfg.get("lr_stn", stn_cfg.get("lr", 1e-4)))
+            self.joint_cfg["val_interval"] = int(j_cfg.get("val_interval", 5))
+
+            # Restore eval_weights
+            raw_ew = j_cfg.get("eval_weights")
+            self._reset_best_fitness_on_resume = False
+            if raw_ew is not None:
+                self.joint_cfg["eval_weights"] = [float(x) for x in parse_list_arg(raw_ew, float)]
+            else:
+                resume_path = Path(self.args.resume)
+                yaml_candidates = [
+                    resume_path.parent / "joint_config.yaml",
+                    resume_path.parent.parent / "joint_config.yaml",
+                ]
+                loaded_ew = None
+                for y_path in yaml_candidates:
+                    if y_path.is_file():
+                        try:
+                            y_data = YAML.load(y_path)
+                            if isinstance(y_data, dict) and y_data.get("eval_weights") is not None:
+                                loaded_ew = y_data["eval_weights"]
+                                break
+                        except (OSError, KeyError, ValueError, TypeError) as e:
+                            LOGGER.warning(f"Failed to read eval_weights from {y_path}: {e}")
+                if loaded_ew is not None:
+                    self.joint_cfg["eval_weights"] = [float(x) for x in parse_list_arg(loaded_ew, float)]
+                    LOGGER.info(f"Restored eval_weights from {y_path}: {self.joint_cfg['eval_weights']}")
+                else:
+                    self.joint_cfg["eval_weights"] = [0.20, 0.20, 0.20, 0.20, 0.20]
+                    self._reset_best_fitness_on_resume = True
+                    LOGGER.warning(
+                        "No eval_weights found in checkpoint or joint_config.yaml; using default equal weights "
+                        "[0.20, 0.20, 0.20, 0.20, 0.20] and resetting best_fitness to None to re-evaluate under unified criteria."
+                    )
+
+            # Restore STN architecture
+            stn_arch = self.joint_checkpoint.get("stn_architecture", {})
+            compat_max_deg = self.joint_cfg["degrees"] * 1.5
+            compat_max_trans = self.joint_cfg["translate"] * 1.5
+            compat_fill = 114.0 / 255.0
+            self.joint_cfg["stn_architecture"] = {
+                "max_degrees": float(stn_arch.get("max_degrees", compat_max_deg)),
+                "max_translate": float(stn_arch.get("max_translate", compat_max_trans)),
+                "fill": float(stn_arch.get("fill", compat_fill)),
+            }
+
+        # Initialize trainer attributes directly from active joint_cfg
+        self.preprocess_mode = canonicalize_mode(self.joint_cfg["preprocess_mode"])
+        self.init_mode = str(self.joint_cfg["init"]).strip().lower()
+        self.fgd_weights = self.joint_cfg["fgd_weights"]
+        self.stn_weights = self.joint_cfg["stn_weights"]
+        self.attack_through_preprocess = bool(self.joint_cfg["attack_through_preprocess"])
+        self.attack_weights = self.joint_cfg["attack_weights"]
+        self.attack_names = parse_list_arg(self.joint_cfg["attack_name"])
+        ratios = self.joint_cfg["attack_ratio"]
+        self.attack_ratios = [float(x) for x in parse_list_arg(ratios, float)] if ratios is not None else []
+        self.p_clean = float(self.joint_cfg["p_clean"])
+        self.worstk_k = int(self.joint_cfg["worstk_k"])
+        self.degrees = float(self.joint_cfg["degrees"])
+        self.translate = float(self.joint_cfg["translate"])
+        self.lambda_fgd = float(self.joint_cfg["lambda_fgd"])
+        self.lambda_geom = float(self.joint_cfg["lambda_geom"])
+        self.lambda_recon = float(self.joint_cfg["lambda_recon"])
+        self.lambda_det = float(self.joint_cfg["lambda_det"])
+        self.lambda_identity = float(self.joint_cfg["lambda_identity"])
+        self.lr_fgd = float(self.joint_cfg["lr_fgd"])
+        self.lr_stn = float(self.joint_cfg["lr_stn"])
+        self.val_interval = int(self.joint_cfg["val_interval"])
+        self.eval_weights = self.joint_cfg["eval_weights"]
+        self.stn_architecture = self.joint_cfg["stn_architecture"]
 
         if self.preprocess_mode not in {"stn_fgd", "fgd_stn"}:
             raise ValueError(f"Joint training only supports 'stn_fgd' or 'fgd_stn', got: {self.preprocess_mode}")
@@ -402,28 +465,6 @@ class JointFGDSTNTrainer(DetectionTrainer):
                 f"Sum of attack ratios plus clean ratio p_clean must equal 1.0, got: sum(ratios)={sum(self.attack_ratios):.4f}, "
                 f"p_clean={self.p_clean:.4f}, total={total_ratio:.4f}"
             )
-
-        self.worstk_k = int(self.joint_cfg["worstk_k"])
-        self.degrees = float(self.joint_cfg["degrees"])
-        self.translate = float(self.joint_cfg["translate"])
-
-        self.lambda_fgd = float(self.joint_cfg["lambda_fgd"])
-        self.lambda_geom = float(self.joint_cfg["lambda_geom"])
-        self.lambda_recon = float(self.joint_cfg["lambda_recon"])
-        self.lambda_det = float(self.joint_cfg["lambda_det"])
-        self.lambda_identity = float(self.joint_cfg["lambda_identity"])
-
-        self.lr_fgd = float(self.joint_cfg["lr_fgd"])
-        self.lr_stn = float(self.joint_cfg["lr_stn"])
-        self.val_interval = int(self.joint_cfg["val_interval"])
-
-        # Validation evaluation weights (default: equal weights across 5 scenarios, or custom weights)
-        default_eval = [0.20, 0.20, 0.20, 0.20, 0.20]
-        raw_ew = self.joint_cfg.get("eval_weights")
-        if raw_ew is not None:
-            self.eval_weights = [float(x) for x in parse_list_arg(raw_ew, float)]
-        else:
-            self.eval_weights = default_eval
 
         self.save_dir = Path(self.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -450,6 +491,8 @@ class JointFGDSTNTrainer(DetectionTrainer):
                         "Start a new run to change seed."
                     )
             saved.update({k: overrides[k] for k in ("device", "workers", "epochs", "batch") if k in overrides})
+            if "seed" in overrides and overrides["seed"] is not None:
+                saved["seed"] = int(overrides["seed"])
             saved.update(resume=str(resume_path), exist_ok=True)
             self.args = get_cfg(DEFAULT_CFG, saved)
 
@@ -475,13 +518,19 @@ class JointFGDSTNTrainer(DetectionTrainer):
             LOGGER.info(f"Loading FGD ({self.fgd_weights}) and STN ({self.stn_weights}) in pretrained mode...")
             self.denoiser, _fgd_meta = load_fgd_denoiser(self.fgd_weights, device=self.device)
             self.stn, _stn_meta = load_stn_checkpoint(self.stn_weights, device=self.device)
+            self.stn_architecture = {
+                "max_degrees": getattr(self.stn, "max_degrees", self.degrees * 1.5),
+                "max_translate": getattr(self.stn, "max_translate", self.translate * 1.5),
+                "fill": getattr(self.stn, "fill", 114.0 / 255.0),
+            }
+            self.joint_cfg["stn_architecture"] = self.stn_architecture
         else:
-            LOGGER.info("Initializing FGD and STN from scratch...")
+            LOGGER.info("Initializing FGD and STN...")
             self.denoiser = ResidualDenoiser().to(self.device)
             self.stn = SpatialTransformer(
-                max_degrees=self.degrees * 1.5,
-                max_translate=self.translate * 1.5,
-                fill=114.0 / 255.0,
+                max_degrees=self.stn_architecture["max_degrees"],
+                max_translate=self.stn_architecture["max_translate"],
+                fill=self.stn_architecture["fill"],
             ).to(self.device)
 
         # Activate training state and gradient computation for defense modules
@@ -587,85 +636,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         # 8. Load checkpoint state if resuming
         if self.joint_checkpoint is not None:
-            ckpt = self.joint_checkpoint
-            fgd_st = ckpt.get("fgd_state_dict", ckpt.get("denoiser"))
-            if fgd_st:
-                self.denoiser.load_state_dict(fgd_st)
-            stn_st = ckpt.get("stn_state_dict", ckpt.get("stn"))
-            if stn_st:
-                self.stn.load_state_dict(stn_st)
-
-            if "optimizer_state_dict" in ckpt:
-                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            elif "optimizer" in ckpt:
-                self.optimizer.load_state_dict(ckpt["optimizer"])
-
-            scheduler_restored = False
-            sched_st = ckpt.get("scheduler_state_dict", ckpt.get("scheduler"))
-            if sched_st and hasattr(self, "scheduler") and self.scheduler:
-                self.scheduler.load_state_dict(sched_st)
-                scheduler_restored = True
-
-            scaler_st = ckpt.get("scaler_state_dict", ckpt.get("scaler"))
-            if scaler_st and hasattr(self, "scaler") and self.scaler:
-                self.scaler.load_state_dict(scaler_st)
-            elif getattr(self, "amp", False):
-                LOGGER.warning(
-                    "Checkpoint does not contain 'scaler_state_dict'; amp scaler cannot be exactly restored."
-                )
-
-            if "attacker_state" in ckpt or "attackers_state" in ckpt:
-                atk_st = ckpt.get("attacker_state", ckpt.get("attackers_state", {}))
-                for att_name, st in atk_st.items():
-                    if (
-                        att_name in self.attackers
-                        and hasattr(self.attackers[att_name], "load_state_dict")
-                        and st is not None
-                    ):
-                        self.attackers[att_name].load_state_dict(st)
-            else:
-                LOGGER.warning("Checkpoint does not contain 'attacker_state'; attackers cannot be restored.")
-
-            self.start_epoch = ckpt["epoch"] + 1
-            bf = ckpt.get("best_fitness")
-            self.best_fitness = float(bf) if bf is not None else None
-            if self.start_epoch >= self.epochs:
-                raise ValueError(
-                    f"--epochs ({self.epochs}) must be greater than completed checkpoint epochs ({self.start_epoch})."
-                )
-
-            if not scheduler_restored and hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
-                LOGGER.warning(
-                    "Checkpoint does not contain scheduler state; setting last_epoch from start_epoch. "
-                    "Step-by-step equivalence cannot be guaranteed."
-                )
-                self.scheduler.last_epoch = self.start_epoch - 1
-
-            # Restore RNG states as the final step before training begins
-            if ckpt.get("random_state"):
-                rnd = ckpt["random_state"]
-                if "torch" in rnd and rnd["torch"] is not None:
-                    torch.set_rng_state(rnd["torch"])
-                if torch.cuda.is_available() and rnd.get("cuda") is not None:
-                    with contextlib.suppress(RuntimeError, TypeError, ValueError):
-                        torch.cuda.set_rng_state_all(rnd["cuda"])
-                if "numpy" in rnd and rnd["numpy"] is not None:
-                    np.random.set_state(rnd["numpy"])
-                if "python" in rnd and rnd["python"] is not None:
-                    random.setstate(rnd["python"])
-                if (
-                    "dataloader" in rnd
-                    and rnd["dataloader"] is not None
-                    and hasattr(self, "train_loader")
-                    and getattr(self.train_loader, "generator", None) is not None
-                ):
-                    self.train_loader.generator.set_state(rnd["dataloader"])
-            else:
-                LOGGER.warning(
-                    "Checkpoint does not contain 'random_state'; random number generators cannot be restored "
-                    "for step-by-step equivalence."
-                )
-
+            self._restore_joint_checkpoint_state(self.joint_checkpoint, is_recovery=False)
             self.joint_checkpoint = None
         else:
             if hasattr(self, "scheduler") and (
@@ -693,6 +664,94 @@ class JointFGDSTNTrainer(DetectionTrainer):
             f"LR_FGD: {self.lr_fgd}, LR_STN: {self.lr_stn})"
         )
         self.run_callbacks("on_pretrain_routine_end")
+
+    def _restore_joint_checkpoint_state(self, ckpt: dict, is_recovery: bool = False) -> None:
+        """Restore defense modules, optimizer, scheduler, scaler, best_fitness, attackers, and RNG from joint checkpoint."""
+        fgd_st = ckpt.get("fgd_state_dict", ckpt.get("denoiser"))
+        if fgd_st:
+            self.denoiser.load_state_dict(fgd_st)
+        stn_st = ckpt.get("stn_state_dict", ckpt.get("stn"))
+        if stn_st:
+            self.stn.load_state_dict(stn_st)
+
+        if "optimizer_state_dict" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        elif "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+
+        scheduler_restored = False
+        sched_st = ckpt.get("scheduler_state_dict", ckpt.get("scheduler"))
+        if sched_st and hasattr(self, "scheduler") and self.scheduler:
+            self.scheduler.load_state_dict(sched_st)
+            scheduler_restored = True
+
+        scaler_st = ckpt.get("scaler_state_dict", ckpt.get("scaler"))
+        if scaler_st and hasattr(self, "scaler") and self.scaler:
+            self.scaler.load_state_dict(scaler_st)
+        elif getattr(self, "amp", False):
+            LOGGER.warning("Checkpoint does not contain 'scaler_state_dict'; amp scaler cannot be exactly restored.")
+
+        if "attacker_state" in ckpt or "attackers_state" in ckpt:
+            atk_st = ckpt.get("attacker_state", ckpt.get("attackers_state", {}))
+            for att_name, st in atk_st.items():
+                if (
+                    att_name in self.attackers
+                    and hasattr(self.attackers[att_name], "load_state_dict")
+                    and st is not None
+                ):
+                    self.attackers[att_name].load_state_dict(st)
+        else:
+            LOGGER.warning("Checkpoint does not contain 'attacker_state'; attackers cannot be restored.")
+
+        if not getattr(self, "_reset_best_fitness_on_resume", False):
+            bf = ckpt.get("best_fitness")
+            self.best_fitness = float(bf) if bf is not None else None
+        else:
+            self.best_fitness = None
+
+        if not is_recovery:
+            self.start_epoch = ckpt["epoch"] + 1
+            if self.start_epoch >= self.epochs:
+                raise ValueError(
+                    f"--epochs ({self.epochs}) must be greater than completed checkpoint epochs ({self.start_epoch})."
+                )
+
+            if not scheduler_restored and hasattr(self, "scheduler") and hasattr(self.scheduler, "last_epoch"):
+                LOGGER.warning(
+                    "Checkpoint does not contain scheduler state; setting last_epoch from start_epoch. "
+                    "Step-by-step equivalence cannot be guaranteed."
+                )
+                self.scheduler.last_epoch = self.start_epoch - 1
+
+        # Restore RNG states
+        if ckpt.get("random_state"):
+            rnd = ckpt["random_state"]
+            if "torch" in rnd and rnd["torch"] is not None:
+                torch.set_rng_state(rnd["torch"])
+            if torch.cuda.is_available() and rnd.get("cuda") is not None:
+                with contextlib.suppress(RuntimeError, TypeError, ValueError):
+                    torch.cuda.set_rng_state_all(rnd["cuda"])
+            if "numpy" in rnd and rnd["numpy"] is not None:
+                np.random.set_state(rnd["numpy"])
+            if "python" in rnd and rnd["python"] is not None:
+                random.setstate(rnd["python"])
+            if (
+                "dataloader" in rnd
+                and rnd["dataloader"] is not None
+                and hasattr(self, "train_loader")
+                and getattr(self.train_loader, "generator", None) is not None
+            ):
+                self.train_loader.generator.set_state(rnd["dataloader"])
+        else:
+            LOGGER.warning(
+                "Checkpoint does not contain 'random_state'; random number generators cannot be restored "
+                "for step-by-step equivalence."
+            )
+
+        # Ensure defense modules remain trainable and guidance model strictly frozen
+        self.guidance_model.eval().requires_grad_(False)
+        self.denoiser.train().requires_grad_(True)
+        self.stn.train().requires_grad_(True)
 
     def _build_train_pipeline(self) -> None:
         """Build data loader pipeline and configure guidance model detector attributes."""
@@ -765,7 +824,9 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         # Preserve original clean images and clean bounding boxes
         batch["clean_img"] = batch["img"].clone()
-        batch["clean_batch_idx"] = batch["batch_idx"].clone() if "batch_idx" in batch and batch["batch_idx"] is not None else None
+        batch["clean_batch_idx"] = (
+            batch["batch_idx"].clone() if "batch_idx" in batch and batch["batch_idx"] is not None else None
+        )
         batch["clean_cls"] = batch["cls"].clone() if "cls" in batch and batch["cls"] is not None else None
         batch["clean_bboxes"] = batch["bboxes"].clone() if "bboxes" in batch and batch["bboxes"] is not None else None
 
@@ -796,76 +857,76 @@ class JointFGDSTNTrainer(DetectionTrainer):
         batch_i = getattr(self, "epoch", -1)
 
         try:
-            # 1. Process Worst-of-K spatial attack (batch-aware bridge strict path)
-            if "worstk" in sub_batches and "worstk" in self.attackers:
-                indices = [i for i, st in enumerate(orig_sample_types) if st == "worstk"]
-                if indices:
-                    attacker = self.attackers["worstk"]
-                    sub_b = sub_batches["worstk"]
-                    adv_imgs = run_attack_on_batch(
-                        attacker,
-                        sub_b,
-                        strict=True,
-                        attack_name="worstk",
-                        batch_i=batch_i,
-                    )
-                    if adv_imgs is None or not torch.is_tensor(adv_imgs):
-                        raise RuntimeError(f"Worst-of-K failed to produce image tensor at batch {batch_i}")
-                    if not torch.isfinite(adv_imgs).all():
-                        raise RuntimeError(f"Worst-of-K produced non-finite image values at batch {batch_i}")
-
-                    gt_m = sub_b.get("gt_matrix")
-                    if gt_m is None and hasattr(attacker, "last_selected_matrices"):
-                        gt_m = attacker.last_selected_matrices
-                    if gt_m is None or not torch.is_tensor(gt_m):
-                        raise RuntimeError(f"Worst-of-K missing gt_matrix in attacked batch at batch {batch_i}")
-                    if gt_m.shape != (len(indices), 3, 3):
-                        raise RuntimeError(
-                            f"Worst-of-K gt_matrix shape {gt_m.shape} != expected ({len(indices)}, 3, 3) at batch {batch_i}"
+            with autocast(False, device=self.device.type):
+                # 1. Process Worst-of-K spatial attack (batch-aware bridge strict path)
+                if "worstk" in sub_batches and "worstk" in self.attackers:
+                    indices = [i for i, st in enumerate(orig_sample_types) if st == "worstk"]
+                    if indices:
+                        attacker = self.attackers["worstk"]
+                        sub_b = sub_batches["worstk"]
+                        adv_imgs = run_attack_on_batch(
+                            attacker,
+                            sub_b,
+                            strict=True,
+                            attack_name="worstk",
+                            batch_i=batch_i,
                         )
-                    if not torch.isfinite(gt_m).all():
-                        raise RuntimeError(f"Worst-of-K gt_matrix contains non-finite values at batch {batch_i}")
+                        if adv_imgs is None or not torch.is_tensor(adv_imgs):
+                            raise RuntimeError(f"Worst-of-K failed to produce image tensor at batch {batch_i}")
+                        if not torch.isfinite(adv_imgs).all():
+                            raise RuntimeError(f"Worst-of-K produced non-finite image values at batch {batch_i}")
 
-                    validate_batch_annotations(sub_b, len(indices), classes=eval_classes)
+                        gt_m = sub_b.get("gt_matrix")
+                        if gt_m is None and hasattr(attacker, "last_selected_matrices"):
+                            gt_m = attacker.last_selected_matrices
+                        if gt_m is None or not torch.is_tensor(gt_m):
+                            raise RuntimeError(f"Worst-of-K missing gt_matrix in attacked batch at batch {batch_i}")
+                        if gt_m.shape != (len(indices), 3, 3):
+                            raise RuntimeError(
+                                f"Worst-of-K gt_matrix shape {gt_m.shape} != expected ({len(indices)}, 3, 3) at batch {batch_i}"
+                            )
+                        if not torch.isfinite(gt_m).all():
+                            raise RuntimeError(f"Worst-of-K gt_matrix contains non-finite values at batch {batch_i}")
 
-                    batch["img"][indices] = adv_imgs.detach().to(batch["img"].dtype)
-                    gt_matrices[indices] = gt_m.detach().to(device=device, dtype=gt_matrices.dtype)
+                        validate_batch_annotations(sub_b, len(indices), classes=eval_classes)
 
-            # 2. Process pixel attacks (PGD, BIM, MIM)
-            for att_name in ("pgd", "bim", "mim"):
-                if att_name not in sub_batches or att_name not in self.attackers:
-                    continue
-                attacker = self.attackers[att_name]
-                att_indices = [i for i, st in enumerate(orig_sample_types) if st == att_name]
-                if not att_indices:
-                    continue
+                        batch["img"][indices] = adv_imgs.detach().to(batch["img"].dtype)
+                        gt_matrices[indices] = gt_m.detach().to(device=device, dtype=gt_matrices.dtype)
 
-                target_indices = [i for i in att_indices if has_targets[i].item()]
-                no_target_indices = [i for i in att_indices if not has_targets[i].item()]
+                # 2. Process pixel attacks (PGD, BIM, MIM)
+                for att_name in ("pgd", "bim", "mim"):
+                    if att_name not in sub_batches or att_name not in self.attackers:
+                        continue
+                    attacker = self.attackers[att_name]
+                    att_indices = [i for i, st in enumerate(orig_sample_types) if st == att_name]
+                    if not att_indices:
+                        continue
 
-                for idx in no_target_indices:
-                    final_sample_types[idx] = "raw"
-                    self.skipped_no_target_count += 1
+                    target_indices = [i for i in att_indices if has_targets[i].item()]
+                    no_target_indices = [i for i in att_indices if not has_targets[i].item()]
 
-                if target_indices:
-                    sub_b = slice_batch_indices(batch, target_indices)
-                    adv_imgs = run_attack_on_batch(
-                        attacker,
-                        sub_b,
-                        label_policy="largest_box",
-                        strict=True,
-                        attack_name=att_name,
-                        batch_i=batch_i,
-                    )
-                    if adv_imgs is None or not torch.is_tensor(adv_imgs):
-                        raise RuntimeError(f"Attack '{att_name}' failed to produce image tensor at batch {batch_i}")
-                    if not torch.isfinite(adv_imgs).all():
-                        raise RuntimeError(f"Attack '{att_name}' produced non-finite image values at batch {batch_i}")
+                    for idx in no_target_indices:
+                        final_sample_types[idx] = "raw"
+                        self.skipped_no_target_count += 1
 
-                    batch["img"][target_indices] = adv_imgs.detach().to(batch["img"].dtype)
-        except Exception:
-            self.skip_opt_step = True
-            raise
+                    if target_indices:
+                        sub_b = slice_batch_indices(batch, target_indices)
+                        adv_imgs = run_attack_on_batch(
+                            attacker,
+                            sub_b,
+                            label_policy="largest_box",
+                            strict=True,
+                            attack_name=att_name,
+                            batch_i=batch_i,
+                        )
+                        if adv_imgs is None or not torch.is_tensor(adv_imgs):
+                            raise RuntimeError(f"Attack '{att_name}' failed to produce image tensor at batch {batch_i}")
+                        if not torch.isfinite(adv_imgs).all():
+                            raise RuntimeError(
+                                f"Attack '{att_name}' produced non-finite image values at batch {batch_i}"
+                            )
+
+                        batch["img"][target_indices] = adv_imgs.detach().to(batch["img"].dtype)
         finally:
             # Restore defense module parameter gradients for joint loss backpropagation
             for p, state in zip(self.denoiser.parameters(), den_states):
@@ -964,10 +1025,6 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
     def optimizer_step(self) -> None:
         """Check that defense module gradients are finite before optimizer step."""
-        if getattr(self, "skip_opt_step", False):
-            self.skip_opt_step = False
-            self.optimizer.zero_grad()
-            return
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -1071,9 +1128,121 @@ class JointFGDSTNTrainer(DetectionTrainer):
             self.stn.train().requires_grad_(True)
             self.joint_model.pipeline.train().requires_grad_(True)
 
+    def _handle_nan_recovery(self, epoch: int) -> bool:
+        """Detect NaN/Inf in epoch losses or fitness and automatically recover from the last joint checkpoint."""
+        corrupted_losses = []
+        if isinstance(self.tloss, dict):
+            for k, v in self.tloss.items():
+                if torch.is_tensor(v):
+                    if not torch.isfinite(v).all():
+                        corrupted_losses.append(f"{k}={v.item() if v.numel() == 1 else v}")
+                elif isinstance(v, (int, float, np.floating, np.integer)) and not np.isfinite(v):
+                    corrupted_losses.append(f"{k}={v}")
+        elif torch.is_tensor(self.tloss) and not torch.isfinite(self.tloss).all():
+            corrupted_losses.append(f"tloss={self.tloss.item() if self.tloss.numel() == 1 else self.tloss}")
+
+        if self.loss is not None:
+            if torch.is_tensor(self.loss):
+                if not torch.isfinite(self.loss).all():
+                    corrupted_losses.append(f"loss={self.loss.item() if self.loss.numel() == 1 else self.loss}")
+            elif isinstance(self.loss, (int, float, np.floating, np.integer)) and not np.isfinite(self.loss):
+                corrupted_losses.append(f"loss={self.loss}")
+
+        if self.fitness is not None and (
+            (isinstance(self.fitness, (int, float, np.floating, np.integer)) and not np.isfinite(self.fitness))
+            or (torch.is_tensor(self.fitness) and not torch.isfinite(self.fitness).all())
+        ):
+            corrupted_losses.append(f"fitness={self.fitness}")
+
+        if not corrupted_losses:
+            return False
+
+        corrupted_str = ", ".join(corrupted_losses)
+        last_path = getattr(self, "last", None)
+        if last_path is None or not Path(last_path).is_file():
+            raise RuntimeError(
+                f"Epoch {epoch}: Non-finite loss/fitness detected in [{corrupted_str}], "
+                f"but no checkpoint available at {last_path} for recovery."
+            )
+
+        ckpt = torch_load(last_path, map_location="cpu")
+        ckpt_epoch = ckpt.get("epoch")
+        if ckpt_epoch is None or ckpt_epoch != epoch - 1:
+            raise RuntimeError(
+                f"Epoch {epoch}: Non-finite loss/fitness detected in [{corrupted_str}], "
+                f"checkpoint epoch ({ckpt_epoch}) does not match expected previous epoch {epoch - 1} for recovery."
+            )
+
+        fgd_st = ckpt.get("fgd_state_dict", ckpt.get("denoiser"))
+        stn_st = ckpt.get("stn_state_dict", ckpt.get("stn"))
+        if fgd_st is None or stn_st is None:
+            raise RuntimeError(
+                f"Epoch {epoch}: Non-finite loss/fitness detected in [{corrupted_str}], "
+                "checkpoint is missing required FGD or STN weights."
+            )
+
+        for mod_name, st in [("FGD", fgd_st), ("STN", stn_st)]:
+            for param_name, tensor in st.items():
+                if torch.is_tensor(tensor) and tensor.is_floating_point() and not torch.isfinite(tensor).all():
+                    raise RuntimeError(
+                        f"Epoch {epoch}: Non-finite loss/fitness detected in [{corrupted_str}], "
+                        f"checkpoint {mod_name} parameter '{param_name}' contains non-finite weights."
+                    )
+
+        self.nan_recovery_attempts = getattr(self, "nan_recovery_attempts", 0) + 1
+        if self.nan_recovery_attempts > 3:
+            raise RuntimeError(
+                f"Training failed: NaN persisted for {self.nan_recovery_attempts} consecutive attempts at epoch {epoch} "
+                f"(corrupted: [{corrupted_str}])."
+            )
+
+        LOGGER.warning(
+            f"Epoch {epoch}: Non-finite loss/fitness detected in [{corrupted_str}] "
+            f"(recovery attempt {self.nan_recovery_attempts}/3), recovering from {last_path}..."
+        )
+
+        self._restore_joint_checkpoint_state(ckpt, is_recovery=True)
+
+        if hasattr(self, "train_loader") and hasattr(self.train_loader, "reset"):
+            self.train_loader.reset()
+
+        self.optimizer.zero_grad()
+        self.tloss = None
+        self.loss = None
+        self.metrics = {}
+        self.fitness = None
+
+        return True
+
     def save_model(self) -> bool:
         """Save joint checkpoint and standalone FGD and STN checkpoints."""
-        # 1. Evaluate current valid fitness and determine is_best BEFORE constructing checkpoint
+        # 1. Epoch 1 validation check: verify defense weights updated and guidance model remained frozen
+        if self.epoch == 0 and hasattr(self, "_epoch1_snapshot"):
+            den_changed = any(
+                not torch.equal(p.cpu(), p0)
+                for p, p0 in zip(self.denoiser.parameters(), self._epoch1_snapshot["denoiser"])
+            )
+            stn_changed = any(
+                not torch.equal(p.cpu(), p0) for p, p0 in zip(self.stn.parameters(), self._epoch1_snapshot["stn"])
+            )
+            if not den_changed:
+                raise RuntimeError("Epoch 1 validation failed: FGD denoiser weights did not update.")
+            if not stn_changed:
+                raise RuntimeError("Epoch 1 validation failed: STN weights did not update.")
+            guidance_params_ok = all(
+                torch.equal(p.cpu(), p0)
+                for p, p0 in zip(self.guidance_model.parameters(), self._epoch1_snapshot["guidance_params"])
+            )
+            guidance_buffers_ok = all(
+                torch.equal(b.cpu(), b0)
+                for b, b0 in zip(self.guidance_model.buffers(), self._epoch1_snapshot["guidance_buffers"])
+            )
+            if not guidance_params_ok:
+                raise RuntimeError("Epoch 1 validation failed: Guidance detector parameters were modified.")
+            if not guidance_buffers_ok:
+                raise RuntimeError("Epoch 1 validation failed: Guidance detector BatchNorm statistics were modified.")
+
+        # 2. Evaluate current valid fitness and determine is_best BEFORE constructing checkpoint
         is_best = False
         has_valid_val = (
             self.fitness is not None
@@ -1086,7 +1255,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
                 self.best_fitness = current_fitness
                 is_best = True
 
-        # 2. Build single consistent checkpoint dictionary with updated self.best_fitness
+        # 3. Build single consistent checkpoint dictionary with updated self.best_fitness
         checkpoint = {
             "epoch": self.epoch,
             "fgd_state_dict": self.denoiser.state_dict(),
@@ -1110,6 +1279,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
                 "lr_fgd": self.lr_fgd,
                 "lr_stn": self.lr_stn,
                 "val_interval": self.val_interval,
+                "eval_weights": self.eval_weights,
                 "fgd": {
                     "lr": self.lr_fgd,
                 },
@@ -1120,11 +1290,15 @@ class JointFGDSTNTrainer(DetectionTrainer):
                     "worstk_k": self.worstk_k,
                 },
             },
-            "stn_architecture": {
-                "max_degrees": getattr(self.stn, "max_degrees", self.degrees * 1.5),
-                "max_translate": getattr(self.stn, "max_translate", self.translate * 1.5),
-                "fill": getattr(self.stn, "fill", 114.0 / 255.0),
-            },
+            "stn_architecture": getattr(
+                self,
+                "stn_architecture",
+                {
+                    "max_degrees": getattr(self.stn, "max_degrees", self.degrees * 1.5),
+                    "max_translate": getattr(self.stn, "max_translate", self.translate * 1.5),
+                    "fill": getattr(self.stn, "fill", 114.0 / 255.0),
+                },
+            ),
             "guidance_model_reference": str(self.args.model),
             "guidance_model": str(self.args.model),
             "attack_configuration": {
@@ -1155,58 +1329,20 @@ class JointFGDSTNTrainer(DetectionTrainer):
             },
         }
 
-        # Epoch 1 validation check: verify finite loss, weight updates, frozen detector and zero attack failures
-        if self.epoch == 0 and hasattr(self, "_epoch1_snapshot"):
-            loss_t = getattr(self, "tloss", None)
-            if loss_t is not None and not torch.isfinite(loss_t).all():
-                raise RuntimeError(f"Epoch 1 validation failed: loss contains non-finite values {loss_t}")
-            if getattr(self, "failed_attack_count", 0) > 0:
-                raise RuntimeError(
-                    f"Epoch 1 validation failed: attack failures on targeted samples={self.failed_attack_count} > 0"
-                )
-            den_changed = any(
-                not torch.equal(p.cpu(), p0)
-                for p, p0 in zip(self.denoiser.parameters(), self._epoch1_snapshot["denoiser"])
-            )
-            stn_changed = any(
-                not torch.equal(p.cpu(), p0)
-                for p, p0 in zip(self.stn.parameters(), self._epoch1_snapshot["stn"])
-            )
-            if not den_changed:
-                raise RuntimeError("Epoch 1 validation failed: FGD denoiser weights did not update.")
-            if not stn_changed:
-                raise RuntimeError("Epoch 1 validation failed: STN weights did not update.")
-            guidance_params_ok = all(
-                torch.equal(p.cpu(), p0)
-                for p, p0 in zip(self.guidance_model.parameters(), self._epoch1_snapshot["guidance_params"])
-            )
-            guidance_buffers_ok = all(
-                torch.equal(b.cpu(), b0)
-                for b, b0 in zip(self.guidance_model.buffers(), self._epoch1_snapshot["guidance_buffers"])
-            )
-            if not guidance_params_ok:
-                raise RuntimeError("Epoch 1 validation failed: Guidance detector parameters were modified.")
-            if not guidance_buffers_ok:
-                raise RuntimeError("Epoch 1 validation failed: Guidance detector BatchNorm statistics were modified.")
-            LOGGER.info(
-                ">>> [Epoch 1 Sanity Check PASSED] All losses finite, defense weights updated, "
-                "guidance detector & BN stats strictly frozen, attack failures=0."
-            )
-
-        # 3. Save last.pt and export standalone last checkpoints
+        # 4. Save last.pt and export standalone last checkpoints
         self.wdir.mkdir(parents=True, exist_ok=True)
         last_path = self.wdir / "last.pt"
         torch.save(checkpoint, last_path)
         export_joint_checkpoint(checkpoint, output_dir=self.wdir, prefix="last_")
 
-        # 4. Save best.pt and export standalone best checkpoints if improved
+        # 5. Save best.pt and export standalone best checkpoints if improved
         if is_best:
             best_path = self.wdir / "best.pt"
             torch.save(checkpoint, best_path)
             export_joint_checkpoint(checkpoint, output_dir=self.wdir, prefix="best_")
             LOGGER.info(f"Saving new best joint checkpoint: robust fitness={self.best_fitness:.4f}")
 
-        # 5. Periodic checkpoint save
+        # 6. Periodic checkpoint save
         if (self.save_period > 0 and (self.epoch + 1) % self.save_period == 0) or (self.epoch + 1) in (5, 10, 15):
             torch.save(checkpoint, self.wdir / f"epoch{self.epoch + 1}.pt")
             export_dir = self.save_dir / "export"

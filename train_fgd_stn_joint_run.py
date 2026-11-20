@@ -112,11 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr_stn", type=float, default=1e-4, help="STN spatial transformer initial learning rate (default: 1e-4)"
     )
     parser.add_argument("--weight_decay", type=float, default=1e-5, help="Adam optimizer weight decay (default: 1e-5)")
-    parser.add_argument("--epochs", type=int, default=50, help="Total training epochs (default: 50)")
-    parser.add_argument("--batch", type=int, default=4, help="Training batch size (default: 4)")
+    parser.add_argument("--epochs", type=int, default=argparse.SUPPRESS, help="Total training epochs (default: 50)")
+    parser.add_argument("--batch", type=int, default=argparse.SUPPRESS, help="Training batch size (default: 4)")
     parser.add_argument("--imgsz", type=int, default=640, help="Image resolution size (default: 640)")
-    parser.add_argument("--device", default="0", help="Training device (e.g. 0 or cpu)")
-    parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes (default: 4)")
+    parser.add_argument("--device", default=argparse.SUPPRESS, help="Training device (e.g. 0 or cpu)")
+    parser.add_argument(
+        "--workers", type=int, default=argparse.SUPPRESS, help="DataLoader worker processes (default: 4)"
+    )
     parser.add_argument("--cache", default="True", help="Dataset cache mode (ram, disk, True, False)")
     parser.add_argument(
         "--amp",
@@ -127,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=argparse.SUPPRESS,
         help="Random seed for reproducibility (default: inherited from cfg/default.yaml)",
     )
 
@@ -156,6 +158,29 @@ def main():
     """Parse command-line arguments and launch FGD and STN joint training."""
     args = parse_args()
 
+    # Resume branch: only pass checkpoint path and explicitly provided runtime overrides
+    is_resume = bool(getattr(args, "resume", False)) and str(args.resume).strip().lower() not in {
+        "false",
+        "0",
+        "none",
+        "",
+    }
+    if is_resume:
+        overrides = {"resume": str(args.resume)}
+        for k in ("device", "workers", "epochs", "batch", "seed"):
+            if hasattr(args, k):
+                overrides[k] = getattr(args, k)
+        trainer = JointFGDSTNTrainer(overrides=overrides)
+        trainer.train()
+        return
+
+    # New training branch: populate defaults for suppressed arguments
+    epochs = getattr(args, "epochs", 50)
+    batch = getattr(args, "batch", 4)
+    device = getattr(args, "device", "0")
+    workers = getattr(args, "workers", 4)
+    seed = getattr(args, "seed", None)
+
     # Normalization and early validation
     mode = canonicalize_mode(args.preprocess_mode)
     if mode not in {"stn_fgd", "fgd_stn"}:
@@ -165,7 +190,7 @@ def main():
     if init_mode not in {"pretrained", "scratch"}:
         raise ValueError(f"--init must be 'pretrained' or 'scratch', got: {args.init}")
 
-    if not args.resume and init_mode == "pretrained":
+    if init_mode == "pretrained":
         if not args.fgd_weights or not Path(args.fgd_weights).is_file():
             raise FileNotFoundError(
                 f"Pretrained fine-tuning requires valid --fgd_weights path, got: {args.fgd_weights}"
@@ -233,11 +258,11 @@ def main():
         "lr_fgd": float(args.lr_fgd),
         "lr_stn": float(args.lr_stn),
         "weight_decay": float(args.weight_decay),
-        "epochs": int(args.epochs),
-        "batch": int(args.batch),
+        "epochs": int(epochs),
+        "batch": int(batch),
         "imgsz": int(args.imgsz),
-        "device": str(args.device),
-        "workers": int(args.workers),
+        "device": str(device),
+        "workers": int(workers),
         "cache": cache_val,
         "amp": args.amp,
         "val_interval": int(args.val_interval),
@@ -245,11 +270,11 @@ def main():
         "project": args.project,
         "name": args.name,
         "save_period": int(args.save_period),
-        "resume": args.resume,
+        "resume": False,
     }
 
-    if args.seed is not None:
-        overrides["seed"] = int(args.seed)
+    if seed is not None:
+        overrides["seed"] = int(seed)
 
     trainer = JointFGDSTNTrainer(overrides=overrides)
     trainer.train()

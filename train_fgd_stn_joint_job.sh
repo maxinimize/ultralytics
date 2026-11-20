@@ -13,6 +13,25 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Capture whether runtime parameters were explicitly set before applying defaults
+USER_DEVICE_SET=0; [[ -v DEVICE ]] && USER_DEVICE_SET=1
+USER_WORKERS_SET=0; [[ -v WORKERS ]] && USER_WORKERS_SET=1
+USER_EPOCHS_SET=0; [[ -v EPOCHS ]] && USER_EPOCHS_SET=1
+USER_BATCH_SET=0; [[ -v BATCH ]] && USER_BATCH_SET=1
+USER_SEED_SET=0; [[ -v SEED ]] && USER_SEED_SET=1
+USER_DEVICE="${DEVICE:-}"
+USER_WORKERS="${WORKERS:-}"
+USER_EPOCHS="${EPOCHS:-}"
+USER_BATCH="${BATCH:-}"
+USER_SEED="${SEED:-}"
+
+RESUME="${RESUME:-}"
+if [[ "${1:-}" == "--resume" && -n "${2:-}" ]]; then
+  RESUME="$2"
+elif [[ "${1:-}" =~ ^--resume=(.+) ]]; then
+  RESUME="${BASH_REMATCH[1]}"
+fi
+
 # Training configuration options and environment variable defaults
 MODEL="${MODEL:-yolo12l.pt}"
 DATA="${DATA:-coco_train_traffic5k.yaml}"
@@ -109,6 +128,43 @@ print('PyTorch Version:', torch.__version__, '| CUDA Support:', torch.version.cu
 assert torch.cuda.is_available(), 'Error: No available CUDA GPU detected in current environment!'
 print('GPU Device:', torch.cuda.get_device_name(0))
 PY
+
+# Direct resume branch: use dataset/model from checkpoint, forward only explicitly set runtime options
+if [[ -n "$RESUME" ]]; then
+  if [[ ! -f "$RESUME" ]]; then
+    echo "ERROR: Resume checkpoint not found: $RESUME" >&2
+    exit 1
+  fi
+
+  LOG_PROJECT="${PROJECT:-runs/train_fgd_stn_joint}"
+  LOG_NAME="${SLURM_JOB_NAME:-joint_fgd_stn}_resume_$(basename "$RESUME" .pt)"
+  mkdir -p "$ROOT/logs" "$ROOT/$LOG_PROJECT"
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  LOG_FILE="$ROOT/logs/${LOG_NAME}-${SLURM_JOB_ID:-local}_${TIMESTAMP}.log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "=================================================================="
+  echo "=== SHARCNET FGD + STN Joint Training Resume: $LOG_NAME ==="
+  echo "=================================================================="
+  echo "Start Time: $(date)"
+  echo "Project Root: $ROOT"
+  echo "Log File: $LOG_FILE"
+  echo "Resume Checkpoint: $RESUME"
+  echo "=================================================================="
+
+  TRAIN_ARGS=(--resume "$RESUME")
+  if (( USER_DEVICE_SET )) && [[ -n "$USER_DEVICE" ]]; then TRAIN_ARGS+=(--device "$USER_DEVICE"); fi
+  if (( USER_WORKERS_SET )) && [[ -n "$USER_WORKERS" ]]; then TRAIN_ARGS+=(--workers "$USER_WORKERS"); fi
+  if (( USER_EPOCHS_SET )) && [[ -n "$USER_EPOCHS" ]]; then TRAIN_ARGS+=(--epochs "$USER_EPOCHS"); fi
+  if (( USER_BATCH_SET )) && [[ -n "$USER_BATCH" ]]; then TRAIN_ARGS+=(--batch "$USER_BATCH"); fi
+  if (( USER_SEED_SET )) && [[ -n "$USER_SEED" ]]; then TRAIN_ARGS+=(--seed "$USER_SEED"); fi
+
+  printf 'Executing resume training command: python -u train_fgd_stn_joint_run.py'; printf ' %q' "${TRAIN_ARGS[@]}"; echo
+  python -u train_fgd_stn_joint_run.py "${TRAIN_ARGS[@]}"
+
+  echo "Training finished at: $(date)"
+  exit 0
+fi
 
 # Resolve dataset path with support for SLURM local fast SSD staging
 DATA_ARG="${DATA}"

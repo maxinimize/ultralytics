@@ -12,7 +12,78 @@ if [[ ! -f "$ROOT/train_fgd_stn_joint_run.py" || ! -f "$ROOT/.yolo_env/bin/activ
 fi
 source "$ROOT/.yolo_env/bin/activate"
 
-# Configuration parameters and environment variables
+# Capture whether runtime parameters were explicitly set before applying defaults
+USER_DEVICE_SET=0; [[ -v DEVICE ]] && USER_DEVICE_SET=1
+USER_WORKERS_SET=0; [[ -v WORKERS ]] && USER_WORKERS_SET=1
+USER_EPOCHS_SET=0; [[ -v EPOCHS ]] && USER_EPOCHS_SET=1
+USER_BATCH_SET=0; [[ -v BATCH ]] && USER_BATCH_SET=1
+USER_SEED_SET=0; [[ -v SEED ]] && USER_SEED_SET=1
+USER_DEVICE="${DEVICE:-}"
+USER_WORKERS="${WORKERS:-}"
+USER_EPOCHS="${EPOCHS:-}"
+USER_BATCH="${BATCH:-}"
+USER_SEED="${SEED:-}"
+
+RESUME="${RESUME:-}"
+if [[ "${1:-}" == "--resume" && -n "${2:-}" ]]; then
+  RESUME="$2"
+elif [[ "${1:-}" =~ ^--resume=(.+) ]]; then
+  RESUME="${BASH_REMATCH[1]}"
+fi
+
+# Thread and GPU memory environment variables
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export OMP_THREAD_LIMIT="${OMP_THREAD_LIMIT:-4}"
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
+
+# Verify CUDA status and GPU info
+python - <<'PY'
+import torch
+print('PyTorch Version:', torch.__version__, '| CUDA Support:', torch.version.cuda)
+assert torch.cuda.is_available(), 'Error: CUDA is not available in current virtual environment!'
+print('GPU Device:', torch.cuda.get_device_name(0), '| BF16 Support:', torch.cuda.is_bf16_supported())
+PY
+
+# Direct resume branch: use dataset/model from checkpoint, forward only explicitly set runtime options
+if [[ -n "$RESUME" ]]; then
+  if [[ ! -f "$RESUME" ]]; then
+    echo "Error: Resume checkpoint not found: $RESUME" >&2
+    exit 1
+  fi
+
+  PROJECT="${PROJECT:-$ROOT/runs/train_fgd_stn_joint}"
+  JOB_NAME="${JOB_NAME:-local_fgd_stn_joint}"
+  LOG_NAME="${NAME:-${JOB_NAME}_resume_$(basename "$RESUME" .pt)}"
+  mkdir -p "$ROOT/logs" "$PROJECT"
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  LOG_FILE="$ROOT/logs/${LOG_NAME}-${TIMESTAMP}.log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  echo "=================================================================="
+  echo "=== Local Ubuntu FGD + STN Joint Training Resume: $LOG_NAME ==="
+  echo "=================================================================="
+  echo "Start Time: $(date -Is)"
+  echo "Project Path: $ROOT"
+  echo "Log File: $LOG_FILE"
+  echo "Resume Checkpoint: $RESUME"
+  echo "=================================================================="
+
+  ARGS=(--resume "$RESUME")
+  if (( USER_DEVICE_SET )) && [[ -n "$USER_DEVICE" ]]; then ARGS+=(--device "$USER_DEVICE"); fi
+  if (( USER_WORKERS_SET )) && [[ -n "$USER_WORKERS" ]]; then ARGS+=(--workers "$USER_WORKERS"); fi
+  if (( USER_EPOCHS_SET )) && [[ -n "$USER_EPOCHS" ]]; then ARGS+=(--epochs "$USER_EPOCHS"); fi
+  if (( USER_BATCH_SET )) && [[ -n "$USER_BATCH" ]]; then ARGS+=(--batch "$USER_BATCH"); fi
+  if (( USER_SEED_SET )) && [[ -n "$USER_SEED" ]]; then ARGS+=(--seed "$USER_SEED"); fi
+
+  printf 'Executing resume training command: python -u train_fgd_stn_joint_run.py'; printf ' %q' "${ARGS[@]}"; echo
+  python -u train_fgd_stn_joint_run.py "${ARGS[@]}"
+  echo "Training finished normally: $(date -Is)"
+  exit 0
+fi
+
+# Configuration parameters and environment variables for new training
 PREPROCESS_MODE="${PREPROCESS_MODE:-${1:-stn_fgd}}"
 # INIT="${INIT:-${2:-scratch}}"
 # FGD_WEIGHTS="${FGD_WEIGHTS:-none}"
