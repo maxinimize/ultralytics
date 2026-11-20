@@ -14,7 +14,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ultralytics.attacks.attack_bridge import build_attacker, run_attack_on_batch
+from ultralytics.attacks.attack_bridge import (
+    build_attacker,
+    run_attack_on_batch,
+    slice_batch_indices,
+    validate_batch_annotations,
+)
 from ultralytics.attacks.attack_utils import isolate_rng
 from ultralytics.attacks.spatial_worst_of_k_stn import SpatialWorstOfKWithMetadata
 from ultralytics.cfg import get_cfg
@@ -201,9 +206,10 @@ class JointFGDSTNModel(nn.Module):
             scale_losses = []
             for s in range(3):
                 mask_s = F.interpolate(mask, size=proc_feats[s].shape[-2:], mode="nearest")
-                diff_s = (proc_feats[s] - clean_feats[s]).abs() * mask_s
-                valid_counts = mask_s.sum(dim=[-2, -1]).clamp(min=1.0) * float(proc_feats[s].shape[1])
-                scale_loss = (diff_s.sum(dim=[-2, -1]) / valid_counts).mean(dim=1)
+                diff_s = (proc_feats[s].float() - clean_feats[s].float()).abs() * mask_s.float()
+                valid_pixels = mask_s.float().sum(dim=(1, 2, 3))
+                valid_elements = (valid_pixels * proc_feats[s].shape[1]).clamp_min(1)
+                scale_loss = diff_s.sum(dim=(1, 2, 3)) / valid_elements
                 scale_losses.append(scale_loss)
             per_image_fgd = torch.stack(scale_losses, dim=1)
             loss_fgd = per_image_fgd.mean()
@@ -242,10 +248,11 @@ class JointFGDSTNModel(nn.Module):
         if self.lambda_det > 0.0:
             batch_det = {k: v.clone() if torch.is_tensor(v) else copy.copy(v) for k, v in batch.items()}
             batch_det["img"] = processed_images
-            batch_det = transform_batch_bboxes_for_stn(batch_det, pred_matrices, height=h, width=w)
+            with torch.no_grad():
+                batch_det = transform_batch_bboxes_for_stn(batch_det, pred_matrices.detach(), height=h, width=w)
             det_preds = self.guidance_model(processed_images, augment=False)
             det_loss_items, _ = unwrap_model(self.guidance_model).loss(batch_det, det_preds)
-            loss_det = det_loss_items.sum()
+            loss_det = det_loss_items.sum() / processed_images.shape[0]
         else:
             loss_det = torch.tensor(0.0, device=device)
 
@@ -265,6 +272,11 @@ class JointFGDSTNModel(nn.Module):
             "recon_loss": loss_recon.detach(),
             "det_loss": loss_det.detach(),
             "identity_loss": loss_identity.detach(),
+            "w_fgd": (self.lambda_fgd * loss_fgd).detach(),
+            "w_geom": (self.lambda_geom * loss_geom).detach(),
+            "w_recon": (self.lambda_recon * loss_recon).detach(),
+            "w_det": (self.lambda_det * loss_det).detach(),
+            "w_identity": (self.lambda_identity * loss_identity).detach(),
         }
         return total_loss, loss_items
 
@@ -557,7 +569,19 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         # 7. Validator configuration
         self.validator = self.get_validator()
-        self.loss_names = ("total_loss", "fgd_loss", "geom_loss", "recon_loss", "det_loss", "identity_loss")
+        self.loss_names = (
+            "total_loss",
+            "fgd_loss",
+            "geom_loss",
+            "recon_loss",
+            "det_loss",
+            "identity_loss",
+            "w_fgd",
+            "w_geom",
+            "w_recon",
+            "w_det",
+            "w_identity",
+        )
         self.metrics = {}
         self.best_fitness = None
 
@@ -654,6 +678,14 @@ class JointFGDSTNTrainer(DetectionTrainer):
         self.stn.train().requires_grad_(True)
         self.guidance_model.eval().requires_grad_(False)
 
+        # Record baseline snapshots for epoch 1 freezing and weight update verification
+        self._epoch1_snapshot = {
+            "denoiser": [p.clone().detach().cpu() for p in self.denoiser.parameters()],
+            "stn": [p.clone().detach().cpu() for p in self.stn.parameters()],
+            "guidance_params": [p.clone().detach().cpu() for p in self.guidance_model.parameters()],
+            "guidance_buffers": [b.clone().detach().cpu() for b in self.guidance_model.buffers()],
+        }
+
         YAML.save(self.save_dir / "args.yaml", vars(self.args))
         YAML.save(self.save_dir / "joint_config.yaml", self.joint_cfg)
         LOGGER.info(
@@ -733,9 +765,9 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
         # Preserve original clean images and clean bounding boxes
         batch["clean_img"] = batch["img"].clone()
-        batch["clean_batch_idx"] = batch["batch_idx"].clone() if "batch_idx" in batch else None
-        batch["clean_cls"] = batch["cls"].clone() if "cls" in batch else None
-        batch["clean_bboxes"] = batch["bboxes"].clone() if "bboxes" in batch else None
+        batch["clean_batch_idx"] = batch["batch_idx"].clone() if "batch_idx" in batch and batch["batch_idx"] is not None else None
+        batch["clean_cls"] = batch["cls"].clone() if "cls" in batch and batch["cls"] is not None else None
+        batch["clean_bboxes"] = batch["bboxes"].clone() if "bboxes" in batch and batch["bboxes"] is not None else None
 
         sample_types = list(batch.get("sample_type", ["raw"] * b))
         batch["sample_type"] = sample_types
@@ -743,8 +775,15 @@ class JointFGDSTNTrainer(DetectionTrainer):
         # Default ground-truth spatial transformation matrix is identity
         gt_matrices = torch.eye(3, device=device, dtype=batch["img"].dtype).unsqueeze(0).repeat(b, 1, 1)
 
+        eval_classes = getattr(self.args, "classes", None)
+        has_targets = validate_batch_annotations(batch, b, classes=eval_classes)
+
         # Split sub-batches and generate targeted adversarial samples
         sub_batches = self.split_batch_by_type(batch)
+
+        orig_sample_types = list(sample_types)
+        final_sample_types = list(orig_sample_types)
+        self.skipped_no_target_count = getattr(self, "skipped_no_target_count", 0)
 
         # Suspend defense parameter gradients during attack generation
         den_states = [p.requires_grad for p in self.denoiser.parameters()]
@@ -754,26 +793,79 @@ class JointFGDSTNTrainer(DetectionTrainer):
         for p in self.stn.parameters():
             p.requires_grad = False
 
+        batch_i = getattr(self, "epoch", -1)
+
         try:
-            for att_name, attacker in self.attackers.items():
-                if att_name not in sub_batches:
+            # 1. Process Worst-of-K spatial attack (batch-aware bridge strict path)
+            if "worstk" in sub_batches and "worstk" in self.attackers:
+                indices = [i for i, st in enumerate(orig_sample_types) if st == "worstk"]
+                if indices:
+                    attacker = self.attackers["worstk"]
+                    sub_b = sub_batches["worstk"]
+                    adv_imgs = run_attack_on_batch(
+                        attacker,
+                        sub_b,
+                        strict=True,
+                        attack_name="worstk",
+                        batch_i=batch_i,
+                    )
+                    if adv_imgs is None or not torch.is_tensor(adv_imgs):
+                        raise RuntimeError(f"Worst-of-K failed to produce image tensor at batch {batch_i}")
+                    if not torch.isfinite(adv_imgs).all():
+                        raise RuntimeError(f"Worst-of-K produced non-finite image values at batch {batch_i}")
+
+                    gt_m = sub_b.get("gt_matrix")
+                    if gt_m is None and hasattr(attacker, "last_selected_matrices"):
+                        gt_m = attacker.last_selected_matrices
+                    if gt_m is None or not torch.is_tensor(gt_m):
+                        raise RuntimeError(f"Worst-of-K missing gt_matrix in attacked batch at batch {batch_i}")
+                    if gt_m.shape != (len(indices), 3, 3):
+                        raise RuntimeError(
+                            f"Worst-of-K gt_matrix shape {gt_m.shape} != expected ({len(indices)}, 3, 3) at batch {batch_i}"
+                        )
+                    if not torch.isfinite(gt_m).all():
+                        raise RuntimeError(f"Worst-of-K gt_matrix contains non-finite values at batch {batch_i}")
+
+                    validate_batch_annotations(sub_b, len(indices), classes=eval_classes)
+
+                    batch["img"][indices] = adv_imgs.detach().to(batch["img"].dtype)
+                    gt_matrices[indices] = gt_m.detach().to(device=device, dtype=gt_matrices.dtype)
+
+            # 2. Process pixel attacks (PGD, BIM, MIM)
+            for att_name in ("pgd", "bim", "mim"):
+                if att_name not in sub_batches or att_name not in self.attackers:
                     continue
-                sub_b = sub_batches[att_name]
-                indices = [i for i, st in enumerate(sample_types) if st == att_name]
-                if not indices:
+                attacker = self.attackers[att_name]
+                att_indices = [i for i, st in enumerate(orig_sample_types) if st == att_name]
+                if not att_indices:
                     continue
 
-                if att_name == "worstk" and callable(getattr(attacker, "forward_batch", None)):
-                    attacker.forward_batch(sub_b)
-                    adv_imgs = sub_b["img"]
-                    if "gt_matrix" in sub_b:
-                        gt_matrices[indices] = sub_b["gt_matrix"].to(device=device, dtype=gt_matrices.dtype)
-                else:
-                    adv_imgs = run_attack_on_batch(attacker, sub_b, label_policy="largest_box")
+                target_indices = [i for i in att_indices if has_targets[i].item()]
+                no_target_indices = [i for i in att_indices if not has_targets[i].item()]
 
-                if adv_imgs is not None:
-                    sub_b["img"] = adv_imgs.detach()
-                    batch["img"][indices] = adv_imgs.detach()
+                for idx in no_target_indices:
+                    final_sample_types[idx] = "raw"
+                    self.skipped_no_target_count += 1
+
+                if target_indices:
+                    sub_b = slice_batch_indices(batch, target_indices)
+                    adv_imgs = run_attack_on_batch(
+                        attacker,
+                        sub_b,
+                        label_policy="largest_box",
+                        strict=True,
+                        attack_name=att_name,
+                        batch_i=batch_i,
+                    )
+                    if adv_imgs is None or not torch.is_tensor(adv_imgs):
+                        raise RuntimeError(f"Attack '{att_name}' failed to produce image tensor at batch {batch_i}")
+                    if not torch.isfinite(adv_imgs).all():
+                        raise RuntimeError(f"Attack '{att_name}' produced non-finite image values at batch {batch_i}")
+
+                    batch["img"][target_indices] = adv_imgs.detach().to(batch["img"].dtype)
+        except Exception:
+            self.skip_opt_step = True
+            raise
         finally:
             # Restore defense module parameter gradients for joint loss backpropagation
             for p, state in zip(self.denoiser.parameters(), den_states):
@@ -790,7 +882,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
             orig_cls_dim = batch["cls"].dim() if "cls" in batch and batch["cls"] is not None else 1
 
             for t, sub_b in sub_batches.items():
-                indices = [idx for idx, st in enumerate(sample_types) if st == t]
+                indices = [idx for idx, st in enumerate(orig_sample_types) if st == t]
                 if not indices:
                     continue
                 sub_bi = sub_b.get("batch_idx")
@@ -827,6 +919,7 @@ class JointFGDSTNTrainer(DetectionTrainer):
                 batch["cls"] = torch.zeros((0, 1) if orig_cls_dim > 1 else (0,), dtype=torch.float32, device=device)
                 batch["bboxes"] = torch.zeros((0, 4), dtype=torch.float32, device=device)
 
+        batch["sample_type"] = final_sample_types
         batch["gt_matrix"] = gt_matrices
         # Ensure adversarial images are detached from previous computation graph
         batch["img"] = batch["img"].detach()
@@ -871,6 +964,10 @@ class JointFGDSTNTrainer(DetectionTrainer):
 
     def optimizer_step(self) -> None:
         """Check that defense module gradients are finite before optimizer step."""
+        if getattr(self, "skip_opt_step", False):
+            self.skip_opt_step = False
+            self.optimizer.zero_grad()
+            return
         for group in self.optimizer.param_groups:
             for p in group["params"]:
                 if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -1058,6 +1155,44 @@ class JointFGDSTNTrainer(DetectionTrainer):
             },
         }
 
+        # Epoch 1 validation check: verify finite loss, weight updates, frozen detector and zero attack failures
+        if self.epoch == 0 and hasattr(self, "_epoch1_snapshot"):
+            loss_t = getattr(self, "tloss", None)
+            if loss_t is not None and not torch.isfinite(loss_t).all():
+                raise RuntimeError(f"Epoch 1 validation failed: loss contains non-finite values {loss_t}")
+            if getattr(self, "failed_attack_count", 0) > 0:
+                raise RuntimeError(
+                    f"Epoch 1 validation failed: attack failures on targeted samples={self.failed_attack_count} > 0"
+                )
+            den_changed = any(
+                not torch.equal(p.cpu(), p0)
+                for p, p0 in zip(self.denoiser.parameters(), self._epoch1_snapshot["denoiser"])
+            )
+            stn_changed = any(
+                not torch.equal(p.cpu(), p0)
+                for p, p0 in zip(self.stn.parameters(), self._epoch1_snapshot["stn"])
+            )
+            if not den_changed:
+                raise RuntimeError("Epoch 1 validation failed: FGD denoiser weights did not update.")
+            if not stn_changed:
+                raise RuntimeError("Epoch 1 validation failed: STN weights did not update.")
+            guidance_params_ok = all(
+                torch.equal(p.cpu(), p0)
+                for p, p0 in zip(self.guidance_model.parameters(), self._epoch1_snapshot["guidance_params"])
+            )
+            guidance_buffers_ok = all(
+                torch.equal(b.cpu(), b0)
+                for b, b0 in zip(self.guidance_model.buffers(), self._epoch1_snapshot["guidance_buffers"])
+            )
+            if not guidance_params_ok:
+                raise RuntimeError("Epoch 1 validation failed: Guidance detector parameters were modified.")
+            if not guidance_buffers_ok:
+                raise RuntimeError("Epoch 1 validation failed: Guidance detector BatchNorm statistics were modified.")
+            LOGGER.info(
+                ">>> [Epoch 1 Sanity Check PASSED] All losses finite, defense weights updated, "
+                "guidance detector & BN stats strictly frozen, attack failures=0."
+            )
+
         # 3. Save last.pt and export standalone last checkpoints
         self.wdir.mkdir(parents=True, exist_ok=True)
         last_path = self.wdir / "last.pt"
@@ -1072,8 +1207,11 @@ class JointFGDSTNTrainer(DetectionTrainer):
             LOGGER.info(f"Saving new best joint checkpoint: robust fitness={self.best_fitness:.4f}")
 
         # 5. Periodic checkpoint save
-        if self.save_period > 0 and (self.epoch + 1) % self.save_period == 0:
+        if (self.save_period > 0 and (self.epoch + 1) % self.save_period == 0) or (self.epoch + 1) in (5, 10, 15):
             torch.save(checkpoint, self.wdir / f"epoch{self.epoch + 1}.pt")
+            export_dir = self.save_dir / "export"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            export_joint_checkpoint(checkpoint, output_dir=export_dir, prefix=f"epoch_{self.epoch + 1}_")
 
         return True
 

@@ -70,10 +70,10 @@ ATTACK_WEIGHTS="${ATTACK_WEIGHTS:-${1:-current}}"
 DATA="${DATA:-${2:-coco_train_traffic5k.yaml}}"
 EPOCHS="${EPOCHS:-${3:-100}}"
 ATTACK_NAME="${ATTACK_NAME:-${4:-pgd bim mim worstk}}"
-ATTACK_RATIO="${ATTACK_RATIO:-${5:-0.10 0.10 0.40 0.15}}"
+ATTACK_RATIO="${ATTACK_RATIO:-${5:-0.18 0.17 0.15 0.10}}"
 
 # Dynamic adaptive training parameters:
-P_CLEAN="${P_CLEAN:-0.25}"
+P_CLEAN="${P_CLEAN:-0.4}"
 TAU="${TAU:-5.0}"
 UPDATE_INTERVAL="${UPDATE_INTERVAL:-5}"
 EVAL_WEIGHTS="${EVAL_WEIGHTS:-0.25 0.25 0.25 0.25}"
